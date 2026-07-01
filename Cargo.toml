@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/inkstone-core",
+    "crates/inkstone-server",
+]
+resolver = "2"
