@@ -61,106 +61,48 @@ pub fn parse_markdown(text: &str) -> MarkdownIndex {
             continue;
         }
 
-        let heading_level = heading_level(line);
-        if heading_level > 0 {
-            let text = line
+        let level = heading_level(line);
+        if level > 0 {
+            let heading_text = line
                 .chars()
                 .skip_while(|c| *c == '#')
                 .collect::<String>()
                 .trim()
                 .to_string();
             headings.push(HeadingRef {
-                level: heading_level,
-                text,
+                level,
+                text: heading_text,
                 line: line_idx,
             });
         }
 
         let mut pos = 0;
-        let line_chars: Vec<char> = line.chars().collect();
+        let chars: Vec<char> = line.chars().collect();
 
-        while pos < line_chars.len() {
-            if line_chars[pos] == '`' {
-                let end = line_chars[pos + 1..]
+        while pos < chars.len() {
+            if chars[pos] == '`' {
+                let end = chars[pos + 1..]
                     .iter()
                     .position(|c| *c == '`')
                     .map(|i| pos + 1 + i + 1)
-                    .unwrap_or(line_chars.len());
+                    .unwrap_or(chars.len());
                 pos = end;
                 continue;
             }
 
-            if pos + 2 < line_chars.len()
-                && line_chars[pos] == '!'
-                && line_chars[pos + 1] == '['
-                && line_chars[pos + 2] == '['
-            {
-                if let Some(end) = find_closing_brackets(&line_chars, pos + 3) {
-                    let content: String = line_chars[pos + 3..end].iter().collect();
-                    if let Some(colon) = content.find(':') {
-                        let kind = content[..colon].to_string();
-                        let id = content[colon + 1..].to_string();
-                        embeds.push(EmbedRef {
-                            kind,
-                            id,
-                            line: line_idx,
-                            col: pos,
-                        });
-                    }
-                    pos = end + 2;
-                    continue;
-                }
+            if let Some(end) = try_parse_embed(&chars, pos, &mut embeds, line_idx) {
+                pos = end;
+                continue;
             }
 
-            if pos + 1 < line_chars.len()
-                && line_chars[pos] == '['
-                && line_chars[pos + 1] == '['
-            {
-                if let Some(end) = find_closing_brackets(&line_chars, pos + 2) {
-                    let content: String = line_chars[pos + 2..end].iter().collect();
-                    if let Some(pipe) = content.find('|') {
-                        let target = content[..pipe].to_string();
-                        let alias = content[pipe + 1..].to_string();
-                        wikilinks.push(WikiLink {
-                            target,
-                            alias: Some(alias),
-                            line: line_idx,
-                            col: pos,
-                        });
-                    } else {
-                        wikilinks.push(WikiLink {
-                            target: content,
-                            alias: None,
-                            line: line_idx,
-                            col: pos,
-                        });
-                    }
-                    pos = end + 2;
-                    continue;
-                }
+            if let Some(end) = try_parse_wikilink(&chars, pos, &mut wikilinks, line_idx) {
+                pos = end;
+                continue;
             }
 
-            if line_chars[pos] == '#' && is_tag_start(&line_chars, pos) {
-                let tag_start = pos + 1;
-                let mut tag_end = tag_start;
-                while tag_end < line_chars.len() {
-                    let c = line_chars[tag_end];
-                    if c.is_alphanumeric() || c == '_' || c == '-' {
-                        tag_end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if tag_end > tag_start {
-                    let tag: String = line_chars[tag_start..tag_end].iter().collect();
-                    tags.push(TagRef {
-                        tag,
-                        line: line_idx,
-                        col: pos,
-                    });
-                    pos = tag_end;
-                    continue;
-                }
+            if let Some(end) = try_parse_tag(&chars, pos, &mut tags, line_idx) {
+                pos = end;
+                continue;
             }
 
             pos += 1;
@@ -178,25 +120,128 @@ pub fn parse_markdown(text: &str) -> MarkdownIndex {
 
 fn heading_level(line: &str) -> u8 {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("# ") {
-        return 1;
-    }
-    if trimmed.starts_with("## ") {
-        return 2;
-    }
-    if trimmed.starts_with("### ") {
-        return 3;
-    }
-    if trimmed.starts_with("#### ") {
-        return 4;
+    if trimmed.starts_with("###### ") {
+        return 6;
     }
     if trimmed.starts_with("##### ") {
         return 5;
     }
-    if trimmed.starts_with("###### ") {
-        return 6;
+    if trimmed.starts_with("#### ") {
+        return 4;
+    }
+    if trimmed.starts_with("### ") {
+        return 3;
+    }
+    if trimmed.starts_with("## ") {
+        return 2;
+    }
+    if trimmed.starts_with("# ") {
+        return 1;
     }
     0
+}
+
+fn try_parse_embed(
+    chars: &[char],
+    pos: usize,
+    embeds: &mut Vec<EmbedRef>,
+    line: usize,
+) -> Option<usize> {
+    if pos + 2 < chars.len() && chars[pos] == '!' && chars[pos + 1] == '[' && chars[pos + 2] == '['
+    {
+        if let Some(end) = find_closing_brackets(chars, pos + 3) {
+            let content: String = chars[pos + 3..end].iter().collect();
+            if let Some(colon) = content.find(':') {
+                embeds.push(EmbedRef {
+                    kind: content[..colon].to_string(),
+                    id: content[colon + 1..].to_string(),
+                    line,
+                    col: pos,
+                });
+            }
+            return Some(end + 2);
+        }
+    }
+    None
+}
+
+fn try_parse_wikilink(
+    chars: &[char],
+    pos: usize,
+    wikilinks: &mut Vec<WikiLink>,
+    line: usize,
+) -> Option<usize> {
+    if pos + 1 < chars.len() && chars[pos] == '[' && chars[pos + 1] == '[' {
+        if let Some(end) = find_closing_brackets(chars, pos + 2) {
+            let content: String = chars[pos + 2..end].iter().collect();
+            if let Some(pipe) = content.find('|') {
+                wikilinks.push(WikiLink {
+                    target: content[..pipe].to_string(),
+                    alias: Some(content[pipe + 1..].to_string()),
+                    line,
+                    col: pos,
+                });
+            } else {
+                wikilinks.push(WikiLink {
+                    target: content,
+                    alias: None,
+                    line,
+                    col: pos,
+                });
+            }
+            return Some(end + 2);
+        }
+    }
+    None
+}
+
+fn try_parse_tag(
+    chars: &[char],
+    pos: usize,
+    tags: &mut Vec<TagRef>,
+    line: usize,
+) -> Option<usize> {
+    if chars[pos] != '#' {
+        return None;
+    }
+
+    if pos > 0 {
+        let prev = chars[pos - 1];
+        if prev.is_alphanumeric() || prev == '_' {
+            return None;
+        }
+    }
+
+    if pos + 1 >= chars.len() {
+        return None;
+    }
+
+    if !chars[pos + 1].is_alphanumeric() && chars[pos + 1] != '_' {
+        return None;
+    }
+
+    let tag_start = pos + 1;
+    let mut tag_end = tag_start;
+    while tag_end < chars.len() {
+        let c = chars[tag_end];
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            tag_end += 1;
+        } else {
+            break;
+        }
+    }
+
+    if tag_end > tag_start {
+        let tag: String = chars[tag_start..tag_end].iter().collect();
+        tags.push(TagRef {
+            tag,
+            line,
+            col: pos,
+        });
+        return Some(tag_end);
+    }
+
+    None
 }
 
 fn find_closing_brackets(chars: &[char], start: usize) -> Option<usize> {
@@ -208,20 +253,6 @@ fn find_closing_brackets(chars: &[char], start: usize) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-fn is_tag_start(chars: &[char], pos: usize) -> bool {
-    if pos > 0 {
-        let prev = chars[pos - 1];
-        if prev.is_alphanumeric() || prev == '_' {
-            return false;
-        }
-    }
-    if pos + 1 >= chars.len() {
-        return false;
-    }
-    let next = chars[pos + 1];
-    next.is_alphanumeric() || next == '_'
 }
 
 pub fn extract_backlinks(index: &MarkdownIndex) -> Vec<(String, String)> {
@@ -246,6 +277,7 @@ mod tests {
         let idx = parse_markdown(text);
         assert_eq!(idx.wikilinks.len(), 2);
         assert_eq!(idx.wikilinks[0].target, "Page");
+        assert!(idx.wikilinks[0].alias.is_none());
         assert_eq!(idx.wikilinks[1].target, "Other Page");
         assert_eq!(idx.wikilinks[1].alias, Some("Alias".to_string()));
     }
@@ -287,5 +319,22 @@ mod tests {
         assert_eq!(idx.headings[0].text, "H1");
         assert_eq!(idx.headings[1].level, 2);
         assert_eq!(idx.headings[2].level, 3);
+    }
+
+    #[test]
+    fn test_no_false_tags_in_heading() {
+        let text = "## Heading with #tag";
+        let idx = parse_markdown(text);
+        assert_eq!(idx.tags.len(), 1);
+        assert_eq!(idx.tags[0].tag, "tag");
+        assert_eq!(idx.headings.len(), 1);
+    }
+
+    #[test]
+    fn test_inline_code_skips_wikilinks() {
+        let text = "`[[not a link]]` and [[real link]]";
+        let idx = parse_markdown(text);
+        assert_eq!(idx.wikilinks.len(), 1);
+        assert_eq!(idx.wikilinks[0].target, "real link");
     }
 }

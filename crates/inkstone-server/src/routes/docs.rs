@@ -123,7 +123,7 @@ async fn post_update(
 ) -> AppResult<Json<UpdateResponse>> {
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
-    let seq = db::get_next_seq(&state.db, doc_id).await?;
+    let seq = db::allocate_seq(&state.db, doc_id).await?;
     let encrypted_update = base64_decode(&req.encrypted_update_b64)?;
     let nonce = base64_decode(&req.nonce_b64)?;
 
@@ -243,24 +243,24 @@ async fn post_snapshot(
 }
 
 fn base64_decode(input: &str) -> AppResult<Vec<u8>> {
-    use base64::Engine as _;
+    use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64: {}", e)))
 }
 
 fn base64_encode(input: &[u8]) -> String {
-    use base64::Engine as _;
+    use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(input)
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/workspaces/{workspace_id}/docs", post(create_doc).get(list_docs))
         .route(
-            "/api/docs/{doc_id}",
-            get(get_doc),
+            "/api/workspaces/{workspace_id}/docs",
+            post(create_doc).get(list_docs),
         )
+        .route("/api/docs/{doc_id}", get(get_doc))
         .route(
             "/api/docs/{doc_id}/updates",
             post(post_update).get(list_updates),

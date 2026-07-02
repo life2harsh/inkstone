@@ -49,14 +49,25 @@ pub async fn verify_doc_access(db: &PgPool, doc_id: Uuid, user_id: Uuid) -> AppR
     Ok(())
 }
 
-pub async fn get_next_seq(db: &PgPool, doc_id: Uuid) -> AppResult<i64> {
-    let max_seq = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MAX(seq) FROM doc_updates WHERE doc_id = $1",
+/// Atomically allocate the next sequence number for a document.
+///
+/// Uses `doc_update_counters` with `UPDATE ... RETURNING` so concurrent
+/// callers never see the same sequence number. The row is created on
+/// first access via `INSERT ... ON CONFLICT DO NOTHING`.
+pub async fn allocate_seq(db: &PgPool, doc_id: Uuid) -> AppResult<i64> {
+    sqlx::query(
+        "INSERT INTO doc_update_counters (doc_id, current_seq) VALUES ($1, 0) ON CONFLICT (doc_id) DO NOTHING",
+    )
+    .bind(doc_id)
+    .execute(db)
+    .await?;
+
+    let seq: (i64,) = sqlx::query_as(
+        "UPDATE doc_update_counters SET current_seq = current_seq + 1 WHERE doc_id = $1 RETURNING current_seq",
     )
     .bind(doc_id)
     .fetch_one(db)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    Ok(max_seq + 1)
+    Ok(seq.0)
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 pub type NodeId = String;
 
@@ -47,6 +47,14 @@ impl GraphIndex {
         self.nodes.get(id)
     }
 
+    pub fn get_node_mut(&mut self, id: &str) -> Option<&mut GraphNode> {
+        self.nodes.get_mut(id)
+    }
+
+    pub fn has_node(&self, id: &str) -> bool {
+        self.nodes.contains_key(id)
+    }
+
     pub fn neighbors(&self, node_id: &str) -> Vec<&GraphEdge> {
         self.edges
             .iter()
@@ -91,7 +99,13 @@ impl GraphIndex {
 
     pub fn remove_node(&mut self, node_id: &str) {
         self.nodes.remove(node_id);
-        self.edges.retain(|e| e.source != node_id && e.target != node_id);
+        self.edges
+            .retain(|e| e.source != node_id && e.target != node_id);
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.edges.clear();
     }
 }
 
@@ -141,7 +155,6 @@ mod tests {
     #[test]
     fn test_nodes_by_type() {
         let mut graph = GraphIndex::new();
-        let node_id = Uuid::new_v4();
 
         graph.add_node(GraphNode {
             id: "tag1".into(),
@@ -151,6 +164,7 @@ mod tests {
             metadata: HashMap::new(),
         });
 
+        let node_id = Uuid::new_v4();
         graph.add_node(GraphNode {
             id: "doc1".into(),
             label: "My Doc".into(),
@@ -165,5 +179,70 @@ mod tests {
 
         let docs = graph.nodes_by_type("doc");
         assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_node_removes_edges() {
+        let mut graph = GraphIndex::new();
+
+        graph.add_node(GraphNode {
+            id: "a".into(),
+            label: "A".into(),
+            doc_id: None,
+            node_type: "doc".into(),
+            metadata: HashMap::new(),
+        });
+
+        graph.add_node(GraphNode {
+            id: "b".into(),
+            label: "B".into(),
+            doc_id: None,
+            node_type: "doc".into(),
+            metadata: HashMap::new(),
+        });
+
+        graph.add_edge(GraphEdge {
+            source: "a".into(),
+            target: "b".into(),
+            edge_type: "wikilink".into(),
+            weight: 1.0,
+        });
+
+        graph.remove_node("a");
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut graph = GraphIndex::new();
+        graph.add_node(GraphNode {
+            id: "x".into(),
+            label: "X".into(),
+            doc_id: None,
+            node_type: "doc".into(),
+            metadata: HashMap::new(),
+        });
+        graph.clear();
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_get_node_mut_updates_in_place() {
+        let mut graph = GraphIndex::new();
+        graph.add_node(GraphNode {
+            id: "doc1".into(),
+            label: "Old".into(),
+            doc_id: None,
+            node_type: "doc".into(),
+            metadata: HashMap::new(),
+        });
+
+        if let Some(n) = graph.get_node_mut("doc1") {
+            n.label = "New".into();
+        }
+
+        assert_eq!(graph.get_node("doc1").unwrap().label, "New");
     }
 }

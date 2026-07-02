@@ -3,7 +3,6 @@ use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use uuid::Uuid;
 
@@ -20,18 +19,31 @@ pub async fn ws_handler(
     Path(doc_id): Path<Uuid>,
     auth: DevAuth,
 ) -> AppResult<Response> {
+    let device_id = auth
+        .0
+        .device_id
+        .ok_or_else(|| AppError::BadRequest("x-dev-device-id header is required for WebSocket sync".into()))?;
+
     db::verify_doc_access(&state.db, doc_id, auth.0.user_id).await?;
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, doc_id, auth)
+        handle_socket(socket, state, doc_id, auth.0.user_id, device_id)
     }))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: DevAuth) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    doc_id: Uuid,
+    user_id: Uuid,
+    device_id: Uuid,
+) {
     let (tx, mut rx) = rooms::join_or_create_async(&state.doc_rooms, doc_id).await;
-
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
+    // Send task: forward broadcast messages to this WebSocket client.
+    // The sender receives its own broadcast. The client must ignore
+    // messages matching its own client_update_id to avoid echo.
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {
@@ -48,6 +60,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
         }
     });
 
+    // Recv task: read messages from WebSocket and broadcast to room.
     let recv_task = tokio::spawn(async move {
         let tx_clone = tx;
         let db = state.db.clone();
@@ -58,23 +71,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
                     let parsed = serde_json::from_str::<ClientWsMessage>(&text);
                     match parsed {
                         Ok(ClientWsMessage::EncryptedUpdate {
-                            doc_id,
+                            doc_id: msg_doc_id,
                             client_update_id,
                             encrypted_update_b64,
                             nonce_b64,
                             aad_version,
                         }) => {
-                            let sender_device_id = auth.0.device_id.unwrap_or_else(Uuid::new_v4);
+                            // Reject if the message's doc_id does not match the path param.
+                            if msg_doc_id != doc_id {
+                                let _ = tx_clone
+                                    .send(ServerWsMessage::Error {
+                                        message: "doc_id in message does not match path".into(),
+                                    });
+                                continue;
+                            }
 
-                            let seq = match sqlx::query_scalar::<_, Option<i64>>(
-                                "SELECT MAX(seq) FROM doc_updates WHERE doc_id = $1",
-                            )
-                            .bind(doc_id)
-                            .fetch_one(&db)
-                            .await
-                            {
-                                Ok(Some(s)) => s + 1,
-                                Ok(None) => 1,
+                            // Allocate sequence number atomically.
+                            let seq = match db::allocate_seq(&db, doc_id).await {
+                                Ok(s) => s,
                                 Err(_) => continue,
                             };
 
@@ -87,13 +101,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
                                 Err(_) => continue,
                             };
 
+                            // Persist the opaque encrypted update blob.
                             if let Err(e) = sqlx::query(
                                 "INSERT INTO doc_updates (doc_id, seq, sender_device_id, encrypted_update, nonce, aad_version, client_update_id)
                                  VALUES ($1, $2, $3, $4, $5, $6, $7)",
                             )
                             .bind(doc_id)
                             .bind(seq)
-                            .bind(sender_device_id)
+                            .bind(device_id)
                             .bind(&encrypted_update)
                             .bind(&nonce)
                             .bind(aad_version)
@@ -105,15 +120,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
                                 continue;
                             }
 
+                            sqlx::query("UPDATE docs SET updated_at = NOW() WHERE id = $1")
+                                .bind(doc_id)
+                                .execute(&db)
+                                .await
+                                .ok();
+
                             let broadcast_msg = ServerWsMessage::EncryptedUpdate {
                                 doc_id,
-                                sender_device_id,
+                                sender_device_id: device_id,
                                 seq,
                                 encrypted_update_b64,
                                 nonce_b64,
                                 aad_version,
                             };
 
+                            // Broadcast to ALL clients in the room, including the sender.
+                            // The sender client ignores its own update by matching client_update_id.
                             let _ = tx_clone.send(broadcast_msg);
                         }
 
@@ -122,13 +145,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
                         }
 
                         Ok(ClientWsMessage::Presence {
-                            doc_id,
+                            doc_id: msg_doc_id,
                             encrypted_presence_b64,
                         }) => {
-                            let sender_device_id = auth.0.device_id.unwrap_or_else(Uuid::new_v4);
+                            if msg_doc_id != doc_id {
+                                continue;
+                            }
                             let broadcast_msg = ServerWsMessage::Presence {
                                 doc_id,
-                                sender_device_id,
+                                sender_device_id: device_id,
                                 encrypted_presence_b64,
                             };
                             let _ = tx_clone.send(broadcast_msg);
@@ -156,7 +181,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, doc_id: Uuid, auth: D
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine as _;
+    use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|e| format!("Base64 decode error: {}", e))
