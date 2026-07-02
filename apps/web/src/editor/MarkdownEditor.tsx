@@ -21,20 +21,19 @@ export function MarkdownEditor({ docId, initialContent, onChange, syncClient }: 
     const value = textareaRef.current?.value ?? '';
     onChange(value);
 
-    // Placeholder: encrypt and send update via sync client
     if (syncClient?.isConnected()) {
+      // DEV MODE PLACEHOLDER: base64-encode plaintext.
+      // This is NOT encrypted. Real clients must encrypt with XChaCha20-Poly1305
+      // before sending. The server never sees plaintext in production.
       const encoder = new TextEncoder();
-      const plaintext = encoder.encode(value);
-
-      // TODO: Replace with actual XChaCha20-Poly1305 encryption
-      // For now, send plaintext as a placeholder (not secure!)
-      const fakeCiphertext = btoa(String.fromCharCode(...plaintext));
+      const devPlaintext = encoder.encode(value);
+      const devPlaintextB64 = btoa(String.fromCharCode(...devPlaintext));
 
       syncClient.send({
         type: 'encrypted_update',
         doc_id: docId,
         client_update_id: crypto.randomUUID(),
-        encrypted_update_b64: fakeCiphertext,
+        encrypted_update_b64: devPlaintextB64,
         nonce_b64: btoa('0'.repeat(24)),
         aad_version: 1,
       });

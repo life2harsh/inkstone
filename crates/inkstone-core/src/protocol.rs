@@ -30,6 +30,7 @@ pub enum ServerWsMessage {
     EncryptedUpdate {
         doc_id: Uuid,
         sender_device_id: Uuid,
+        client_update_id: Uuid,
         seq: i64,
         encrypted_update_b64: String,
         nonce_b64: String,
@@ -83,6 +84,17 @@ pub struct PostSnapshotRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateResponse {
     pub seq: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedUpdateResponse {
+    pub seq: i64,
+    pub client_update_id: Uuid,
+    pub sender_device_id: Uuid,
+    pub encrypted_update_b64: String,
+    pub nonce_b64: String,
+    pub aad_version: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

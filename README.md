@@ -2,23 +2,52 @@
 
 Self-hostable, local-first, E2EE collaborative Markdown knowledge workspace.
 
-**Status:** v0.1 — Foundation.
+**Status:** v0.1 — Sync spine.
+
+## Prerequisites
+
+- Docker + Docker Compose
+- Rust 1.85+ (`rustup`, `cargo`)
+- Node 20+ (for frontend)
 
 ## Quick Start
 
 ```bash
-# 1. Start Postgres
+# 1. Generate Cargo.lock (first-time setup)
+cargo generate-lockfile
+
+# 2. Start Postgres
 docker compose up -d postgres
 
-# 2. Run the server (initializes schema automatically)
+# 3. Run the server (runs migrations on startup)
 cargo run -p inkstone-server
 ```
 
 Server listens on `http://0.0.0.0:8080`.
 
+## Frontend
+
+```bash
+cd apps/web
+npm install
+npm run dev
+```
+
+## All Commands
+
+```bash
+cargo generate-lockfile       # create Cargo.lock if missing
+cargo fmt                     # format Rust code
+cargo check --workspace       # type-check all crates
+cargo test --workspace        # run all tests
+cd apps/web && npm run build  # build frontend
+docker compose build          # build Docker image
+```
+
 ## API
 
-All non-WS routes require `x-dev-user-id: <uuid>` header in dev auth mode.
+Dev auth: HTTP routes use `x-dev-user-id` and `x-dev-device-id` headers.
+WebSocket uses query params `?dev_user_id=...&dev_device_id=...`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -28,8 +57,8 @@ All non-WS routes require `x-dev-user-id: <uuid>` header in dev auth mode.
 | POST | `/api/workspaces/:id/docs` | Create document (encrypted title) |
 | GET | `/api/workspaces/:id/docs` | List documents in workspace |
 | GET | `/api/docs/:id` | Get document metadata |
-| POST | `/api/docs/:id/updates` | Store encrypted update blob |
-| GET | `/api/docs/:id/updates` | List update sequence numbers |
+| POST | `/api/docs/:id/updates` | Store encrypted update blob (idempotent) |
+| GET | `/api/docs/:id/updates?after_seq=0&limit=500` | List encrypted update blobs |
 | GET | `/api/docs/:id/snapshot` | Get latest encrypted snapshot |
 | POST | `/api/docs/:id/snapshot` | Upsert encrypted snapshot |
 | GET | `/api/sync/docs/:id/ws` | WebSocket for real-time sync |
@@ -46,7 +75,3 @@ All non-WS routes require `x-dev-user-id: <uuid>` header in dev auth mode.
 - Dev auth is NOT production-safe
 - Server cannot perform plaintext search
 - See `docs/security.md` for details
-
-## Vault → Migration
-
-(Coming in v0.2)
