@@ -22,9 +22,6 @@ export function MarkdownEditor({ docId, initialContent, onChange, syncClient }: 
     onChange(value);
 
     if (syncClient?.isConnected()) {
-      // DEV MODE PLACEHOLDER: base64-encode plaintext.
-      // This is NOT encrypted. Real clients must encrypt with XChaCha20-Poly1305
-      // before sending. The server never sees plaintext in production.
       const encoder = new TextEncoder();
       const devPlaintext = encoder.encode(value);
       const devPlaintextB64 = btoa(String.fromCharCode(...devPlaintext));

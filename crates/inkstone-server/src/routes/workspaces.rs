@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use uuid::Uuid;
 

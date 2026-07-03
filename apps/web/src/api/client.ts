@@ -40,8 +40,6 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
-// Workspaces
-
 export async function createWorkspace(name: string, description?: string): Promise<Workspace> {
   return request<Workspace>('/api/workspaces', {
     method: 'POST',
@@ -52,8 +50,6 @@ export async function createWorkspace(name: string, description?: string): Promi
 export async function listWorkspaces(): Promise<PaginatedResponse<Workspace>> {
   return request<PaginatedResponse<Workspace>>('/api/workspaces');
 }
-
-// Docs
 
 export async function createDoc(
   workspaceId: string,
@@ -77,8 +73,6 @@ export async function getDoc(docId: string): Promise<Doc> {
   return request<Doc>(`/api/docs/${docId}`);
 }
 
-// Updates
-
 export async function postUpdate(
   docId: string,
   req: PostUpdateRequest,
@@ -101,8 +95,6 @@ export async function listUpdates(
   const url = `/api/docs/${docId}/updates${qs ? '?' + qs : ''}`;
   return request<PaginatedResponse<EncryptedUpdateResponse>>(url);
 }
-
-// Snapshots
 
 export async function getSnapshot(docId: string): Promise<SnapshotResponse> {
   return request<SnapshotResponse>(`/api/docs/${docId}/snapshot`);

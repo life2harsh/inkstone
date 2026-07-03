@@ -132,8 +132,6 @@ async fn post_update(
         AppError::BadRequest("x-dev-device-id header is required".into())
     })?;
 
-    // Verify the request sender_device_id matches the authenticated device.
-    // This prevents one device from impersonating another via the REST API.
     if req.sender_device_id != device_id {
         return Err(AppError::BadRequest(
             "sender_device_id does not match authenticated device".into(),

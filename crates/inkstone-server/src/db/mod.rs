@@ -5,6 +5,33 @@ use uuid::Uuid;
 
 use crate::error::AppResult;
 
+pub async fn create_pool(database_url: &str) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .connect(database_url)
+        .await
+        .expect("Failed to connect to Postgres")
+}
+
+pub async fn run_migrations(pool: &PgPool) {
+    sqlx::migrate!("../../migrations")
+        .run(pool)
+        .await
+        .expect("Failed to run migrations");
+}
+
+pub async fn create_test_pool() -> PgPool {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://inkstone:inkstone@localhost:5433/inkstone_test".into());
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to test database. Is the test Postgres running on port 5433?");
+    run_migrations(&pool).await;
+    pool
+}
+
 pub async fn verify_workspace_access(
     db: &PgPool,
     workspace_id: Uuid,
@@ -71,11 +98,6 @@ pub async fn verify_device_owner(
     Ok(())
 }
 
-/// Atomically allocate the next sequence number for a document.
-///
-/// Uses `doc_update_counters` with `UPDATE ... RETURNING` so concurrent
-/// callers never see the same sequence number. The row is created on
-/// first access via `INSERT ... ON CONFLICT DO NOTHING`.
 pub async fn allocate_seq(db: &PgPool, doc_id: Uuid) -> AppResult<i64> {
     sqlx::query(
         "INSERT INTO doc_update_counters (doc_id, current_seq) VALUES ($1, 0) ON CONFLICT (doc_id) DO NOTHING",
@@ -99,11 +121,6 @@ pub struct StoredUpdate {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Insert a doc update idempotently.
-///
-/// 1. If `(doc_id, client_update_id)` already exists, return its seq and created_at.
-/// 2. Otherwise, allocate a seq and insert. If a unique-vs-client_update_id race
-///    is lost, read the existing row and return that instead.
 pub async fn insert_doc_update_idempotent(
     db: &PgPool,
     doc_id: Uuid,
