@@ -35,6 +35,16 @@ export interface UpdateResponse {
   created_at: string;
 }
 
+export interface EncryptedUpdateResponse {
+  seq: number;
+  client_update_id: string;
+  sender_device_id: string;
+  encrypted_update_b64: string;
+  nonce_b64: string;
+  aad_version: number;
+  created_at: string;
+}
+
 export interface SnapshotResponse {
   snapshot_version: number;
   encrypted_snapshot_b64: string;
@@ -64,6 +74,7 @@ export type ServerWsMessage =
       type: 'encrypted_update';
       doc_id: string;
       sender_device_id: string;
+      client_update_id: string;
       seq: number;
       encrypted_update_b64: string;
       nonce_b64: string;

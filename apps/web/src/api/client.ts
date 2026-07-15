@@ -1,12 +1,30 @@
-import type { Doc, PaginatedResponse, PostUpdateRequest, SnapshotResponse, UpdateResponse, Workspace } from '../types';
+import type {
+  Doc,
+  EncryptedUpdateResponse,
+  PaginatedResponse,
+  PostUpdateRequest,
+  SnapshotResponse,
+  UpdateResponse,
+  Workspace,
+} from '../types';
 
-const DEV_USER_ID = '11111111-1111-4111-8111-111111111111';
+function getOrCreateId(key: string): string {
+  let value = localStorage.getItem(key);
+  if (!value) {
+    value = crypto.randomUUID();
+    localStorage.setItem(key, value);
+  }
+  return value;
+}
+
+export const DEV_USER_ID = getOrCreateId('inkstone.devUserId');
+export const DEV_DEVICE_ID = getOrCreateId('inkstone.devDeviceId');
 
 function headers(): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     'x-dev-user-id': DEV_USER_ID,
-    'x-dev-device-id': crypto.randomUUID(),
+    'x-dev-device-id': DEV_DEVICE_ID,
   };
 }
 
@@ -61,15 +79,27 @@ export async function getDoc(docId: string): Promise<Doc> {
 
 // Updates
 
-export async function postUpdate(docId: string, req: PostUpdateRequest): Promise<UpdateResponse> {
+export async function postUpdate(
+  docId: string,
+  req: PostUpdateRequest,
+): Promise<UpdateResponse> {
   return request<UpdateResponse>(`/api/docs/${docId}/updates`, {
     method: 'POST',
     body: JSON.stringify(req),
   });
 }
 
-export async function listUpdates(docId: string): Promise<PaginatedResponse<UpdateResponse>> {
-  return request<PaginatedResponse<UpdateResponse>>(`/api/docs/${docId}/updates`);
+export async function listUpdates(
+  docId: string,
+  afterSeq?: number,
+  limit?: number,
+): Promise<PaginatedResponse<EncryptedUpdateResponse>> {
+  const params = new URLSearchParams();
+  if (afterSeq !== undefined) params.set('after_seq', String(afterSeq));
+  if (limit !== undefined) params.set('limit', String(limit));
+  const qs = params.toString();
+  const url = `/api/docs/${docId}/updates${qs ? '?' + qs : ''}`;
+  return request<PaginatedResponse<EncryptedUpdateResponse>>(url);
 }
 
 // Snapshots

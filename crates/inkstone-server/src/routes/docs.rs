@@ -1,6 +1,7 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::DevAuth;
@@ -8,9 +9,15 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use inkstone_core::protocol::{
-    CreateDocRequest, DocResponse, PaginatedResponse, PostSnapshotRequest, PostUpdateRequest,
-    SnapshotResponse, UpdateResponse,
+    CreateDocRequest, DocResponse, EncryptedUpdateResponse, PaginatedResponse,
+    PostSnapshotRequest, PostUpdateRequest, SnapshotResponse, UpdateResponse,
 };
+
+#[derive(Deserialize)]
+pub struct ListUpdatesParams {
+    pub after_seq: Option<i64>,
+    pub limit: Option<i64>,
+}
 
 async fn create_doc(
     State(state): State<AppState>,
@@ -94,7 +101,7 @@ async fn get_doc(
 ) -> AppResult<Json<DocResponse>> {
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
-    let row = sqlx::query_as::<_, Option<(Uuid, Uuid, Vec<u8>, Vec<u8>, Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>>(
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, Vec<u8>, Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
         "SELECT id, workspace_id, encrypted_title, title_nonce, created_by, created_at, updated_at FROM docs WHERE id = $1",
     )
     .bind(doc_id)
@@ -121,24 +128,32 @@ async fn post_update(
     Path(doc_id): Path<Uuid>,
     Json(req): Json<PostUpdateRequest>,
 ) -> AppResult<Json<UpdateResponse>> {
+    let device_id = auth.device_id.ok_or_else(|| {
+        AppError::BadRequest("x-dev-device-id header is required".into())
+    })?;
+
+    // Verify the request sender_device_id matches the authenticated device.
+    // This prevents one device from impersonating another via the REST API.
+    if req.sender_device_id != device_id {
+        return Err(AppError::BadRequest(
+            "sender_device_id does not match authenticated device".into(),
+        ));
+    }
+
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
-    let seq = db::allocate_seq(&state.db, doc_id).await?;
     let encrypted_update = base64_decode(&req.encrypted_update_b64)?;
     let nonce = base64_decode(&req.nonce_b64)?;
 
-    sqlx::query(
-        "INSERT INTO doc_updates (doc_id, seq, sender_device_id, encrypted_update, nonce, aad_version, client_update_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    let stored = db::insert_doc_update_idempotent(
+        &state.db,
+        doc_id,
+        device_id,
+        req.client_update_id,
+        encrypted_update,
+        nonce,
+        req.aad_version,
     )
-    .bind(doc_id)
-    .bind(seq)
-    .bind(req.sender_device_id)
-    .bind(&encrypted_update)
-    .bind(&nonce)
-    .bind(req.aad_version)
-    .bind(req.client_update_id)
-    .execute(&state.db)
     .await?;
 
     sqlx::query("UPDATE docs SET updated_at = NOW() WHERE id = $1")
@@ -146,36 +161,58 @@ async fn post_update(
         .execute(&state.db)
         .await?;
 
-    let created_at = chrono::Utc::now();
-
-    Ok(Json(UpdateResponse { seq, created_at }))
+    Ok(Json(UpdateResponse {
+        seq: stored.seq,
+        created_at: stored.created_at,
+    }))
 }
 
 async fn list_updates(
     State(state): State<AppState>,
     DevAuth(auth): DevAuth,
     Path(doc_id): Path<Uuid>,
-) -> AppResult<Json<PaginatedResponse<UpdateResponse>>> {
+    Query(params): Query<ListUpdatesParams>,
+) -> AppResult<Json<PaginatedResponse<EncryptedUpdateResponse>>> {
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
-    let rows = sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>)>(
-        "SELECT seq, created_at FROM doc_updates WHERE doc_id = $1 ORDER BY seq ASC",
+    let after_seq = params.after_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(500).min(1000);
+
+    let rows = sqlx::query_as::<_, (i64, Uuid, Uuid, Vec<u8>, Vec<u8>, i32, chrono::DateTime<chrono::Utc>)>(
+        "SELECT seq, client_update_id, sender_device_id, encrypted_update, nonce, aad_version, created_at
+         FROM doc_updates WHERE doc_id = $1 AND seq > $2
+         ORDER BY seq ASC
+         LIMIT $3",
     )
     .bind(doc_id)
+    .bind(after_seq)
+    .bind(limit)
     .fetch_all(&state.db)
     .await?;
 
-    let items: Vec<UpdateResponse> = rows
+    let total_row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM doc_updates WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_one(&state.db)
+            .await?;
+
+    let items: Vec<EncryptedUpdateResponse> = rows
         .into_iter()
-        .map(|r| UpdateResponse {
+        .map(|r| EncryptedUpdateResponse {
             seq: r.0,
-            created_at: r.1,
+            client_update_id: r.1,
+            sender_device_id: r.2,
+            encrypted_update_b64: base64_encode(&r.3),
+            nonce_b64: base64_encode(&r.4),
+            aad_version: r.5,
+            created_at: r.6,
         })
         .collect();
 
-    let total = items.len() as i64;
-
-    Ok(Json(PaginatedResponse { items, total }))
+    Ok(Json(PaginatedResponse {
+        total: total_row.0,
+        items,
+    }))
 }
 
 async fn get_snapshot(

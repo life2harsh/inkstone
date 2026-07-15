@@ -1,33 +1,56 @@
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::DevAuth;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::sync::rooms;
 use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
 
+#[derive(Deserialize)]
+pub struct WsAuthParams {
+    pub dev_user_id: Uuid,
+    pub dev_device_id: Uuid,
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(doc_id): Path<Uuid>,
-    auth: DevAuth,
+    Query(params): Query<WsAuthParams>,
 ) -> AppResult<Response> {
-    let device_id = auth
-        .0
-        .device_id
-        .ok_or_else(|| AppError::BadRequest("x-dev-device-id header is required for WebSocket sync".into()))?;
+    let user_id = params.dev_user_id;
+    let device_id = params.dev_device_id;
 
-    db::verify_doc_access(&state.db, doc_id, auth.0.user_id).await?;
+    // Ensure user exists (dev auth: auto-create).
+    sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+
+    // Ensure device exists (dev auth: auto-create).
+    sqlx::query(
+        "INSERT INTO devices (id, user_id) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET last_seen_at = NOW()",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    // Verify device belongs to user.
+    db::verify_device_owner(&state.db, device_id, user_id).await?;
+
+    // Verify user has access to this document.
+    db::verify_doc_access(&state.db, doc_id, user_id).await?;
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, doc_id, auth.0.user_id, device_id)
+        handle_socket(socket, state, doc_id, user_id, device_id)
     }))
 }
 
@@ -86,39 +109,46 @@ async fn handle_socket(
                                 continue;
                             }
 
-                            // Allocate sequence number atomically.
-                            let seq = match db::allocate_seq(&db, doc_id).await {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-
                             let encrypted_update = match base64_decode(&encrypted_update_b64) {
                                 Ok(b) => b,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    let _ = tx_clone.send(ServerWsMessage::Error {
+                                        message: format!("Invalid encrypted_update_b64: {}", e),
+                                    });
+                                    continue;
+                                }
                             };
                             let nonce = match base64_decode(&nonce_b64) {
                                 Ok(b) => b,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    let _ = tx_clone.send(ServerWsMessage::Error {
+                                        message: format!("Invalid nonce_b64: {}", e),
+                                    });
+                                    continue;
+                                }
                             };
 
-                            // Persist the opaque encrypted update blob.
-                            if let Err(e) = sqlx::query(
-                                "INSERT INTO doc_updates (doc_id, seq, sender_device_id, encrypted_update, nonce, aad_version, client_update_id)
-                                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            // Persist idempotently (handles retry/dup).
+                            let stored = match db::insert_doc_update_idempotent(
+                                &db,
+                                doc_id,
+                                device_id,
+                                client_update_id,
+                                encrypted_update,
+                                nonce,
+                                aad_version,
                             )
-                            .bind(doc_id)
-                            .bind(seq)
-                            .bind(device_id)
-                            .bind(&encrypted_update)
-                            .bind(&nonce)
-                            .bind(aad_version)
-                            .bind(client_update_id)
-                            .execute(&db)
                             .await
                             {
-                                tracing::error!("Failed to store update: {:?}", e);
-                                continue;
-                            }
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!("Failed to store update: {:?}", e);
+                                    let _ = tx_clone.send(ServerWsMessage::Error {
+                                        message: "Internal error storing update".into(),
+                                    });
+                                    continue;
+                                }
+                            };
 
                             sqlx::query("UPDATE docs SET updated_at = NOW() WHERE id = $1")
                                 .bind(doc_id)
@@ -129,7 +159,8 @@ async fn handle_socket(
                             let broadcast_msg = ServerWsMessage::EncryptedUpdate {
                                 doc_id,
                                 sender_device_id: device_id,
-                                seq,
+                                client_update_id,
+                                seq: stored.seq,
                                 encrypted_update_b64,
                                 nonce_b64,
                                 aad_version,

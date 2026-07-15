@@ -92,7 +92,8 @@ CREATE TABLE doc_updates (
     aad_version INTEGER NOT NULL DEFAULT 1,
     client_update_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(doc_id, seq)
+    UNIQUE(doc_id, seq),
+    UNIQUE(doc_id, client_update_id)
 );
 
 -- doc_snapshots (encrypted full-document snapshots)
