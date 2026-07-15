@@ -1,0 +1,142 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+  background: #fafafa;
+  color: #1a1a1a;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  width: 260px;
+  border-right: 1px solid #e0e0e0;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid #e0e0e0;
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #666;
+}
+
+.sidebar-section {
+  padding: 8px 0;
+}
+
+.sidebar-item {
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background 0.15s;
+}
+
+.sidebar-item:hover {
+  background: #f0f0f0;
+}
+
+.sidebar-item.active {
+  background: #e8f0fe;
+  color: #1a73e8;
+  font-weight: 500;
+}
+
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.toolbar {
+  height: 48px;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  background: #fff;
+  gap: 12px;
+  font-size: 14px;
+}
+
+.editor-container {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.editor-pane {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 32px;
+}
+
+.side-panel {
+  width: 280px;
+  border-left: 1px solid #e0e0e0;
+  background: #fff;
+  overflow-y: auto;
+  padding: 16px;
+  font-size: 13px;
+}
+
+.side-panel h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.markdown-editor {
+  width: 100%;
+  min-height: calc(100vh - 120px);
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 15px;
+  line-height: 1.7;
+  background: transparent;
+  color: #1a1a1a;
+}
+
+.markdown-editor::placeholder {
+  color: #bbb;
+}
+
+.panel-placeholder {
+  color: #999;
+  font-style: italic;
+  padding: 12px 0;
+}
+
+.ink-block-placeholder {
+  border: 1px dashed #ccc;
+  border-radius: 8px;
+  padding: 24px;
+  margin: 12px 0;
+  text-align: center;
+  color: #999;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ink-block-placeholder:hover {
+  border-color: #1a73e8;
+  color: #1a73e8;
+}
