@@ -74,16 +74,23 @@ CREATE TABLE docs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Atomic sequence counter per document for concurrent-safe seq allocation.
+-- INSERT on first use, then UPDATE ... RETURNING current_seq + 1 each time.
+CREATE TABLE doc_update_counters (
+    doc_id UUID PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
+    current_seq BIGINT NOT NULL DEFAULT 0
+);
+
 -- doc_updates (encrypted CRDT update blobs)
 CREATE TABLE doc_updates (
     id BIGSERIAL PRIMARY KEY,
     doc_id UUID NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
     seq BIGINT NOT NULL,
-    sender_device_id UUID,
+    sender_device_id UUID NOT NULL,
     encrypted_update BYTEA NOT NULL,
     nonce BYTEA NOT NULL,
     aad_version INTEGER NOT NULL DEFAULT 1,
-    client_update_id UUID,
+    client_update_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(doc_id, seq)
 );

@@ -60,15 +60,21 @@ pub struct Doc {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct DocUpdateCounter {
+    pub doc_id: Uuid,
+    pub current_seq: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct DocUpdate {
     pub id: i64,
     pub doc_id: Uuid,
     pub seq: i64,
-    pub sender_device_id: Option<Uuid>,
+    pub sender_device_id: Uuid,
     pub encrypted_update: Vec<u8>,
     pub nonce: Vec<u8>,
     pub aad_version: i32,
-    pub client_update_id: Option<Uuid>,
+    pub client_update_id: Uuid,
     pub created_at: DateTime<Utc>,
 }
 

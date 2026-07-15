@@ -1,4 +1,6 @@
-#[derive(Debug, Clone)]
+use std::fmt;
+
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub host: String,
@@ -8,6 +10,21 @@ pub struct Config {
     pub oidc_client_id: Option<String>,
     pub oidc_client_secret: Option<String>,
     pub log_level: String,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &self.database_url)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("dev_auth", &self.dev_auth)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("oidc_client_secret", &"[REDACTED]")
+            .field("log_level", &self.log_level)
+            .finish()
+    }
 }
 
 impl Config {
