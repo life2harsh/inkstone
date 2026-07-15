@@ -9,8 +9,6 @@ export class DocSyncClient {
   private onMessage: SyncCallback;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
-
-  // Track outgoing client_update_ids so echo from broadcast is suppressed.
   private pendingOutgoingIds: Set<string> = new Set();
   private maxPendingIds = 64;
 
@@ -40,13 +38,8 @@ export class DocSyncClient {
       try {
         const parsed: ServerWsMessage = JSON.parse(event.data);
 
-        // Suppress own echo: if this is our own encrypted_update broadcast,
-        // matched by client_update_id, drop it silently.
-        if (parsed.type === 'encrypted_update') {
-          if (this.pendingOutgoingIds.has(parsed.client_update_id)) {
-            this.pendingOutgoingIds.delete(parsed.client_update_id);
-            return;
-          }
+        if (this.shouldSuppressEcho(parsed)) {
+          return;
         }
 
         this.onMessage(parsed);
@@ -91,5 +84,13 @@ export class DocSyncClient {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  private shouldSuppressEcho(msg: ServerWsMessage): boolean {
+    if (msg.type === 'encrypted_update' && this.pendingOutgoingIds.has(msg.client_update_id)) {
+      this.pendingOutgoingIds.delete(msg.client_update_id);
+      return true;
+    }
+    return false;
   }
 }

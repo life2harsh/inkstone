@@ -52,7 +52,6 @@ export interface SnapshotResponse {
   created_at: string;
 }
 
-// WebSocket protocol types (mirrors core/protocol.rs)
 export type ClientWsMessage =
   | {
       type: 'encrypted_update';

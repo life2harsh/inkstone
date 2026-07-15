@@ -1,13 +1,6 @@
 use tracing_subscriber::EnvFilter;
 
-mod app;
-mod auth;
-mod config;
-mod db;
-mod error;
-mod routes;
-mod state;
-mod sync;
+use inkstone_server::{app, config, db, state};
 
 #[tokio::main]
 async fn main() {
@@ -20,12 +13,7 @@ async fn main() {
     let config = config::Config::from_env();
     tracing::info!("Starting Inkstone server with config: {:?}", config);
 
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await
-        .expect("Failed to connect to Postgres");
-
+    let pool = db::create_pool(&config.database_url).await;
     sqlx::migrate!("../../migrations")
         .run(&pool)
         .await

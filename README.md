@@ -7,7 +7,7 @@ Self-hostable, local-first, E2EE collaborative Markdown knowledge workspace.
 ## Prerequisites
 
 - Docker + Docker Compose
-- Rust 1.85+ (`rustup`, `cargo`)
+- Rust 1.88+ (`rustup`, `cargo`)
 - Node 20+ (for frontend)
 
 ## Quick Start
@@ -36,10 +36,11 @@ npm run dev
 ## All Commands
 
 ```bash
-cargo generate-lockfile       # create Cargo.lock if missing
+cargo generate-lockfile       # create Cargo.lock if missing (required before docker compose build)
 cargo fmt                     # format Rust code
 cargo check --workspace       # type-check all crates
-cargo test --workspace        # run all tests
+cargo test -p inkstone-core   # run unit tests (no database needed)
+./scripts/run-tests.sh        # run all tests (starts test Postgres automatically)
 cd apps/web && npm run build  # build frontend
 docker compose build          # build Docker image
 ```
@@ -68,10 +69,16 @@ WebSocket uses query params `?dev_user_id=...&dev_device_id=...`.
 - **inkstone-core**: Shared types (IDs, crypto envelope, protocol messages, ink model, markdown parser, graph index)
 - **inkstone-server**: Axum HTTP + WebSocket server, SQLx + Postgres, zero-knowledge document storage
 
+## v0.1 security status
+
+The current web client uses dev-only base64 plaintext placeholders. This is not encryption.
+The server sync spine stores opaque blobs and is designed for client-side encryption.
+Real E2EE is planned for the client crypto module.
+Do not deploy dev auth in production.
+
 ## Security
 
 - Server stores only encrypted blobs (titles, updates, snapshots, metadata)
 - Client must encrypt before upload (XChaCha20-Poly1305 via WASM or WebCrypto)
 - Dev auth is NOT production-safe
 - Server cannot perform plaintext search
-- See `docs/security.md` for details

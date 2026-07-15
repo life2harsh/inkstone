@@ -8,7 +8,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::state::AppState;
 use crate::sync::rooms;
 use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
@@ -28,13 +28,11 @@ pub async fn ws_handler(
     let user_id = params.dev_user_id;
     let device_id = params.dev_device_id;
 
-    // Ensure user exists (dev auth: auto-create).
     sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
         .bind(user_id)
         .execute(&state.db)
         .await?;
 
-    // Ensure device exists (dev auth: auto-create).
     sqlx::query(
         "INSERT INTO devices (id, user_id) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET last_seen_at = NOW()",
     )
@@ -43,14 +41,11 @@ pub async fn ws_handler(
     .execute(&state.db)
     .await?;
 
-    // Verify device belongs to user.
     db::verify_device_owner(&state.db, device_id, user_id).await?;
-
-    // Verify user has access to this document.
     db::verify_doc_access(&state.db, doc_id, user_id).await?;
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, doc_id, user_id, device_id)
+        handle_socket(socket, state, doc_id, device_id)
     }))
 }
 
@@ -58,15 +53,11 @@ async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     doc_id: Uuid,
-    user_id: Uuid,
     device_id: Uuid,
 ) {
     let (tx, mut rx) = rooms::join_or_create_async(&state.doc_rooms, doc_id).await;
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Send task: forward broadcast messages to this WebSocket client.
-    // The sender receives its own broadcast. The client must ignore
-    // messages matching its own client_update_id to avoid echo.
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {
@@ -83,7 +74,6 @@ async fn handle_socket(
         }
     });
 
-    // Recv task: read messages from WebSocket and broadcast to room.
     let recv_task = tokio::spawn(async move {
         let tx_clone = tx;
         let db = state.db.clone();
@@ -100,7 +90,6 @@ async fn handle_socket(
                             nonce_b64,
                             aad_version,
                         }) => {
-                            // Reject if the message's doc_id does not match the path param.
                             if msg_doc_id != doc_id {
                                 let _ = tx_clone
                                     .send(ServerWsMessage::Error {
@@ -128,7 +117,6 @@ async fn handle_socket(
                                 }
                             };
 
-                            // Persist idempotently (handles retry/dup).
                             let stored = match db::insert_doc_update_idempotent(
                                 &db,
                                 doc_id,
@@ -166,8 +154,7 @@ async fn handle_socket(
                                 aad_version,
                             };
 
-                            // Broadcast to ALL clients in the room, including the sender.
-                            // The sender client ignores its own update by matching client_update_id.
+                            // Broadcast includes sender; client ignores echo via client_update_id.
                             let _ = tx_clone.send(broadcast_msg);
                         }
 
@@ -197,6 +184,11 @@ async fn handle_socket(
                                 });
                         }
                     }
+                }
+                Message::Binary(_) => {
+                    let _ = tx_clone.send(ServerWsMessage::Error {
+                        message: "Binary WebSocket messages are not supported".into(),
+                    });
                 }
                 Message::Close(_) | Message::Ping(_) | Message::Pong(_) => {}
             }

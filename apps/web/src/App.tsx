@@ -5,12 +5,10 @@ import { DocList } from './components/DocList';
 import { GraphPanel } from './components/GraphPanel';
 import { MarkdownEditor } from './editor/MarkdownEditor';
 import { DocSyncClient } from './editor/sync';
-import { createWorkspace, createDoc, getDoc } from './api/client';
+import { createWorkspace, createDoc } from './api/client';
 import type { Workspace, Doc } from './types';
 
-// Placeholder: In v0.2, this will be decrypted client-side.
-// For now, the "encrypted_title" is displayed as-is.
-function placeholderDecrypt(b64: string): string {
+function decodeDevBase64Title(b64: string): string {
   try {
     const binary = atob(b64);
     return new TextDecoder().decode(
@@ -27,7 +25,6 @@ export default function App() {
   const [docContent, setDocContent] = useState('');
   const [syncClient, setSyncClient] = useState<DocSyncClient | null>(null);
 
-  // Connect sync when a doc is selected
   useEffect(() => {
     if (!selectedDoc) return;
 
@@ -51,8 +48,7 @@ export default function App() {
 
   const handleSelectDoc = useCallback((doc: Doc) => {
     setSelectedDoc(doc);
-    // In v0.2, fetch and decrypt document content from snapshot + updates
-    setDocContent(`# Document ${doc.id.slice(0, 8)}\n\nContent will be decrypted client-side in v0.2.`);
+    setDocContent(`# Document ${doc.id.slice(0, 8)}\n\nNo saved content replay is loaded yet.`);
   }, []);
 
   const handleCreateWorkspace = useCallback(async () => {
@@ -66,7 +62,6 @@ export default function App() {
     if (!selectedWorkspace) return;
     const encoder = new TextEncoder();
     const titleBytes = encoder.encode('New Document');
-    // TODO: Encrypt title with workspace key
     const encryptedTitleB64 = btoa(String.fromCharCode(...titleBytes));
     const nonceB64 = btoa('0'.repeat(24));
 
@@ -79,8 +74,8 @@ export default function App() {
     setDocContent(content);
   }, []);
 
-  const encryptedTitle = selectedDoc
-    ? placeholderDecrypt(selectedDoc.encrypted_title_b64)
+  const title = selectedDoc
+    ? decodeDevBase64Title(selectedDoc.encrypted_title_b64)
     : '';
 
   return (
@@ -103,7 +98,7 @@ export default function App() {
       <div className="main-area">
         <div className="toolbar">
           {selectedDoc ? (
-            <span>{encryptedTitle}</span>
+            <span>{title}</span>
           ) : (
             <span style={{ color: '#999' }}>Select a document</span>
           )}

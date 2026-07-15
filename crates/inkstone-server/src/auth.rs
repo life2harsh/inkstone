@@ -3,7 +3,7 @@ use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::state::AppState;
 use inkstone_core::ids::{DeviceId, UserId};
 
@@ -13,14 +13,6 @@ pub struct AuthUser {
     pub device_id: Option<DeviceId>,
 }
 
-/// Dev-mode auth extractor.
-///
-/// Reads `x-dev-user-id` header to identify the user.
-/// If the user doesn't exist, creates them on the fly.
-///
-/// When OIDC is implemented, replace this extractor with one that
-/// validates the OIDC token from the Authorization header and
-/// resolves the user from the `identities` table.
 pub struct DevAuth(pub AuthUser);
 
 impl FromRequestParts<AppState> for DevAuth {
