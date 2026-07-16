@@ -1,0 +1,9 @@
+/target/
+apps/web/node_modules/
+apps/web/dist/
+*.swp
+*.swo
+.DS_Store
+AGENTS.md
+SKILLS.md
+

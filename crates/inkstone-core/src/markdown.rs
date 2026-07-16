@@ -195,12 +195,7 @@ fn try_parse_wikilink(
     None
 }
 
-fn try_parse_tag(
-    chars: &[char],
-    pos: usize,
-    tags: &mut Vec<TagRef>,
-    line: usize,
-) -> Option<usize> {
+fn try_parse_tag(chars: &[char], pos: usize, tags: &mut Vec<TagRef>, line: usize) -> Option<usize> {
     if chars[pos] != '#' {
         return None;
     }
@@ -255,12 +250,49 @@ fn find_closing_brackets(chars: &[char], start: usize) -> Option<usize> {
     None
 }
 
+pub fn index_document_blocks(
+    doc: &crate::document::InkstoneDocument,
+) -> Vec<(crate::ids::BlockId, MarkdownIndex)> {
+    doc.blocks
+        .iter()
+        .filter_map(|b| match &b.content {
+            crate::document::BlockContent::Markdown { text } => Some((b.id, parse_markdown(text))),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn extract_backlinks(index: &MarkdownIndex) -> Vec<(String, String)> {
     let mut backlinks = Vec::new();
     for wl in &index.wikilinks {
         backlinks.push((wl.target.clone(), wl.alias.clone().unwrap_or_default()));
     }
     backlinks
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundWikiLink {
+    pub source_doc_id: crate::ids::DocId,
+    pub source_block_id: crate::ids::BlockId,
+    pub target: String,
+}
+
+pub fn derive_outbound_links(doc: &crate::document::InkstoneDocument) -> Vec<OutboundWikiLink> {
+    let doc_id = doc.id;
+    let mut links = Vec::new();
+    for block in &doc.blocks {
+        if let crate::document::BlockContent::Markdown { text } = &block.content {
+            let idx = parse_markdown(text);
+            for wl in &idx.wikilinks {
+                links.push(OutboundWikiLink {
+                    source_doc_id: doc_id,
+                    source_block_id: block.id,
+                    target: wl.target.clone(),
+                });
+            }
+        }
+    }
+    links
 }
 
 pub fn all_tags(index: &MarkdownIndex) -> HashSet<String> {
@@ -336,5 +368,129 @@ mod tests {
         let idx = parse_markdown(text);
         assert_eq!(idx.wikilinks.len(), 1);
         assert_eq!(idx.wikilinks[0].target, "real link");
+    }
+
+    #[test]
+    fn test_index_document_walks_only_markdown_blocks() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Markdown {
+                text: "[[WikiLink]]".into(),
+            },
+        ));
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Math {
+                source: "E=mc^2".into(),
+            },
+        ));
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Ink {
+                stonepen_json: "{}".into(),
+            },
+        ));
+
+        let indexes = index_document_blocks(&doc);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].1.wikilinks.len(), 1);
+        assert_eq!(indexes[0].1.wikilinks[0].target, "WikiLink");
+    }
+
+    #[test]
+    fn test_derived_indexes_reproducible_from_document() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Markdown {
+                text: "# Heading\n[[Page]] text #tag".into(),
+            },
+        ));
+
+        let indexes = index_document_blocks(&doc);
+        assert_eq!(indexes.len(), 1);
+        let idx = &indexes[0].1;
+        assert_eq!(idx.headings.len(), 1);
+        assert_eq!(idx.wikilinks.len(), 1);
+        assert_eq!(idx.tags.len(), 1);
+
+        let indexes2 = index_document_blocks(&doc);
+        assert_eq!(
+            indexes[0].1.wikilinks[0].target,
+            indexes2[0].1.wikilinks[0].target
+        );
+    }
+
+    #[test]
+    fn test_outbound_links_include_source_ids() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let block = DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Markdown {
+                text: "[[TargetPage]]".into(),
+            },
+        );
+        let block_id = block.id;
+        doc.blocks.push(block);
+
+        let links = derive_outbound_links(&doc);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_doc_id, doc.id);
+        assert_eq!(links[0].source_block_id, block_id);
+        assert_eq!(links[0].target, "TargetPage");
+    }
+
+    #[test]
+    fn test_two_outbound_links_from_markdown() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Markdown {
+                text: "[[PageA]] and [[PageB]]".into(),
+            },
+        ));
+
+        let links = derive_outbound_links(&doc);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].target, "PageA");
+        assert_eq!(links[1].target, "PageB");
+    }
+
+    #[test]
+    fn test_non_markdown_blocks_produce_no_outbound_links() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Math {
+                source: "x^2".into(),
+            },
+        ));
+        doc.blocks.push(DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Ink {
+                stonepen_json: "{}".into(),
+            },
+        ));
+        doc.blocks
+            .push(DocumentBlock::new(BlockId::new_v4(), BlockContent::Divider));
+
+        let links = derive_outbound_links(&doc);
+        assert_eq!(links.len(), 0);
     }
 }
