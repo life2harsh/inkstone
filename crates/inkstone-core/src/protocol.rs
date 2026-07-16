@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ids::UpdateId;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientWsMessage {
     #[serde(rename = "encrypted_update")]
     EncryptedUpdate {
         doc_id: Uuid,
-        client_update_id: Uuid,
+        update_id: UpdateId,
         encrypted_update_b64: String,
         nonce_b64: String,
         aad_version: i32,
@@ -30,12 +32,16 @@ pub enum ServerWsMessage {
     EncryptedUpdate {
         doc_id: Uuid,
         sender_device_id: Uuid,
-        client_update_id: Uuid,
+        update_id: UpdateId,
         seq: i64,
         encrypted_update_b64: String,
         nonce_b64: String,
         aad_version: i32,
     },
+
+    /// Sent directly to a joining client with the current committed sequence.
+    #[serde(rename = "ready")]
+    Ready { doc_id: Uuid, current_seq: i64 },
 
     #[serde(rename = "pong")]
     Pong,
@@ -68,7 +74,7 @@ pub struct PostUpdateRequest {
     pub encrypted_update_b64: String,
     pub nonce_b64: String,
     pub aad_version: i32,
-    pub client_update_id: Uuid,
+    pub update_id: UpdateId,
     pub sender_device_id: Uuid,
 }
 
@@ -76,7 +82,8 @@ pub struct PostUpdateRequest {
 pub struct PostSnapshotRequest {
     pub encrypted_snapshot_b64: String,
     pub nonce_b64: String,
-    pub snapshot_version: i64,
+    pub base_seq: i64,
+    pub aad_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +95,7 @@ pub struct UpdateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedUpdateResponse {
     pub seq: i64,
-    pub client_update_id: Uuid,
+    pub update_id: UpdateId,
     pub sender_device_id: Uuid,
     pub encrypted_update_b64: String,
     pub nonce_b64: String,
@@ -98,9 +105,10 @@ pub struct EncryptedUpdateResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotResponse {
-    pub snapshot_version: i64,
+    pub base_seq: i64,
     pub encrypted_snapshot_b64: String,
     pub nonce_b64: String,
+    pub aad_version: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

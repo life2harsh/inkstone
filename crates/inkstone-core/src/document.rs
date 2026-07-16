@@ -79,6 +79,11 @@ impl InkstoneDocument {
     }
 }
 
+/// Create a new empty document with the given id.
+pub fn new_document(id: DocId) -> InkstoneDocument {
+    InkstoneDocument::new(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

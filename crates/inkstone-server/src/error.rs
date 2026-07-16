@@ -44,7 +44,10 @@ impl IntoResponse for AppError {
             }
             AppError::Serde(e) => {
                 tracing::error!("Serialization error: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Serialization error".into())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Serialization error".into(),
+                )
             }
             AppError::Uuid(e) => {
                 tracing::error!("UUID error: {:?}", e);

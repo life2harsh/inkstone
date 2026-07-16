@@ -15,15 +15,13 @@ async fn create_workspace(
 ) -> AppResult<Json<WorkspaceResponse>> {
     let workspace_id = Uuid::new_v4();
 
-    sqlx::query(
-        "INSERT INTO workspaces (id, name, description, owner_id) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(workspace_id)
-    .bind(&req.name)
-    .bind(&req.description)
-    .bind(auth.user_id)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("INSERT INTO workspaces (id, name, description, owner_id) VALUES ($1, $2, $3, $4)")
+        .bind(workspace_id)
+        .bind(&req.name)
+        .bind(&req.description)
+        .bind(auth.user_id)
+        .execute(&state.db)
+        .await?;
 
     sqlx::query(
         "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
@@ -54,7 +52,17 @@ async fn list_workspaces(
     State(state): State<AppState>,
     DevAuth(auth): DevAuth,
 ) -> AppResult<Json<PaginatedResponse<WorkspaceResponse>>> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<String>,
+            Uuid,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT w.id, w.name, w.description, w.owner_id, w.created_at, w.updated_at
          FROM workspaces w
          JOIN workspace_members wm ON wm.workspace_id = w.id
@@ -83,6 +91,8 @@ async fn list_workspaces(
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/workspaces", post(create_workspace).get(list_workspaces))
+    Router::new().route(
+        "/api/workspaces",
+        post(create_workspace).get(list_workspaces),
+    )
 }

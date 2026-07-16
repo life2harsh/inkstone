@@ -76,11 +76,7 @@ pub async fn verify_doc_access(db: &PgPool, doc_id: Uuid, user_id: Uuid) -> AppR
     Ok(())
 }
 
-pub async fn verify_device_owner(
-    db: &PgPool,
-    device_id: Uuid,
-    user_id: Uuid,
-) -> AppResult<()> {
+pub async fn verify_device_owner(db: &PgPool, device_id: Uuid, user_id: Uuid) -> AppResult<()> {
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1 AND user_id = $2)",
     )
@@ -116,61 +112,128 @@ pub async fn allocate_seq(db: &PgPool, doc_id: Uuid) -> AppResult<i64> {
     Ok(seq.0)
 }
 
+pub async fn current_seq(db: &PgPool, doc_id: Uuid) -> AppResult<i64> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT current_seq FROM doc_update_counters WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|r| r.0).unwrap_or(0))
+}
+
 pub struct StoredUpdate {
     pub seq: i64,
+    pub sender_device_id: Uuid,
+    pub encrypted_update: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub aad_version: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Atomic transaction-based sequence allocation.
+///
+/// BEGIN
+///   LOCK doc_update_counters row FOR UPDATE
+///   Check if update_id already exists
+///   If exists: return existing seq (no counter increment)
+///   If new: next_seq = current_seq + 1, insert update, update counter
+/// COMMIT
+///
+/// Any failure rolls back both counter movement and update insertion.
 pub async fn insert_doc_update_idempotent(
     db: &PgPool,
     doc_id: Uuid,
     sender_device_id: Uuid,
-    client_update_id: Uuid,
+    update_id: Uuid,
     encrypted_update: Vec<u8>,
     nonce: Vec<u8>,
     aad_version: i32,
 ) -> AppResult<StoredUpdate> {
-    let existing = sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>)>(
-        "SELECT seq, created_at FROM doc_updates WHERE doc_id = $1 AND client_update_id = $2",
+    // Use a serializable transaction for atomicity
+    let mut tx = db.begin().await?;
+
+    // Ensure counter row exists (locked for update below)
+    sqlx::query(
+        "INSERT INTO doc_update_counters (doc_id, current_seq) VALUES ($1, 0)
+         ON CONFLICT (doc_id) DO NOTHING",
     )
     .bind(doc_id)
-    .bind(client_update_id)
-    .fetch_optional(db)
+    .execute(&mut *tx)
     .await?;
 
-    if let Some((seq, created_at)) = existing {
-        return Ok(StoredUpdate { seq, created_at });
+    // Lock the counter row to prevent concurrent sequence allocation
+    let counter: (i64,) =
+        sqlx::query_as("SELECT current_seq FROM doc_update_counters WHERE doc_id = $1 FOR UPDATE")
+            .bind(doc_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let current_seq = counter.0;
+
+    // Check whether update_id already exists (return full canonical record)
+    let existing: Option<(
+        i64,
+        Uuid,
+        Vec<u8>,
+        Vec<u8>,
+        i32,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "SELECT seq, sender_device_id, encrypted_update, nonce, aad_version, created_at
+         FROM doc_updates WHERE doc_id = $1 AND update_id = $2",
+    )
+    .bind(doc_id)
+    .bind(update_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((seq, sender_device_id, encrypted_update, nonce, aad_version, created_at)) =
+        existing
+    {
+        tx.commit().await?;
+        return Ok(StoredUpdate {
+            seq,
+            sender_device_id,
+            encrypted_update,
+            nonce,
+            aad_version,
+            created_at,
+        });
     }
 
-    let seq = allocate_seq(db, doc_id).await?;
+    // Allocate next sequence
+    let next_seq = current_seq + 1;
     let created_at = chrono::Utc::now();
 
-    let result = sqlx::query(
-        "INSERT INTO doc_updates (doc_id, seq, sender_device_id, encrypted_update, nonce, aad_version, client_update_id)
+    // Insert the update with the new sequence
+    sqlx::query(
+        "INSERT INTO doc_updates (doc_id, seq, sender_device_id, encrypted_update, nonce, aad_version, update_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(doc_id)
-    .bind(seq)
+    .bind(next_seq)
     .bind(sender_device_id)
     .bind(&encrypted_update)
     .bind(&nonce)
     .bind(aad_version)
-    .bind(client_update_id)
-    .execute(db)
-    .await;
+    .bind(update_id)
+    .execute(&mut *tx)
+    .await?;
 
-    match result {
-        Ok(_) => Ok(StoredUpdate { seq, created_at }),
-        Err(sqlx::Error::Database(ref e)) if e.is_unique_violation() => {
-            let row = sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>)>(
-                "SELECT seq, created_at FROM doc_updates WHERE doc_id = $1 AND client_update_id = $2",
-            )
-            .bind(doc_id)
-            .bind(client_update_id)
-            .fetch_one(db)
-            .await?;
-            Ok(StoredUpdate { seq: row.0, created_at: row.1 })
-        }
-        Err(e) => Err(e.into()),
-    }
+    // Update the counter atomically
+    sqlx::query("UPDATE doc_update_counters SET current_seq = $1 WHERE doc_id = $2")
+        .bind(next_seq)
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    Ok(StoredUpdate {
+        seq: next_seq,
+        sender_device_id,
+        encrypted_update,
+        nonce,
+        aad_version,
+        created_at,
+    })
 }

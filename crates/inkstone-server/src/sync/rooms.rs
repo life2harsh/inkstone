@@ -7,7 +7,10 @@ use inkstone_core::protocol::ServerWsMessage;
 pub fn join_or_create(
     rooms: &DocRoomRegistry,
     doc_id: Uuid,
-) -> (broadcast::Sender<ServerWsMessage>, broadcast::Receiver<ServerWsMessage>) {
+) -> (
+    broadcast::Sender<ServerWsMessage>,
+    broadcast::Receiver<ServerWsMessage>,
+) {
     let mut rooms = rooms.blocking_write();
     let tx = rooms
         .entry(doc_id)
@@ -23,7 +26,10 @@ pub fn join_or_create(
 pub async fn join_or_create_async(
     rooms: &DocRoomRegistry,
     doc_id: Uuid,
-) -> (broadcast::Sender<ServerWsMessage>, broadcast::Receiver<ServerWsMessage>) {
+) -> (
+    broadcast::Sender<ServerWsMessage>,
+    broadcast::Receiver<ServerWsMessage>,
+) {
     let mut rooms = rooms.write().await;
     let tx = rooms
         .entry(doc_id)

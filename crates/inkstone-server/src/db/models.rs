@@ -74,7 +74,7 @@ pub struct DocUpdate {
     pub encrypted_update: Vec<u8>,
     pub nonce: Vec<u8>,
     pub aad_version: i32,
-    pub client_update_id: Uuid,
+    pub update_id: Uuid,
     pub created_at: DateTime<Utc>,
 }
 
@@ -82,9 +82,10 @@ pub struct DocUpdate {
 pub struct DocSnapshot {
     pub id: i64,
     pub doc_id: Uuid,
-    pub snapshot_version: i64,
+    pub base_seq: i64,
     pub encrypted_snapshot: Vec<u8>,
     pub nonce: Vec<u8>,
+    pub aad_version: i32,
     pub created_at: DateTime<Utc>,
 }
 

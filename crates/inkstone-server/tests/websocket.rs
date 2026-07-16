@@ -3,8 +3,48 @@ mod common;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
+use inkstone_core::UpdateId;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
+
+/// Connect and consume the Ready message that every successful WS connection
+/// receives before any operation-specific messages.
+async fn connect_and_ready(
+    base: &str,
+    doc_id: Uuid,
+) -> (
+    impl SinkExt<WsMessage, Error = impl std::error::Error>,
+    impl StreamExt<Item = Result<WsMessage, impl std::error::Error>>,
+) {
+    let (ws_stream, _) = connect_async(&ws_url(base, doc_id))
+        .await
+        .expect("Failed to connect to WS");
+    let (write, mut read) = ws_stream.split();
+
+    // Consume Ready
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), read.next())
+        .await
+        .expect("Timeout waiting for Ready")
+        .expect("Stream ended")
+        .expect("Error reading from WS");
+    let text = response.into_text().expect("Expected text message");
+    let server_msg: ServerWsMessage =
+        serde_json::from_str(&text).expect("Failed to parse server message");
+    match server_msg {
+        ServerWsMessage::Ready {
+            doc_id: received_doc_id,
+            current_seq,
+        } => {
+            assert_eq!(received_doc_id, doc_id, "Ready doc_id mismatch");
+            // current_seq should be 0 for a fresh document
+            assert_eq!(current_seq, 0, "Fresh doc should have current_seq=0");
+        }
+        other => panic!("Expected Ready as first message, got: {:?}", other),
+    }
+
+    (write, read)
+}
 
 async fn create_workspace_and_doc(base: &str) -> (Uuid, Uuid) {
     let ws = client()
@@ -54,21 +94,19 @@ async fn test_ws_send_update_and_receive_broadcast() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
-    let client_update_id = Uuid::new_v4();
+    let update_id = UpdateId(Uuid::new_v4());
     let msg = ClientWsMessage::EncryptedUpdate {
         doc_id,
-        client_update_id,
+        update_id,
         encrypted_update_b64: b64_encode(b"ws-update"),
         nonce_b64: b64_encode(b"nonce12345678"),
         aad_version: 1,
     };
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
@@ -87,14 +125,14 @@ async fn test_ws_send_update_and_receive_broadcast() {
         ServerWsMessage::EncryptedUpdate {
             doc_id: received_doc_id,
             sender_device_id,
-            client_update_id: received_client_id,
+            update_id: received_client_id,
             seq,
             encrypted_update_b64,
             ..
         } => {
             assert_eq!(received_doc_id, doc_id);
             assert_eq!(sender_device_id, dev_device_id());
-            assert_eq!(received_client_id, client_update_id);
+            assert_eq!(received_client_id, update_id);
             assert_eq!(seq, 1);
             assert_eq!(encrypted_update_b64, b64_encode(b"ws-update"));
         }
@@ -107,14 +145,12 @@ async fn test_ws_ping_pong() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
     let msg = ClientWsMessage::Ping;
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
@@ -136,22 +172,20 @@ async fn test_ws_doc_id_mismatch() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
     // Send update with a different doc_id than the path
     let wrong_doc_id = Uuid::new_v4();
     let msg = ClientWsMessage::EncryptedUpdate {
         doc_id: wrong_doc_id,
-        client_update_id: Uuid::new_v4(),
+        update_id: UpdateId(Uuid::new_v4()),
         encrypted_update_b64: b64_encode(b"wrong-doc"),
         nonce_b64: b64_encode(b"nonce12345678"),
         aad_version: 1,
     };
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
@@ -178,13 +212,12 @@ async fn test_ws_invalid_json() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
     write
-        .send(tokio_tungstenite::tungstenite::Message::Text("not json".into()))
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "not json".into(),
+        ))
         .await
         .unwrap();
 
@@ -211,20 +244,18 @@ async fn test_ws_invalid_base64() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
     let msg = ClientWsMessage::EncryptedUpdate {
         doc_id,
-        client_update_id: Uuid::new_v4(),
+        update_id: UpdateId(Uuid::new_v4()),
         encrypted_update_b64: "not-valid-base64!!".into(),
         nonce_b64: b64_encode(b"nonce12345678"),
         aad_version: 1,
     };
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
@@ -251,17 +282,15 @@ async fn test_ws_presence() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
     let msg = ClientWsMessage::Presence {
         doc_id,
         encrypted_presence_b64: b64_encode(b"online"),
     };
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
@@ -295,11 +324,7 @@ async fn test_ws_auth_required() {
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
     // Connect without auth params
-    let bad_url = format!(
-        "{}/api/sync/docs/{}/ws",
-        base.replace("http", "ws"),
-        doc_id,
-    );
+    let bad_url = format!("{}/api/sync/docs/{}/ws", base.replace("http", "ws"), doc_id,);
     let result = connect_async(&bad_url).await;
     // Should fail with 400 or similar
     assert!(result.is_err(), "Expected connection to fail without auth");
@@ -310,25 +335,23 @@ async fn test_ws_echo_suppression() {
     let (base, _pool) = setup().await;
     let (_ws_id, doc_id) = create_workspace_and_doc(&base).await;
 
-    let (ws_stream, _) = connect_async(&ws_url(&base, doc_id))
-        .await
-        .expect("Failed to connect to WS");
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = connect_and_ready(&base, doc_id).await;
 
-    let client_update_id = Uuid::new_v4();
+    let update_id = UpdateId(Uuid::new_v4());
     let msg = ClientWsMessage::EncryptedUpdate {
         doc_id,
-        client_update_id,
+        update_id,
         encrypted_update_b64: b64_encode(b"echo-test"),
         nonce_b64: b64_encode(b"nonce12345678"),
         aad_version: 1,
     };
     let json = serde_json::to_string(&msg).unwrap();
-    write.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
         .unwrap();
 
-    // Receive the broadcast
+    // Receive the broadcast (own-echo now serves as the acknowledgement path)
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), read.next())
         .await
         .expect("Timeout")
@@ -336,17 +359,46 @@ async fn test_ws_echo_suppression() {
         .expect("Error");
 
     let text = response.into_text().expect("Expected text");
-    let server_msg: ServerWsMessage =
-        serde_json::from_str(&text).expect("Failed to parse");
+    let server_msg: ServerWsMessage = serde_json::from_str(&text).expect("Failed to parse");
 
     match server_msg {
         ServerWsMessage::EncryptedUpdate {
-            client_update_id: received_cuid,
+            update_id: received_cuid,
+            seq,
             ..
         } => {
-            // The client_update_id is echoed back so the client can suppress its own echo
-            assert_eq!(received_cuid, client_update_id);
+            // Own update echoed back as acknowledgement
+            assert_eq!(received_cuid, update_id);
+            assert_eq!(seq, 1);
         }
         other => panic!("Expected EncryptedUpdate, got: {:?}", other),
+    }
+
+    // Proves a connection whose document already has committed history still receives Ready with nonzero seq
+    let (ws_stream2, _) = connect_async(&ws_url(&base, doc_id))
+        .await
+        .expect("Failed to connect client 2");
+    let (_, mut read2) = ws_stream2.split();
+
+    let response2 = tokio::time::timeout(std::time::Duration::from_secs(5), read2.next())
+        .await
+        .expect("Timeout waiting for Ready from client 2")
+        .expect("Stream ended")
+        .expect("Error reading from WS");
+    let text2 = response2.into_text().expect("Expected text message");
+    let server_msg2: ServerWsMessage =
+        serde_json::from_str(&text2).expect("Failed to parse server message");
+    match server_msg2 {
+        ServerWsMessage::Ready {
+            doc_id: received_doc_id,
+            current_seq,
+        } => {
+            assert_eq!(received_doc_id, doc_id, "Ready doc_id mismatch");
+            assert_eq!(current_seq, 1, "Expected current_seq to be 1 (nonzero)");
+        }
+        other => panic!(
+            "Expected Ready as first message for client 2, got: {:?}",
+            other
+        ),
     }
 }

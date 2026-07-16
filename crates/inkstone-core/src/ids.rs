@@ -11,7 +11,6 @@ pub type CommentId = Uuid;
 pub type IdentityId = Uuid;
 pub type InvitationId = Uuid;
 pub type UpdateSeq = i64;
-pub type SnapshotVersion = i64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -20,6 +19,10 @@ pub struct DocId(pub Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BlockId(pub Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UpdateId(pub Uuid);
 
 impl DocId {
     pub fn new_v4() -> Self {
@@ -33,6 +36,12 @@ impl BlockId {
     }
 }
 
+impl UpdateId {
+    pub fn new_v4() -> Self {
+        UpdateId(Uuid::new_v4())
+    }
+}
+
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -40,6 +49,12 @@ impl fmt::Display for DocId {
 }
 
 impl fmt::Display for BlockId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for UpdateId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -57,6 +72,12 @@ impl From<Uuid> for BlockId {
     }
 }
 
+impl From<Uuid> for UpdateId {
+    fn from(u: Uuid) -> Self {
+        UpdateId(u)
+    }
+}
+
 impl From<DocId> for Uuid {
     fn from(id: DocId) -> Self {
         id.0
@@ -65,6 +86,12 @@ impl From<DocId> for Uuid {
 
 impl From<BlockId> for Uuid {
     fn from(id: BlockId) -> Self {
+        id.0
+    }
+}
+
+impl From<UpdateId> for Uuid {
+    fn from(id: UpdateId) -> Self {
         id.0
     }
 }

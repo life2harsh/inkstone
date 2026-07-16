@@ -5,6 +5,7 @@ use inkstone_core::protocol::{
     CreateDocRequest, CreateWorkspaceRequest, PostSnapshotRequest, PostUpdateRequest,
     WorkspaceResponse,
 };
+use inkstone_core::UpdateId;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -222,7 +223,10 @@ async fn test_get_doc() {
 
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["id"], doc_id.to_string());
-    assert_eq!(body["encrypted_title_b64"], make_b64_payload("Specific Doc"));
+    assert_eq!(
+        body["encrypted_title_b64"],
+        make_b64_payload("Specific Doc")
+    );
 }
 
 #[tokio::test]
@@ -303,7 +307,7 @@ async fn test_post_update() {
             encrypted_update_b64: make_b64_payload("update1"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id: Uuid::new_v4(),
+            update_id: UpdateId(Uuid::new_v4()),
             sender_device_id: dev_device_id(),
         })
         .send()
@@ -320,7 +324,7 @@ async fn test_post_update_idempotent() {
     let (base, _pool) = setup().await;
     let (_ws, doc_id) = create_doc_for_updates(&base).await;
 
-    let client_update_id = Uuid::new_v4();
+    let update_id = UpdateId(Uuid::new_v4());
 
     // First post
     let resp1 = client()
@@ -330,7 +334,7 @@ async fn test_post_update_idempotent() {
             encrypted_update_b64: make_b64_payload("update1"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id,
+            update_id,
             sender_device_id: dev_device_id(),
         })
         .send()
@@ -340,7 +344,7 @@ async fn test_post_update_idempotent() {
     let body1: Value = resp1.json().await.unwrap();
     assert_eq!(body1["seq"], 1);
 
-    // Second post with same client_update_id
+    // Second post with same update_id
     let resp2 = client()
         .post(format!("{}/api/docs/{}/updates", base, doc_id))
         .headers(dev_headers())
@@ -348,7 +352,7 @@ async fn test_post_update_idempotent() {
             encrypted_update_b64: make_b64_payload("update1-dup"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id,
+            update_id,
             sender_device_id: dev_device_id(),
         })
         .send()
@@ -358,7 +362,7 @@ async fn test_post_update_idempotent() {
     let body2: Value = resp2.json().await.unwrap();
     assert_eq!(body2["seq"], 1); // Same seq, not 2
 
-    // seq 2 should be allocatable with a different client_update_id
+    // seq 2 should be allocatable with a different update_id
     let resp3 = client()
         .post(format!("{}/api/docs/{}/updates", base, doc_id))
         .headers(dev_headers())
@@ -366,7 +370,7 @@ async fn test_post_update_idempotent() {
             encrypted_update_b64: make_b64_payload("update2"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id: Uuid::new_v4(),
+            update_id: UpdateId(Uuid::new_v4()),
             sender_device_id: dev_device_id(),
         })
         .send()
@@ -389,7 +393,7 @@ async fn test_post_update_requires_device_id() {
             encrypted_update_b64: make_b64_payload("update"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id: Uuid::new_v4(),
+            update_id: UpdateId(Uuid::new_v4()),
             sender_device_id: dev_device_id(),
         })
         .send()
@@ -412,7 +416,7 @@ async fn test_list_updates() {
                 encrypted_update_b64: make_b64_payload(&format!("update{}", i)),
                 nonce_b64: make_b64_payload("nonce12345678"),
                 aad_version: 1,
-                client_update_id: Uuid::new_v4(),
+                update_id: UpdateId(Uuid::new_v4()),
                 sender_device_id: dev_device_id(),
             })
             .send()
@@ -451,7 +455,7 @@ async fn test_list_updates_after_seq() {
                 encrypted_update_b64: make_b64_payload(&format!("update{}", i)),
                 nonce_b64: make_b64_payload("nonce12345678"),
                 aad_version: 1,
-                client_update_id: Uuid::new_v4(),
+                update_id: UpdateId(Uuid::new_v4()),
                 sender_device_id: dev_device_id(),
             })
             .send()
@@ -461,10 +465,7 @@ async fn test_list_updates_after_seq() {
 
     // Get updates after seq 2
     let resp = client()
-        .get(format!(
-            "{}/api/docs/{}/updates?after_seq=2",
-            base, doc_id
-        ))
+        .get(format!("{}/api/docs/{}/updates?after_seq=2", base, doc_id))
         .headers(dev_headers())
         .send()
         .await
@@ -493,7 +494,7 @@ async fn test_list_updates_pagination() {
                 encrypted_update_b64: make_b64_payload(&format!("update{}", i)),
                 nonce_b64: make_b64_payload("nonce12345678"),
                 aad_version: 1,
-                client_update_id: Uuid::new_v4(),
+                update_id: UpdateId(Uuid::new_v4()),
                 sender_device_id: dev_device_id(),
             })
             .send()
@@ -503,10 +504,7 @@ async fn test_list_updates_pagination() {
 
     // Get updates with limit 2
     let resp = client()
-        .get(format!(
-            "{}/api/docs/{}/updates?limit=2",
-            base, doc_id
-        ))
+        .get(format!("{}/api/docs/{}/updates?limit=2", base, doc_id))
         .headers(dev_headers())
         .send()
         .await
@@ -528,21 +526,22 @@ async fn test_post_and_get_snapshot() {
     let (base, _pool) = setup().await;
     let (_ws, doc_id) = create_doc_for_updates(&base).await;
 
-    // Post a snapshot
+    // Post a snapshot at base_seq=0 (fresh document, current_seq=0)
     let post_resp = client()
         .post(format!("{}/api/docs/{}/snapshot", base, doc_id))
         .headers(dev_headers())
         .json(&PostSnapshotRequest {
             encrypted_snapshot_b64: make_b64_payload("snapshot1"),
             nonce_b64: make_b64_payload("nonce12345678"),
-            snapshot_version: 1,
+            base_seq: 0,
+            aad_version: 1,
         })
         .send()
         .await
         .unwrap();
     assert_eq!(post_resp.status(), 200);
     let post_body: Value = post_resp.json().await.unwrap();
-    assert_eq!(post_body["snapshot_version"], 1);
+    assert_eq!(post_body["base_seq"], 0);
     assert_eq!(
         post_body["encrypted_snapshot_b64"],
         make_b64_payload("snapshot1")
@@ -557,11 +556,52 @@ async fn test_post_and_get_snapshot() {
         .unwrap();
     assert_eq!(get_resp.status(), 200);
     let get_body: Value = get_resp.json().await.unwrap();
-    assert_eq!(get_body["snapshot_version"], 1);
+    assert_eq!(get_body["base_seq"], 0);
     assert_eq!(
         get_body["encrypted_snapshot_b64"],
         make_b64_payload("snapshot1")
     );
+}
+
+#[tokio::test]
+async fn test_snapshot_negative_base_seq_rejected() {
+    let (base, _pool) = setup().await;
+    let (_ws, doc_id) = create_doc_for_updates(&base).await;
+
+    let resp = client()
+        .post(format!("{}/api/docs/{}/snapshot", base, doc_id))
+        .headers(dev_headers())
+        .json(&PostSnapshotRequest {
+            encrypted_snapshot_b64: make_b64_payload("negative"),
+            nonce_b64: make_b64_payload("nonce12345678"),
+            base_seq: -1,
+            aad_version: 1,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn test_snapshot_base_seq_ahead_of_current_rejected() {
+    let (base, _pool) = setup().await;
+    let (_ws, doc_id) = create_doc_for_updates(&base).await;
+
+    // Fresh document has current_seq=0, so base_seq=1 should be rejected
+    let resp = client()
+        .post(format!("{}/api/docs/{}/snapshot", base, doc_id))
+        .headers(dev_headers())
+        .json(&PostSnapshotRequest {
+            encrypted_snapshot_b64: make_b64_payload("ahead"),
+            nonce_b64: make_b64_payload("nonce12345678"),
+            base_seq: 1,
+            aad_version: 1,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }
 
 #[tokio::test]
@@ -583,7 +623,7 @@ async fn test_snapshot_upsert() {
     let (base, _pool) = setup().await;
     let (_ws, doc_id) = create_doc_for_updates(&base).await;
 
-    // Post same version twice
+    // Post same version twice (base_seq=0 valid for fresh doc with current_seq=0)
     for _ in 0..2 {
         client()
             .post(format!("{}/api/docs/{}/snapshot", base, doc_id))
@@ -591,7 +631,8 @@ async fn test_snapshot_upsert() {
             .json(&PostSnapshotRequest {
                 encrypted_snapshot_b64: make_b64_payload("updated"),
                 nonce_b64: make_b64_payload("nonce12345678"),
-                snapshot_version: 1,
+                base_seq: 0,
+                aad_version: 1,
             })
             .send()
             .await
@@ -606,7 +647,7 @@ async fn test_snapshot_upsert() {
         .await
         .unwrap();
     let body: Value = get_resp.json().await.unwrap();
-    assert_eq!(body["snapshot_version"], 1);
+    assert_eq!(body["base_seq"], 0);
 }
 
 // ─── Auth / Error Cases ─────────────────────────────────────────────────────
@@ -657,7 +698,7 @@ async fn test_sender_device_id_mismatch() {
             encrypted_update_b64: make_b64_payload("update"),
             nonce_b64: make_b64_payload("nonce12345678"),
             aad_version: 1,
-            client_update_id: Uuid::new_v4(),
+            update_id: UpdateId(Uuid::new_v4()),
             sender_device_id: Uuid::new_v4(), // different from header
         })
         .send()

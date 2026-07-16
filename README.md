@@ -13,6 +13,9 @@ Self-hostable, local-first, E2EE collaborative Markdown knowledge workspace.
 ## Quick Start
 
 ```bash
+# 0. Clone with submodules (or git submodule update --init --recursive for existing clones)
+git clone --recurse-submodules https://github.com/life2harsh/inkstone.git
+
 # 1. Generate Cargo.lock (first-time setup)
 cargo generate-lockfile
 
@@ -66,7 +69,8 @@ WebSocket uses query params `?dev_user_id=...&dev_device_id=...`.
 
 ## Architecture
 
-- **inkstone-core**: Shared types (IDs, crypto envelope, protocol messages, ink model, markdown parser, graph index)
+- **inkstone-core**: Shared types (IDs, crypto envelope, protocol messages, document model, operations, markdown parser, graph index)
+- **stonepen**: Pinned Git submodule — standalone Rust/WASM ink engine (not a Cargo workspace member)
 - **inkstone-server**: Axum HTTP + WebSocket server, SQLx + Postgres, zero-knowledge document storage
 
 ## v0.1 security status

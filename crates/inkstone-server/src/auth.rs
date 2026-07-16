@@ -32,12 +32,10 @@ impl FromRequestParts<AppState> for DevAuth {
                 AppError::Unauthorized("Missing or invalid x-dev-user-id header".into())
             })?;
 
-        sqlx::query(
-            "INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .execute(&state.db)
-        .await?;
+        sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .execute(&state.db)
+            .await?;
 
         let device_id = headers
             .get("x-dev-device-id")
@@ -54,9 +52,6 @@ impl FromRequestParts<AppState> for DevAuth {
             .await?;
         }
 
-        Ok(DevAuth(AuthUser {
-            user_id,
-            device_id,
-        }))
+        Ok(DevAuth(AuthUser { user_id, device_id }))
     }
 }

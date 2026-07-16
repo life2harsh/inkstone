@@ -1,15 +1,14 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
-use crate::ids::{BlockId, DocId};
+use crate::ids::{BlockId, DocId, UpdateId};
 
 pub const DOCUMENT_UPDATE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentUpdate {
     pub version: u32,
-    pub update_id: Uuid,
+    pub update_id: UpdateId,
     pub doc_id: DocId,
     pub applied_at_ms: i64,
     pub op: DocumentOp,
@@ -37,6 +36,8 @@ pub enum DocumentOp {
     SetTitle { title: String },
 }
 
+// ── Strict local-intent errors ──────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
     #[error("update doc_id does not match document id")]
@@ -61,18 +62,10 @@ pub enum ApplyError {
     UnsupportedUpdateVersion(u32),
 }
 
+/// Strict local-intent application.
+/// Rejects any operation that cannot be applied exactly as intended.
 pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Result<(), ApplyError> {
-    if doc.schema_version != crate::document::DOCUMENT_SCHEMA_VERSION {
-        return Err(ApplyError::UnsupportedDocumentSchemaVersion(
-            doc.schema_version,
-        ));
-    }
-    if update.version != DOCUMENT_UPDATE_VERSION {
-        return Err(ApplyError::UnsupportedUpdateVersion(update.version));
-    }
-    if update.doc_id != doc.id {
-        return Err(ApplyError::WrongDocumentId);
-    }
+    validate_update(doc, &update)?;
 
     match update.op {
         DocumentOp::InsertBlock { idx, block } => {
@@ -119,10 +112,140 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
     Ok(())
 }
 
+fn validate_update(doc: &InkstoneDocument, update: &DocumentUpdate) -> Result<(), ApplyError> {
+    if doc.schema_version != crate::document::DOCUMENT_SCHEMA_VERSION {
+        return Err(ApplyError::UnsupportedDocumentSchemaVersion(
+            doc.schema_version,
+        ));
+    }
+    if update.version != DOCUMENT_UPDATE_VERSION {
+        return Err(ApplyError::UnsupportedUpdateVersion(update.version));
+    }
+    if update.doc_id != doc.id {
+        return Err(ApplyError::WrongDocumentId);
+    }
+    Ok(())
+}
+
+// ── Sequenced replay outcomes ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    Applied,
+    Adjusted { reason: String },
+    NoOp { conflict: String },
+    Fatal { reason: String },
+}
+
+/// Deterministic sequenced replay.
+/// Every valid-version server-sequenced update must produce a deterministic
+/// outcome.  Never rejects an operation that passes schema/version/doc_id
+/// validation — instead it produces an explicit outcome.
+pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> ReplayOutcome {
+    match validate_update(doc, &update) {
+        Err(ApplyError::WrongDocumentId) => {
+            return ReplayOutcome::Fatal {
+                reason: "update doc_id does not match document id".into(),
+            };
+        }
+        Err(ApplyError::UnsupportedDocumentSchemaVersion(v)) => {
+            return ReplayOutcome::Fatal {
+                reason: format!("unsupported document schema version {}", v),
+            };
+        }
+        Err(ApplyError::UnsupportedUpdateVersion(v)) => {
+            return ReplayOutcome::Fatal {
+                reason: format!("unsupported update version {}", v),
+            };
+        }
+        Err(_) => {
+            return ReplayOutcome::Fatal {
+                reason: "protocol invariant violation during replay".into(),
+            };
+        }
+        Ok(()) => {}
+    }
+
+    match update.op {
+        DocumentOp::InsertBlock { idx, block } => {
+            if doc.block_index(block.id).is_some() {
+                return ReplayOutcome::NoOp {
+                    conflict: format!("duplicate block id {}", block.id),
+                };
+            }
+            let clamped_idx = idx.min(doc.blocks.len());
+            let adjusted = clamped_idx != idx;
+            doc.blocks.insert(clamped_idx, block);
+            if adjusted {
+                ReplayOutcome::Adjusted {
+                    reason: format!("insert index {} clamped to {}", idx, clamped_idx),
+                }
+            } else {
+                ReplayOutcome::Applied
+            }
+        }
+
+        DocumentOp::DeleteBlock { block_id } => {
+            let pos = match doc.block_index(block_id) {
+                Some(p) => p,
+                None => {
+                    return ReplayOutcome::NoOp {
+                        conflict: format!("delete target block {} not found", block_id),
+                    };
+                }
+            };
+            doc.blocks.remove(pos);
+            ReplayOutcome::Applied
+        }
+
+        DocumentOp::MoveBlock { block_id, new_idx } => {
+            let pos = match doc.block_index(block_id) {
+                Some(p) => p,
+                None => {
+                    return ReplayOutcome::NoOp {
+                        conflict: format!("move target block {} not found", block_id),
+                    };
+                }
+            };
+            let len = doc.blocks.len();
+            let clamped_idx = if new_idx >= len { len - 1 } else { new_idx };
+            let adjusted = clamped_idx != new_idx;
+            let block = doc.blocks.remove(pos);
+            doc.blocks.insert(clamped_idx, block);
+            if adjusted {
+                ReplayOutcome::Adjusted {
+                    reason: format!("move index {} clamped to {}", new_idx, clamped_idx),
+                }
+            } else {
+                ReplayOutcome::Applied
+            }
+        }
+
+        DocumentOp::ReplaceBlockContent { block_id, content } => {
+            match doc.get_block_mut(block_id) {
+                Some(block) => {
+                    block.content = content;
+                    block.updated_at_ms = update.applied_at_ms;
+                    ReplayOutcome::Applied
+                }
+                None => ReplayOutcome::NoOp {
+                    conflict: format!("replace target block {} not found", block_id),
+                },
+            }
+        }
+
+        DocumentOp::SetTitle { title } => {
+            doc.title = title;
+            ReplayOutcome::Applied
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::document::BlockContent;
+    use crate::ids::UpdateId;
 
     fn make_doc() -> (InkstoneDocument, DocId) {
         let doc = InkstoneDocument::new(DocId::new_v4());
@@ -139,7 +262,7 @@ mod tests {
     fn upd(doc_id: DocId, applied_at_ms: i64, op: DocumentOp) -> DocumentUpdate {
         DocumentUpdate {
             version: DOCUMENT_UPDATE_VERSION,
-            update_id: Uuid::new_v4(),
+            update_id: UpdateId::new_v4(),
             doc_id,
             applied_at_ms,
             op,
@@ -402,7 +525,7 @@ mod tests {
             &mut doc,
             DocumentUpdate {
                 version: DOCUMENT_UPDATE_VERSION,
-                update_id: Uuid::new_v4(),
+                update_id: UpdateId::new_v4(),
                 doc_id: DocId::new_v4(),
                 applied_at_ms: 1000,
                 op: DocumentOp::SetTitle {
@@ -436,7 +559,7 @@ mod tests {
         let doc_id = DocId::new_v4();
         let update = DocumentUpdate {
             version: DOCUMENT_UPDATE_VERSION,
-            update_id: Uuid::new_v4(),
+            update_id: UpdateId::new_v4(),
             doc_id,
             applied_at_ms: 1000,
             op: DocumentOp::InsertBlock {
@@ -488,7 +611,7 @@ mod tests {
 
         let update = DocumentUpdate {
             version: DOCUMENT_UPDATE_VERSION,
-            update_id: Uuid::new_v4(),
+            update_id: UpdateId::new_v4(),
             doc_id: doc.id,
             applied_at_ms: 999999,
             op: DocumentOp::ReplaceBlockContent {
@@ -513,7 +636,7 @@ mod tests {
 
         let update = DocumentUpdate {
             version: DOCUMENT_UPDATE_VERSION,
-            update_id: Uuid::new_v4(),
+            update_id: UpdateId::new_v4(),
             doc_id: id,
             applied_at_ms: 5000,
             op: DocumentOp::ReplaceBlockContent {
@@ -539,7 +662,7 @@ mod tests {
             &mut doc,
             DocumentUpdate {
                 version: DOCUMENT_UPDATE_VERSION,
-                update_id: Uuid::new_v4(),
+                update_id: UpdateId::new_v4(),
                 doc_id,
                 applied_at_ms: 1000,
                 op: DocumentOp::SetTitle { title: "x".into() },
@@ -556,7 +679,7 @@ mod tests {
             &mut doc,
             DocumentUpdate {
                 version: 99,
-                update_id: Uuid::new_v4(),
+                update_id: UpdateId::new_v4(),
                 doc_id,
                 applied_at_ms: 1000,
                 op: DocumentOp::SetTitle { title: "x".into() },
@@ -564,5 +687,196 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ApplyError::UnsupportedUpdateVersion(99));
+    }
+
+    // ── Sequenced replay tests ───────────────────────────────────────────────
+
+    fn replay_nop(doc: &mut InkstoneDocument, doc_id: DocId, op: DocumentOp) -> ReplayOutcome {
+        sequenced_replay(doc, upd(doc_id, 1000, op))
+    }
+
+    #[test]
+    fn test_sequenced_delete_missing_block_is_nop() {
+        let (mut doc, doc_id) = make_doc();
+        let outcome = replay_nop(
+            &mut doc,
+            doc_id,
+            DocumentOp::DeleteBlock {
+                block_id: BlockId::new_v4(),
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::NoOp { .. }));
+    }
+
+    #[test]
+    fn test_sequenced_replace_missing_block_is_nop() {
+        let (mut doc, doc_id) = make_doc();
+        let outcome = replay_nop(
+            &mut doc,
+            doc_id,
+            DocumentOp::ReplaceBlockContent {
+                block_id: BlockId::new_v4(),
+                content: markdown("x"),
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::NoOp { .. }));
+    }
+
+    #[test]
+    fn test_sequenced_move_missing_block_is_nop() {
+        let (mut doc, doc_id) = make_doc();
+        let outcome = replay_nop(
+            &mut doc,
+            doc_id,
+            DocumentOp::MoveBlock {
+                block_id: BlockId::new_v4(),
+                new_idx: 0,
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::NoOp { .. }));
+    }
+
+    #[test]
+    fn test_sequenced_duplicate_block_id_is_nop() {
+        let (mut doc, doc_id) = make_doc();
+        let id = BlockId::new_v4();
+        doc.blocks
+            .push(DocumentBlock::new(id, markdown("existing")));
+        let outcome = replay_nop(
+            &mut doc,
+            doc_id,
+            DocumentOp::InsertBlock {
+                idx: 0,
+                block: DocumentBlock::new(id, markdown("dup")),
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::NoOp { .. }));
+    }
+
+    #[test]
+    fn test_sequenced_out_of_range_insert_clamps() {
+        let (mut doc, doc_id) = make_doc();
+        doc.blocks
+            .push(DocumentBlock::new(BlockId::new_v4(), markdown("a")));
+        let outcome = replay_nop(
+            &mut doc,
+            doc_id,
+            DocumentOp::InsertBlock {
+                idx: 100,
+                block: DocumentBlock::new(BlockId::new_v4(), markdown("late")),
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::Adjusted { .. }));
+        assert_eq!(doc.blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_sequenced_wrong_document_id_is_fatal() {
+        let (mut doc, _) = make_doc();
+        let outcome = sequenced_replay(
+            &mut doc,
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: DocId::new_v4(),
+                applied_at_ms: 1000,
+                op: DocumentOp::SetTitle {
+                    title: "test".into(),
+                },
+            },
+        );
+        assert!(matches!(outcome, ReplayOutcome::Fatal { .. }));
+    }
+
+    #[test]
+    fn test_sequenced_set_title_is_applied() {
+        let (mut doc, doc_id) = make_doc();
+        let outcome = sequenced_replay(
+            &mut doc,
+            upd(
+                doc_id,
+                1000,
+                DocumentOp::SetTitle {
+                    title: "hello".into(),
+                },
+            ),
+        );
+        assert_eq!(outcome, ReplayOutcome::Applied);
+        assert_eq!(doc.title, "hello");
+    }
+
+    #[test]
+    fn test_same_ordered_log_identical_final_document() {
+        let id = DocId::new_v4();
+        let b_a = DocumentBlock::new(BlockId::new_v4(), markdown("a"));
+        let b_b = DocumentBlock::new(BlockId::new_v4(), markdown("b"));
+        let b_c = DocumentBlock::new(BlockId::new_v4(), markdown("c"));
+        let b_a_id = b_a.id;
+        let b_c_id = b_c.id;
+
+        let updates = vec![
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: id,
+                applied_at_ms: 1000,
+                op: DocumentOp::InsertBlock { idx: 0, block: b_a },
+            },
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: id,
+                applied_at_ms: 1001,
+                op: DocumentOp::InsertBlock { idx: 1, block: b_b },
+            },
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: id,
+                applied_at_ms: 1002,
+                op: DocumentOp::InsertBlock { idx: 0, block: b_c },
+            },
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: id,
+                applied_at_ms: 1003,
+                op: DocumentOp::ReplaceBlockContent {
+                    block_id: b_a_id,
+                    content: markdown("A"),
+                },
+            },
+            DocumentUpdate {
+                version: DOCUMENT_UPDATE_VERSION,
+                update_id: UpdateId::new_v4(),
+                doc_id: id,
+                applied_at_ms: 1004,
+                op: DocumentOp::DeleteBlock { block_id: b_c_id },
+            },
+        ];
+
+        // Two docs replaying the same ordered log
+        let mut doc_a = InkstoneDocument::new(id);
+        let mut doc_b = InkstoneDocument::new(id);
+        for u in &updates {
+            assert_eq!(
+                sequenced_replay(&mut doc_a, u.clone()),
+                ReplayOutcome::Applied
+            );
+        }
+        for u in &updates {
+            assert_eq!(
+                sequenced_replay(&mut doc_b, u.clone()),
+                ReplayOutcome::Applied
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_string(&doc_a).unwrap(),
+            serde_json::to_string(&doc_b).unwrap()
+        );
+        assert_eq!(doc_a.blocks.len(), 2);
+        // After delete of c, blocks: [c, a, b] -> delete c -> [a, b], then a updated to "A"
+        assert_eq!(doc_a.blocks[0].id, b_a_id);
     }
 }

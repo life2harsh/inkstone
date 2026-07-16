@@ -8,9 +8,10 @@ use crate::auth::DevAuth;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+use inkstone_core::ids::UpdateId;
 use inkstone_core::protocol::{
-    CreateDocRequest, DocResponse, EncryptedUpdateResponse, PaginatedResponse,
-    PostSnapshotRequest, PostUpdateRequest, SnapshotResponse, UpdateResponse,
+    CreateDocRequest, DocResponse, EncryptedUpdateResponse, PaginatedResponse, PostSnapshotRequest,
+    PostUpdateRequest, SnapshotResponse, UpdateResponse,
 };
 
 #[derive(Deserialize)]
@@ -67,7 +68,18 @@ async fn list_docs(
 ) -> AppResult<Json<PaginatedResponse<DocResponse>>> {
     db::verify_workspace_access(&state.db, workspace_id, auth.user_id).await?;
 
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, Vec<u8>, Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            Vec<u8>,
+            Vec<u8>,
+            Uuid,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT id, workspace_id, encrypted_title, title_nonce, created_by, created_at, updated_at
          FROM docs WHERE workspace_id = $1
          ORDER BY updated_at DESC",
@@ -128,9 +140,9 @@ async fn post_update(
     Path(doc_id): Path<Uuid>,
     Json(req): Json<PostUpdateRequest>,
 ) -> AppResult<Json<UpdateResponse>> {
-    let device_id = auth.device_id.ok_or_else(|| {
-        AppError::BadRequest("x-dev-device-id header is required".into())
-    })?;
+    let device_id = auth
+        .device_id
+        .ok_or_else(|| AppError::BadRequest("x-dev-device-id header is required".into()))?;
 
     if req.sender_device_id != device_id {
         return Err(AppError::BadRequest(
@@ -147,7 +159,7 @@ async fn post_update(
         &state.db,
         doc_id,
         device_id,
-        req.client_update_id,
+        req.update_id.into(),
         encrypted_update,
         nonce,
         req.aad_version,
@@ -176,8 +188,19 @@ async fn list_updates(
     let after_seq = params.after_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(500).min(1000);
 
-    let rows = sqlx::query_as::<_, (i64, Uuid, Uuid, Vec<u8>, Vec<u8>, i32, chrono::DateTime<chrono::Utc>)>(
-        "SELECT seq, client_update_id, sender_device_id, encrypted_update, nonce, aad_version, created_at
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Uuid,
+            Uuid,
+            Vec<u8>,
+            Vec<u8>,
+            i32,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT seq, update_id, sender_device_id, encrypted_update, nonce, aad_version, created_at
          FROM doc_updates WHERE doc_id = $1 AND seq > $2
          ORDER BY seq ASC
          LIMIT $3",
@@ -188,17 +211,16 @@ async fn list_updates(
     .fetch_all(&state.db)
     .await?;
 
-    let total_row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM doc_updates WHERE doc_id = $1")
-            .bind(doc_id)
-            .fetch_one(&state.db)
-            .await?;
+    let total_row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM doc_updates WHERE doc_id = $1")
+        .bind(doc_id)
+        .fetch_one(&state.db)
+        .await?;
 
     let items: Vec<EncryptedUpdateResponse> = rows
         .into_iter()
         .map(|r| EncryptedUpdateResponse {
             seq: r.0,
-            client_update_id: r.1,
+            update_id: UpdateId(r.1),
             sender_device_id: r.2,
             encrypted_update_b64: base64_encode(&r.3),
             nonce_b64: base64_encode(&r.4),
@@ -220,10 +242,10 @@ async fn get_snapshot(
 ) -> AppResult<Json<SnapshotResponse>> {
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
-    let row = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT snapshot_version, encrypted_snapshot, nonce, created_at
+    let row = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, i32, chrono::DateTime<chrono::Utc>)>(
+        "SELECT base_seq, encrypted_snapshot, nonce, aad_version, created_at
          FROM doc_snapshots WHERE doc_id = $1
-         ORDER BY snapshot_version DESC LIMIT 1",
+         ORDER BY base_seq DESC LIMIT 1",
     )
     .bind(doc_id)
     .fetch_optional(&state.db)
@@ -231,10 +253,11 @@ async fn get_snapshot(
 
     match row {
         Some(r) => Ok(Json(SnapshotResponse {
-            snapshot_version: r.0,
+            base_seq: r.0,
             encrypted_snapshot_b64: base64_encode(&r.1),
             nonce_b64: base64_encode(&r.2),
-            created_at: r.3,
+            aad_version: r.3,
+            created_at: r.4,
         })),
         None => Err(AppError::NotFound("No snapshot found".into())),
     }
@@ -248,19 +271,34 @@ async fn post_snapshot(
 ) -> AppResult<Json<SnapshotResponse>> {
     db::verify_doc_access(&state.db, doc_id, auth.user_id).await?;
 
+    // Validate base_seq
+    if req.base_seq < 0 {
+        return Err(AppError::BadRequest(
+            "Snapshot base_seq cannot be negative".into(),
+        ));
+    }
+    let current = db::current_seq(&state.db, doc_id).await?;
+    if req.base_seq > current {
+        return Err(AppError::BadRequest(format!(
+            "Snapshot base_seq {} is ahead of document current_seq {}",
+            req.base_seq, current
+        )));
+    }
+
     let encrypted_snapshot = base64_decode(&req.encrypted_snapshot_b64)?;
     let nonce = base64_decode(&req.nonce_b64)?;
 
     sqlx::query(
-        "INSERT INTO doc_snapshots (doc_id, snapshot_version, encrypted_snapshot, nonce)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (doc_id, snapshot_version) DO UPDATE
-         SET encrypted_snapshot = $3, nonce = $4",
+        "INSERT INTO doc_snapshots (doc_id, base_seq, encrypted_snapshot, nonce, aad_version)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (doc_id, base_seq) DO UPDATE
+         SET encrypted_snapshot = $3, nonce = $4, aad_version = $5",
     )
     .bind(doc_id)
-    .bind(req.snapshot_version)
+    .bind(req.base_seq)
     .bind(&encrypted_snapshot)
     .bind(&nonce)
+    .bind(req.aad_version)
     .execute(&state.db)
     .await?;
 
@@ -270,9 +308,10 @@ async fn post_snapshot(
         .await?;
 
     Ok(Json(SnapshotResponse {
-        snapshot_version: req.snapshot_version,
+        base_seq: req.base_seq,
         encrypted_snapshot_b64: req.encrypted_snapshot_b64,
         nonce_b64: req.nonce_b64,
+        aad_version: req.aad_version,
         created_at: chrono::Utc::now(),
     }))
 }

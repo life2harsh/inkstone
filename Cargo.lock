@@ -919,6 +919,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkstone-client"
+version = "0.1.0"
+dependencies = [
+ "inkstone-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "inkstone-core"
 version = "0.1.0"
 dependencies = [

@@ -15,7 +15,8 @@ pub struct AppState {
     pub doc_rooms: DocRoomRegistry,
 }
 
-pub type DocRoomRegistry = Arc<RwLock<HashMap<Uuid, tokio::sync::broadcast::Sender<ServerWsMessage>>>>;
+pub type DocRoomRegistry =
+    Arc<RwLock<HashMap<Uuid, tokio::sync::broadcast::Sender<ServerWsMessage>>>>;
 
 impl AppState {
     pub fn new(db: PgPool, config: Config) -> Self {
