@@ -376,6 +376,9 @@ impl WorkspaceStore for WorkspaceDb {
 
     async fn delete_file(&self, path: &WorkspacePath) -> Result<(), WorkspaceStoreError> {
         let path_str = path.as_str();
+        if self.read_bytes(path_str).await?.is_none() {
+            return Err(WorkspaceStoreError::NotFound(path_str.to_string()));
+        }
         self.delete_key("files", path_str).await?;
         self.delete_key("doc_map", path_str).await?;
         Ok(())
@@ -394,14 +397,54 @@ impl WorkspaceStore for WorkspaceDb {
             .await?
             .ok_or_else(|| WorkspaceStoreError::NotFound(src_str.to_string()))?;
 
+        if self.read_bytes(dst_str).await?.is_some() {
+            return Err(WorkspaceStoreError::AlreadyExists(dst_str.to_string()));
+        }
+
         let doc_id = self.read_string("doc_map", src_str).await?;
 
-        self.write_bytes(dst_str, &data).await?;
+        let store_names = js_sys::Array::new();
+        store_names.push(&JsValue::from_str("files"));
+        store_names.push(&JsValue::from_str("doc_map"));
+
+        let tx = self
+            .db
+            .transaction_with_str_sequence_and_mode(
+                &store_names.into(),
+                IdbTransactionMode::Readwrite,
+            )
+            .map_err(|e| WorkspaceStoreError::Backend(format!("tx: {:?}", e)))?;
+
+        let files_store = tx
+            .object_store("files")
+            .map_err(|e| WorkspaceStoreError::Backend(format!("files store: {:?}", e)))?;
+        let doc_map_store = tx
+            .object_store("doc_map")
+            .map_err(|e| WorkspaceStoreError::Backend(format!("doc_map store: {:?}", e)))?;
+
+        let js_array = js_sys::Uint8Array::from(&data[..]);
+        files_store
+            .put_with_key(&js_array, &JsValue::from_str(dst_str))
+            .map_err(|e| WorkspaceStoreError::Backend(format!("put: {:?}", e)))?;
+
         if let Some(id) = &doc_id {
-            self.write_string("doc_map", dst_str, id).await?;
+            doc_map_store
+                .put_with_key(&JsValue::from_str(id), &JsValue::from_str(dst_str))
+                .map_err(|e| WorkspaceStoreError::Backend(format!("put doc_map: {:?}", e)))?;
         }
-        self.delete_key("files", src_str).await?;
-        self.delete_key("doc_map", src_str).await?;
+
+        files_store
+            .delete(&JsValue::from_str(src_str))
+            .map_err(|e| WorkspaceStoreError::Backend(format!("del files: {:?}", e)))?;
+
+        doc_map_store
+            .delete(&JsValue::from_str(src_str))
+            .map_err(|e| WorkspaceStoreError::Backend(format!("del doc_map: {:?}", e)))?;
+
+        await_transaction(tx)
+            .await
+            .map_err(|e| WorkspaceStoreError::Backend(format!("tx await: {:?}", e)))?;
+
         Ok(())
     }
 }

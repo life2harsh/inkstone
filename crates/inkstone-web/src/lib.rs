@@ -88,6 +88,21 @@ impl Driver {
             None => return,
         };
         wasm_bindgen_futures::spawn_local(async move {
+            match ws.read_file(&path).await {
+                Ok(Some(_)) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("File already exists: {}", name));
+                    this.render();
+                    return;
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("Create file check failed: {:?}", e));
+                    this.render();
+                    return;
+                }
+                Ok(None) => {}
+            }
             match ws.write_file(&path, &[]).await {
                 Ok(()) => {
                     let _ = ws.set_doc_id(&path_str, doc_id.0).await;
@@ -116,23 +131,35 @@ impl Driver {
         };
         let is_selected = self.0.borrow().selected_path.as_deref() == Some(&path_str);
         wasm_bindgen_futures::spawn_local(async move {
-            let doc_id = ws.get_doc_id(&path_str).await.ok().flatten();
-            if let Some(did) = doc_id {
-                let _ = ws.delete_document_record(&did).await;
-            }
-            match ws.delete_file(&path_wp).await {
-                Ok(()) => {
-                    if is_selected {
-                        this.0.borrow_mut().selected_path = None;
-                    }
-                    this.refresh_entries();
+            let doc_id = match ws.get_doc_id(&path_str).await {
+                Ok(id) => id,
+                Err(e) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("Delete lookup failed: {:?}", e));
                     this.render();
+                    return;
                 }
+            };
+            match ws.delete_file(&path_wp).await {
+                Ok(()) => {}
                 Err(e) => {
                     this.0.borrow_mut().storage_error = Some(format!("Delete failed: {:?}", e));
                     this.render();
+                    return;
                 }
             }
+            if let Some(did) = doc_id {
+                if let Err(e) = ws.delete_document_record(&did).await {
+                    web_sys::console::warn_1(
+                        &format!("Failed to delete document record: {:?}", e).into(),
+                    );
+                }
+            }
+            if is_selected {
+                this.0.borrow_mut().selected_path = None;
+            }
+            this.refresh_entries();
+            this.render();
         });
     }
 
