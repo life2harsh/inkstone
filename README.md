@@ -52,6 +52,12 @@ inkstone-web
   → Rust/WASM browser host. IndexedDB adapter (storage.rs, indexed_db.rs),
     DOM renderer, event delegation. Built with wasm-pack.
 
+inkstone-workspace
+  → Portable workspace paths, manifest format, and async storage contract.
+    Platform-independent: no web-sys, no std::fs, no IndexedDB.
+    Reference in-memory store for testing.
+    Browser workspace migration and desktop filesystem storage are future work.
+
 inkstone-server
   → Axum HTTP + WebSocket server, SQLx + Postgres. Synchronization spine.
     Stores opaque encrypted blobs.
