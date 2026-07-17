@@ -221,3 +221,145 @@ body {
   font-size: 13px;
   color: #c53030;
 }
+
+/* ── Workspace File List ─────────────────────────────── */
+
+.file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 16px;
+}
+
+.file-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.file-entry:hover {
+  background-color: #e8e6e2;
+}
+
+.file-entry.active {
+  background-color: var(--accent-blue);
+  color: #fff;
+}
+
+.file-entry.active .file-name {
+  color: #fff;
+}
+
+.file-entry.active .rename-btn,
+.file-entry.active .delete-btn {
+  color: #cbd5e0;
+}
+
+.file-entry.active .rename-btn:hover,
+.file-entry.active .delete-btn:hover {
+  color: #fff;
+}
+
+.file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-main);
+}
+
+.file-actions {
+  display: none;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.file-entry:hover .file-actions {
+  display: flex;
+}
+
+.rename-btn,
+.delete-btn {
+  background: none;
+  border: none;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  color: var(--text-muted);
+}
+
+.rename-btn:hover {
+  color: var(--accent-blue);
+  background-color: rgba(44, 82, 130, 0.1);
+}
+
+.delete-btn:hover {
+  color: #c53030;
+  background-color: rgba(197, 48, 48, 0.1);
+}
+
+/* ── New File Row ────────────────────────────────────── */
+
+.new-file-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.new-file-input {
+  flex: 1;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+  background: #fff;
+  color: var(--text-main);
+  outline: none;
+}
+
+.new-file-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.new-file-btn {
+  background-color: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.new-file-btn:hover {
+  background-color: var(--accent-blue-hover);
+}
+
+/* ── Empty State ─────────────────────────────────────── */
+
+.empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 15px;
+  padding: 48px 24px;
+}
+
+/* ── Storage Error ───────────────────────────────────── */
+
+.storage-error {
+  background-color: #fff5f5;
+  border: 1px solid #fed7d7;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  color: #c53030;
+  font-size: 14px;
+}

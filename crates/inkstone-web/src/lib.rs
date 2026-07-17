@@ -1,5 +1,6 @@
 pub mod indexed_db;
 pub mod storage;
+pub mod workspace_db;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -9,34 +10,21 @@ use wasm_bindgen::JsCast;
 use inkstone_client::{ClientEvent, ClientState, Effect, SessionPhase};
 use inkstone_core::doc_ops::DocumentOp;
 use inkstone_core::ids::{BlockId, DocId, UpdateId};
+use inkstone_workspace::{WorkspaceEntry, WorkspacePath, WorkspaceStore};
 
 use indexed_db::IndexedDb;
-
-fn get_or_create_demo_doc_id() -> DocId {
-    let window = web_sys::window().expect("No global window found");
-    let local_storage = window
-        .local_storage()
-        .expect("No localStorage found")
-        .expect("localStorage disabled");
-
-    let key = "inkstone_demo_doc_id";
-    if let Ok(Some(val)) = local_storage.get_item(key) {
-        if let Ok(uuid) = uuid::Uuid::parse_str(&val) {
-            return DocId(uuid);
-        }
-    }
-
-    let new_id = DocId::new_v4();
-    let _ = local_storage.set_item(key, &new_id.0.to_string());
-    new_id
-}
+use workspace_db::WorkspaceDb;
 
 pub struct DriverInner {
     pub client_state: ClientState,
     pub db: Option<IndexedDb>,
+    pub workspace_db: Option<WorkspaceDb>,
     pub persistence_status: String,
     pub storage_error: Option<String>,
     pub selected_doc_id: DocId,
+    pub entries: Vec<WorkspaceEntry>,
+    pub selected_path: Option<String>,
+    pub workspace_loaded: bool,
 }
 
 #[derive(Clone)]
@@ -47,10 +35,165 @@ impl Driver {
         Driver(Rc::new(RefCell::new(DriverInner {
             client_state: ClientState::new(doc_id),
             db: None,
+            workspace_db: None,
             persistence_status: "Initializing...".to_string(),
             storage_error: None,
             selected_doc_id: doc_id,
+            entries: Vec::new(),
+            selected_path: None,
+            workspace_loaded: false,
         })))
+    }
+
+    fn select_entry(&self, path: &str) {
+        let this = self.clone();
+        let path_str = path.to_string();
+        let ws = self.0.borrow().workspace_db.clone();
+        let ws = match ws {
+            Some(w) => w,
+            None => return,
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let existing_id = ws.get_doc_id(&path_str).await.ok().flatten();
+            let doc_id = existing_id.unwrap_or_else(uuid::Uuid::new_v4);
+            if existing_id.is_none() {
+                let _ = ws.set_doc_id(&path_str, doc_id).await;
+            }
+            let d = DocId(doc_id);
+            {
+                let mut inner = this.0.borrow_mut();
+                inner.selected_doc_id = d;
+                inner.selected_path = Some(path_str);
+                inner.client_state = ClientState::new(d);
+            }
+            this.dispatch(ClientEvent::OpenDocument { doc_id: d });
+        });
+    }
+
+    fn create_file(&self, name: &str) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let path = match WorkspacePath::new(&name) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let path_str = path.as_str().to_string();
+        let doc_id = DocId::new_v4();
+        let this = self.clone();
+        let ws = self.0.borrow().workspace_db.clone();
+        let ws = match ws {
+            Some(w) => w,
+            None => return,
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            match ws.write_file(&path, &[]).await {
+                Ok(()) => {
+                    let _ = ws.set_doc_id(&path_str, doc_id.0).await;
+                    this.refresh_entries();
+                    this.select_entry(&path_str);
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("Create file failed: {:?}", e));
+                    this.render();
+                }
+            }
+        });
+    }
+    fn delete_entry(&self, path: &str) {
+        let path_str = path.to_string();
+        let path_wp = match WorkspacePath::new(&path_str) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let this = self.clone();
+        let ws = self.0.borrow().workspace_db.clone();
+        let ws = match ws {
+            Some(w) => w,
+            None => return,
+        };
+        let is_selected = self.0.borrow().selected_path.as_deref() == Some(&path_str);
+        wasm_bindgen_futures::spawn_local(async move {
+            let doc_id = ws.get_doc_id(&path_str).await.ok().flatten();
+            if let Some(did) = doc_id {
+                let _ = ws.delete_document_record(&did).await;
+            }
+            match ws.delete_file(&path_wp).await {
+                Ok(()) => {
+                    if is_selected {
+                        this.0.borrow_mut().selected_path = None;
+                    }
+                    this.refresh_entries();
+                    this.render();
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error = Some(format!("Delete failed: {:?}", e));
+                    this.render();
+                }
+            }
+        });
+    }
+
+    fn rename_entry(&self, old_path: &str, new_name: &str) {
+        let new_name = new_name.trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let new_path = match WorkspacePath::new(&new_name) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let old_path_wp = match WorkspacePath::new(old_path) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let this = self.clone();
+        let ws = self.0.borrow().workspace_db.clone();
+        let ws = match ws {
+            Some(w) => w,
+            None => return,
+        };
+        let is_selected = self.0.borrow().selected_path.as_deref() == Some(old_path);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ws.rename_file(&old_path_wp, &new_path).await {
+                Ok(()) => {
+                    if is_selected {
+                        this.0.borrow_mut().selected_path = Some(new_name.clone());
+                    }
+                    this.refresh_entries();
+                    this.render();
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error = Some(format!("Rename failed: {:?}", e));
+                    this.render();
+                }
+            }
+        });
+    }
+
+    fn refresh_entries(&self) {
+        let ws = match self.0.borrow().workspace_db.clone() {
+            Some(w) => w,
+            None => return,
+        };
+        let this = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match ws.list_entries().await {
+                Ok(mut entries) => {
+                    entries.sort_by(|a, b| a.path.cmp(&b.path));
+                    this.0.borrow_mut().entries = entries;
+                    this.0.borrow_mut().workspace_loaded = true;
+                    this.render();
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("List entries failed: {:?}", e));
+                    this.render();
+                }
+            }
+        });
     }
 
     pub fn dispatch(&self, event: ClientEvent) {
@@ -388,6 +531,8 @@ impl Driver {
         let phase = client_state.phase();
         let persistence_status = &inner.persistence_status;
         let storage_error = &inner.storage_error;
+        let entries = &inner.entries;
+        let selected_path = &inner.selected_path;
 
         let editing_allowed = storage_error.is_none()
             && phase != SessionPhase::HydratingLocal
@@ -407,18 +552,65 @@ impl Driver {
 
         let sidebar_heading = document.create_element("div").unwrap();
         sidebar_heading.set_class_name("sidebar-heading");
-        sidebar_heading.set_text_content(Some("Documents"));
+        sidebar_heading.set_text_content(Some("Files"));
         sidebar.append_child(&sidebar_heading).unwrap();
 
-        let doc_entry = document.create_element("div").unwrap();
-        doc_entry.set_class_name("doc-entry active");
-        let doc_title_text = if view_doc.title.trim().is_empty() {
-            "Untitled"
-        } else {
-            &view_doc.title
-        };
-        doc_entry.set_text_content(Some(doc_title_text));
-        sidebar.append_child(&doc_entry).unwrap();
+        let file_list = document.create_element("div").unwrap();
+        file_list.set_class_name("file-list");
+        for entry in entries.iter() {
+            let path_str = entry.path.as_str();
+            let is_active = selected_path.as_deref() == Some(path_str);
+
+            let file_entry = document.create_element("div").unwrap();
+            let class = if is_active {
+                "file-entry active"
+            } else {
+                "file-entry"
+            };
+            file_entry.set_class_name(class);
+            file_entry.set_attribute("data-path", path_str).unwrap();
+
+            let file_name = document.create_element("span").unwrap();
+            file_name.set_class_name("file-name");
+            file_name.set_text_content(Some(path_str));
+            file_entry.append_child(&file_name).unwrap();
+
+            let file_actions = document.create_element("span").unwrap();
+            file_actions.set_class_name("file-actions");
+
+            let rename_btn = document.create_element("button").unwrap();
+            rename_btn.set_class_name("rename-btn");
+            rename_btn.set_attribute("data-path", path_str).unwrap();
+            rename_btn.set_text_content(Some("Rename"));
+            file_actions.append_child(&rename_btn).unwrap();
+
+            let delete_btn = document.create_element("button").unwrap();
+            delete_btn.set_class_name("delete-btn");
+            delete_btn.set_attribute("data-path", path_str).unwrap();
+            delete_btn.set_text_content(Some("Delete"));
+            file_actions.append_child(&delete_btn).unwrap();
+
+            file_entry.append_child(&file_actions).unwrap();
+            file_list.append_child(&file_entry).unwrap();
+        }
+        sidebar.append_child(&file_list).unwrap();
+
+        let new_file_row = document.create_element("div").unwrap();
+        new_file_row.set_class_name("new-file-row");
+
+        let new_file_input = document.create_element("input").unwrap();
+        let new_file_input: web_sys::HtmlInputElement = new_file_input.unchecked_into();
+        new_file_input.set_type("text");
+        new_file_input.set_class_name("new-file-input");
+        new_file_input.set_placeholder("filename.md");
+        new_file_row.append_child(&new_file_input).unwrap();
+
+        let create_btn = document.create_element("button").unwrap();
+        create_btn.set_class_name("new-file-btn");
+        create_btn.set_text_content(Some("Create"));
+        new_file_row.append_child(&create_btn).unwrap();
+
+        sidebar.append_child(&new_file_row).unwrap();
 
         let sidebar_footer = document.create_element("div").unwrap();
         sidebar_footer.set_class_name("sidebar-footer");
@@ -439,6 +631,13 @@ impl Driver {
         let main_content = document.create_element("div").unwrap();
         main_content.set_class_name("main-content");
 
+        if selected_path.is_none() && storage_error.is_none() {
+            let empty_state = document.create_element("div").unwrap();
+            empty_state.set_class_name("empty-state");
+            empty_state.set_text_content(Some("Select a file or create a new one."));
+            main_content.append_child(&empty_state).unwrap();
+        }
+
         if let Some(err) = storage_error {
             let err_div = document.create_element("div").unwrap();
             err_div.set_class_name("storage-error");
@@ -451,14 +650,14 @@ impl Driver {
             loading_div.set_class_name("loading-state");
             loading_div.set_text_content(Some("Loading local document..."));
             main_content.append_child(&loading_div).unwrap();
-        } else if phase == SessionPhase::Closed {
+        } else if phase == SessionPhase::Closed && selected_path.is_some() {
             let closed_div = document.create_element("div").unwrap();
             closed_div.set_class_name("closed-state");
             closed_div.set_text_content(Some("No document open."));
             main_content.append_child(&closed_div).unwrap();
         }
 
-        if editing_allowed {
+        if editing_allowed && selected_path.is_some() {
             let editor_container = document.create_element("div").unwrap();
             editor_container.set_class_name("editor-container");
 
@@ -634,7 +833,94 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     let d_click = driver.clone();
     let on_click = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+        let target = match event.target() {
+            Some(t) => t,
+            None => return,
+        };
+        let el = match target.dyn_into::<web_sys::HtmlElement>() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let class = el.class_name();
         let editing_allowed = {
+            let inner = d_click.0.borrow();
+            let has_err = inner.storage_error.is_some();
+            !has_err
+        };
+
+        if !editing_allowed {
+            return;
+        }
+
+        // ── Workspace: new file button ──────────────────────────────
+        if class == "new-file-btn" {
+            let parent = el.parent_element().and_then(|p| p.parent_element());
+            let input_val = parent
+                .and_then(|p| p.query_selector(".new-file-input").ok().flatten())
+                .and_then(|input| {
+                    let html_input: web_sys::HtmlInputElement = input.unchecked_into();
+                    let val = html_input.value();
+                    if val.trim().is_empty() {
+                        None
+                    } else {
+                        Some(val)
+                    }
+                });
+            if let Some(name) = input_val {
+                d_click.create_file(&name);
+            }
+            return;
+        }
+
+        // ── Workspace: file entry click (select) ──────────────────
+        if class == "file-entry" || class == "file-entry active" || class == "file-name" {
+            let path = el.get_attribute("data-path").or_else(|| {
+                el.parent_element()
+                    .and_then(|p| p.get_attribute("data-path"))
+            });
+            if let Some(p) = path {
+                d_click.select_entry(&p);
+            }
+            return;
+        }
+
+        // ── Workspace: rename button ──────────────────────────────
+        if class == "rename-btn" {
+            if let Some(path) = el.get_attribute("data-path") {
+                if let Some(window) = web_sys::window() {
+                    let new_name = window
+                        .prompt_with_message_and_default("Rename file to:", &path)
+                        .unwrap_or(None);
+                    if let Some(name) = new_name {
+                        if !name.trim().is_empty() && name != path {
+                            d_click.rename_entry(&path, &name);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // ── Workspace: delete button ──────────────────────────────
+        if class == "delete-btn" {
+            if let Some(path) = el.get_attribute("data-path") {
+                if let Some(window) = web_sys::window() {
+                    let confirmed = window
+                        .confirm_with_message(&format!(
+                            "Delete \"{}\"? This cannot be undone.",
+                            path
+                        ))
+                        .unwrap_or(false);
+                    if confirmed {
+                        d_click.delete_entry(&path);
+                    }
+                }
+            }
+            return;
+        }
+
+        // ── Existing: add block button ────────────────────────────
+        let editor_editing_allowed = {
             let inner = d_click.0.borrow();
             let state = &inner.client_state;
             let phase = state.phase();
@@ -642,42 +928,63 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 && phase != SessionPhase::HydratingLocal
                 && phase != SessionPhase::Closed
                 && phase != SessionPhase::Error
+                && inner.selected_path.is_some()
         };
-        if !editing_allowed {
+        if !editor_editing_allowed {
             return;
         }
-        let target = event.target();
-        if let Some(target) = target {
-            if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
-                if el.class_name() == "add-block-btn" {
-                    let update_id = UpdateId::new_v4();
-                    let applied_at_ms = js_sys::Date::now() as i64;
-                    let block_id = BlockId::new_v4();
+        if class == "add-block-btn" {
+            let update_id = UpdateId::new_v4();
+            let applied_at_ms = js_sys::Date::now() as i64;
+            let block_id = BlockId::new_v4();
 
-                    let block = inkstone_core::document::DocumentBlock::new(
-                        block_id,
-                        inkstone_core::document::BlockContent::Markdown {
-                            text: "".to_string(),
-                        },
-                    );
+            let block = inkstone_core::document::DocumentBlock::new(
+                block_id,
+                inkstone_core::document::BlockContent::Markdown {
+                    text: "".to_string(),
+                },
+            );
 
-                    let insert_idx = d_click.0.borrow().client_state.view_doc().blocks.len();
+            let insert_idx = d_click.0.borrow().client_state.view_doc().blocks.len();
 
-                    d_click.dispatch(ClientEvent::LocalIntent {
-                        op: DocumentOp::InsertBlock {
-                            idx: insert_idx,
-                            block,
-                        },
-                        update_id,
-                        applied_at_ms,
-                    });
-                }
-            }
+            d_click.dispatch(ClientEvent::LocalIntent {
+                op: DocumentOp::InsertBlock {
+                    idx: insert_idx,
+                    block,
+                },
+                update_id,
+                applied_at_ms,
+            });
         }
     }) as Box<dyn FnMut(web_sys::MouseEvent)>);
 
     root.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;
     on_click.forget();
+
+    let d_keydown = driver.clone();
+    let on_keydown = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+        if event.key() != "Enter" {
+            return;
+        }
+        let target = match event.target() {
+            Some(t) => t,
+            None => return,
+        };
+        let el = match target.dyn_into::<web_sys::HtmlElement>() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        if el.class_name() != "new-file-input" {
+            return;
+        }
+        let html_input: web_sys::HtmlInputElement = el.unchecked_into();
+        let val = html_input.value();
+        if !val.trim().is_empty() {
+            d_keydown.create_file(&val);
+        }
+    }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+    root.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
+    on_keydown.forget();
 
     let d_focusout = driver.clone();
     let on_focusout = Closure::wrap(Box::new(move |event: web_sys::FocusEvent| {
@@ -720,12 +1027,22 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 pub fn start_app() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
 
-    let doc_id = get_or_create_demo_doc_id();
-    let driver = Driver::new(doc_id);
-
+    let driver = Driver::new(DocId::new_v4());
     setup_event_delegation(&driver)?;
 
-    driver.dispatch(ClientEvent::OpenDocument { doc_id });
+    let d = driver.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        match WorkspaceDb::open().await {
+            Ok(ws) => {
+                d.0.borrow_mut().workspace_db = Some(ws.clone());
+                d.refresh_entries();
+            }
+            Err(e) => {
+                d.0.borrow_mut().storage_error = Some(format!("Failed to open workspace: {:?}", e));
+                d.render();
+            }
+        }
+    });
 
     Ok(())
 }
