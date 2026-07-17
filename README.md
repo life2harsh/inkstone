@@ -1,54 +1,76 @@
 # Inkstone
 
-Self-hostable, local-first, E2EE collaborative Markdown knowledge workspace.
+Self-hostable, local-first collaborative Markdown knowledge workspace.
 
-**Status:** v0.1 — Sync spine.
+**Status:** v0.1 — Local-first Rust/WASM spine. E2EE and browser sync not wired yet.
 
 ## Prerequisites
 
-- Docker + Docker Compose
 - Rust 1.88+ (`rustup`, `cargo`)
-- Node 20+ (for frontend)
+- `wasm-pack` (for browser build)
+- Docker + Docker Compose (only for server/Postgres work)
 
-## Quick Start
+No Node.js required for the frontend.
+
+## Quick Start (browser demo)
 
 ```bash
-# 0. Clone with submodules (or git submodule update --init --recursive for existing clones)
-git clone --recurse-submodules https://github.com/life2harsh/inkstone.git
+# Build the web WASM artifact
+./scripts/build-web.sh
 
-# 1. Generate Cargo.lock (first-time setup)
-cargo generate-lockfile
+# Serve the static directory
+cd apps/web
+python -m http.server 8090
+```
 
-# 2. Start Postgres
+Open `http://localhost:8090` in a browser that supports WebAssembly and IndexedDB.
+
+## Server (sync + collaboration)
+
+```bash
+# Start Postgres
 docker compose up -d postgres
 
-# 3. Run the server (runs migrations on startup)
+# Run the server (runs migrations on startup)
 cargo run -p inkstone-server
 ```
 
 Server listens on `http://0.0.0.0:8080`.
 
-## Frontend
+## Architecture
 
-```bash
-cd apps/web
-npm install
-npm run dev
+```
+inkstone-core
+  → Canonical document model (InkstoneDocument), operations, markdown parser,
+    graph index, protocol messages, typed IDs.
+
+inkstone-client
+  → Pure Rust local-first state machine. Owns phase transitions, intent
+    queue, inbox, confirmation pipeline. No I/O, no browser dependency.
+
+inkstone-web
+  → Rust/WASM browser host. IndexedDB adapter (storage.rs, indexed_db.rs),
+    DOM renderer, event delegation. Built with wasm-pack.
+
+inkstone-server
+  → Axum HTTP + WebSocket server, SQLx + Postgres. Synchronization spine.
+    Stores opaque encrypted blobs.
+
+stonepen
+  → External Rust/WASM ink engine submodule (not a workspace member).
 ```
 
-## All Commands
+## Development
 
 ```bash
-cargo generate-lockfile       # create Cargo.lock if missing (required before docker compose build)
-cargo fmt                     # format Rust code
+cargo fmt                     # format all Rust code
+cargo test -p inkstone-core   # core document model tests
+cargo test -p inkstone-client # local-first state machine tests
+cargo test -p inkstone-web    # storage crate unit tests
 cargo check --workspace       # type-check all crates
-cargo test -p inkstone-core   # run unit tests (no database needed)
-./scripts/run-tests.sh        # run all tests (starts test Postgres automatically)
-cd apps/web && npm run build  # build frontend
-docker compose build          # build Docker image
 ```
 
-## API
+## API (server)
 
 Dev auth: HTTP routes use `x-dev-user-id` and `x-dev-device-id` headers.
 WebSocket uses query params `?dev_user_id=...&dev_device_id=...`.
@@ -67,22 +89,11 @@ WebSocket uses query params `?dev_user_id=...&dev_device_id=...`.
 | POST | `/api/docs/:id/snapshot` | Upsert encrypted snapshot |
 | GET | `/api/sync/docs/:id/ws` | WebSocket for real-time sync |
 
-## Architecture
+## Security status
 
-- **inkstone-core**: Shared types (IDs, crypto envelope, protocol messages, document model, operations, markdown parser, graph index)
-- **stonepen**: Pinned Git submodule — standalone Rust/WASM ink engine (not a Cargo workspace member)
-- **inkstone-server**: Axum HTTP + WebSocket server, SQLx + Postgres, zero-knowledge document storage
-
-## v0.1 security status
-
-The current web client uses dev-only base64 plaintext placeholders. This is not encryption.
-The server sync spine stores opaque blobs and is designed for client-side encryption.
-Real E2EE is planned for the client crypto module.
-Do not deploy dev auth in production.
-
-## Security
-
-- Server stores only encrypted blobs (titles, updates, snapshots, metadata)
-- Client must encrypt before upload (XChaCha20-Poly1305 via WASM or WebCrypto)
-- Dev auth is NOT production-safe
-- Server cannot perform plaintext search
+- The current local demo document is **plaintext** in browser IndexedDB.
+- Browser network sync is **not wired** yet.
+- Real client-side E2EE is **not implemented** yet.
+- Server stores opaque blobs; encryption is expected at the client layer.
+- Dev auth (`x-dev-user-id` / `x-dev-device-id`) is **not production-safe**.
+- This application is **not production ready**.

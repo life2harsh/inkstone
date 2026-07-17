@@ -3,5 +3,6 @@ members = [
     "crates/inkstone-core",
     "crates/inkstone-client",
     "crates/inkstone-server",
+    "crates/inkstone-web",
 ]
 resolver = "2"

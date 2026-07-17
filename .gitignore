@@ -6,4 +6,4 @@ apps/web/dist/
 .DS_Store
 AGENTS.md
 SKILLS.md
-
+/apps/web/pkg/
