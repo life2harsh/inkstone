@@ -131,9 +131,18 @@ impl Driver {
                         this.select_entry(&path_str);
                     }
                     Err(e) => {
-                        let _ = ws.delete_file(&path).await;
-                        this.0.borrow_mut().storage_error =
-                            Some(format!("Create file mapping failed: {:?}", e));
+                        let msg = match ws.delete_file(&path).await {
+                            Ok(()) => {
+                                format!("Create file mapping failed: {:?}", e)
+                            }
+                            Err(rollback_err) => {
+                                format!(
+                                    "Create file mapping failed: {:?}; rollback also failed: {:?}",
+                                    e, rollback_err
+                                )
+                            }
+                        };
+                        this.0.borrow_mut().storage_error = Some(msg);
                         this.render();
                     }
                 },

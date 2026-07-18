@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
@@ -10,6 +10,21 @@ use inkstone_workspace::{
     WorkspaceEntry, WorkspaceManifest, WorkspacePath, WorkspaceStore, WorkspaceStoreError,
     WORKSPACE_MANIFEST_PATH,
 };
+
+thread_local! {
+    static INJECT_FAIL_SET_DOC_ID: Cell<bool> = Cell::new(false);
+    static INJECT_FAIL_DELETE_FILE: Cell<bool> = Cell::new(false);
+}
+
+#[wasm_bindgen]
+pub fn inject_fail_set_doc_id() {
+    INJECT_FAIL_SET_DOC_ID.with(|f| f.set(true));
+}
+
+#[wasm_bindgen]
+pub fn inject_fail_delete_file() {
+    INJECT_FAIL_DELETE_FILE.with(|f| f.set(true));
+}
 
 async fn await_request(request: IdbRequest) -> Result<JsValue, JsValue> {
     let (tx, rx) = futures_channel::oneshot::channel::<Result<JsValue, JsValue>>();
@@ -379,6 +394,11 @@ impl WorkspaceStore for WorkspaceDb {
         if self.read_bytes(path_str).await?.is_none() {
             return Err(WorkspaceStoreError::NotFound(path_str.to_string()));
         }
+        if INJECT_FAIL_DELETE_FILE.with(|f| f.replace(false)) {
+            return Err(WorkspaceStoreError::Backend(
+                "injected delete_file failure".into(),
+            ));
+        }
         self.delete_key("files", path_str).await?;
         self.delete_key("doc_map", path_str).await?;
         Ok(())
@@ -470,6 +490,11 @@ impl WorkspaceDb {
         path: &str,
         doc_id: uuid::Uuid,
     ) -> Result<(), WorkspaceStoreError> {
+        if INJECT_FAIL_SET_DOC_ID.with(|f| f.replace(false)) {
+            return Err(WorkspaceStoreError::Backend(
+                "injected set_doc_id failure".into(),
+            ));
+        }
         self.write_string("doc_map", path, &doc_id.to_string())
             .await
     }
