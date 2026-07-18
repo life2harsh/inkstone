@@ -54,19 +54,40 @@ impl Driver {
             None => return,
         };
         wasm_bindgen_futures::spawn_local(async move {
-            let existing_id = ws.get_doc_id(&path_str).await.ok().flatten();
-            let doc_id = existing_id.unwrap_or_else(uuid::Uuid::new_v4);
-            if existing_id.is_none() {
-                let _ = ws.set_doc_id(&path_str, doc_id).await;
+            match ws.get_doc_id(&path_str).await {
+                Ok(Some(existing_id)) => {
+                    let doc_id = DocId(existing_id);
+                    {
+                        let mut inner = this.0.borrow_mut();
+                        inner.selected_doc_id = doc_id;
+                        inner.selected_path = Some(path_str);
+                        inner.client_state = ClientState::new(doc_id);
+                    }
+                    this.dispatch(ClientEvent::OpenDocument { doc_id });
+                }
+                Ok(None) => {
+                    let new_id = uuid::Uuid::new_v4();
+                    let doc_id = DocId(new_id);
+                    if let Err(e) = ws.set_doc_id(&path_str, new_id).await {
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Failed to save document mapping: {:?}", e));
+                        this.render();
+                        return;
+                    }
+                    {
+                        let mut inner = this.0.borrow_mut();
+                        inner.selected_doc_id = doc_id;
+                        inner.selected_path = Some(path_str);
+                        inner.client_state = ClientState::new(doc_id);
+                    }
+                    this.dispatch(ClientEvent::OpenDocument { doc_id });
+                }
+                Err(e) => {
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("Failed to read document mapping: {:?}", e));
+                    this.render();
+                }
             }
-            let d = DocId(doc_id);
-            {
-                let mut inner = this.0.borrow_mut();
-                inner.selected_doc_id = d;
-                inner.selected_path = Some(path_str);
-                inner.client_state = ClientState::new(d);
-            }
-            this.dispatch(ClientEvent::OpenDocument { doc_id: d });
         });
     }
 
@@ -104,11 +125,18 @@ impl Driver {
                 Ok(None) => {}
             }
             match ws.write_file(&path, &[]).await {
-                Ok(()) => {
-                    let _ = ws.set_doc_id(&path_str, doc_id.0).await;
-                    this.refresh_entries();
-                    this.select_entry(&path_str);
-                }
+                Ok(()) => match ws.set_doc_id(&path_str, doc_id.0).await {
+                    Ok(()) => {
+                        this.refresh_entries();
+                        this.select_entry(&path_str);
+                    }
+                    Err(e) => {
+                        let _ = ws.delete_file(&path).await;
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Create file mapping failed: {:?}", e));
+                        this.render();
+                    }
+                },
                 Err(e) => {
                     this.0.borrow_mut().storage_error =
                         Some(format!("Create file failed: {:?}", e));
@@ -150,9 +178,14 @@ impl Driver {
             }
             if let Some(did) = doc_id {
                 if let Err(e) = ws.delete_document_record(&did).await {
-                    web_sys::console::warn_1(
-                        &format!("Failed to delete document record: {:?}", e).into(),
-                    );
+                    this.0.borrow_mut().storage_error =
+                        Some(format!("Delete document record failed: {:?}", e));
+                    if is_selected {
+                        this.0.borrow_mut().selected_path = None;
+                    }
+                    this.refresh_entries();
+                    this.render();
+                    return;
                 }
             }
             if is_selected {
@@ -1050,11 +1083,40 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     Ok(())
 }
 
+thread_local! {
+    static DRIVER: RefCell<Option<Driver>> = RefCell::new(None);
+}
+
+#[wasm_bindgen]
+pub fn close_workspace_db() {
+    DRIVER.with(|d| {
+        if let Some(ref driver) = *d.borrow() {
+            if let Some(ref ws) = driver.0.borrow().workspace_db {
+                ws.close();
+            }
+        }
+    });
+}
+
+#[wasm_bindgen]
+pub fn close_local_db() {
+    DRIVER.with(|d| {
+        if let Some(ref driver) = *d.borrow() {
+            let mut inner = driver.0.borrow_mut();
+            if let Some(ref db) = inner.db {
+                db.close();
+            }
+            inner.db = None;
+        }
+    });
+}
+
 #[wasm_bindgen(start)]
 pub fn start_app() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
 
     let driver = Driver::new(DocId::new_v4());
+    DRIVER.with(|d| *d.borrow_mut() = Some(driver.clone()));
     setup_event_delegation(&driver)?;
 
     let d = driver.clone();

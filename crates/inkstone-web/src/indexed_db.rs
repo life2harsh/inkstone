@@ -166,6 +166,10 @@ impl IndexedDb {
         }
     }
 
+    pub fn close(&self) {
+        self.db.close();
+    }
+
     pub async fn put_document_record(
         &self,
         doc_id: &str,

@@ -450,6 +450,11 @@ impl WorkspaceStore for WorkspaceDb {
 }
 
 impl WorkspaceDb {
+    /// Close the underlying IndexedDB connection.
+    pub fn close(&self) {
+        self.db.close();
+    }
+
     pub async fn get_doc_id(&self, path: &str) -> Result<Option<uuid::Uuid>, WorkspaceStoreError> {
         let s = self.read_string("doc_map", path).await?;
         match s {
