@@ -1,8 +1,10 @@
+pub mod explorer;
 pub mod indexed_db;
 pub mod storage;
 pub mod workspace_db;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -10,7 +12,7 @@ use wasm_bindgen::JsCast;
 use inkstone_client::{ClientEvent, ClientState, Effect, SessionPhase};
 use inkstone_core::doc_ops::DocumentOp;
 use inkstone_core::ids::{BlockId, DocId, UpdateId};
-use inkstone_workspace::{WorkspaceEntry, WorkspacePath, WorkspaceStore};
+use inkstone_workspace::{WorkspaceEntry, WorkspaceEntryKind, WorkspacePath, WorkspaceStore};
 
 use indexed_db::IndexedDb;
 use workspace_db::WorkspaceDb;
@@ -25,6 +27,11 @@ pub struct DriverInner {
     pub entries: Vec<WorkspaceEntry>,
     pub selected_path: Option<String>,
     pub workspace_loaded: bool,
+    pub expanded_folders: HashSet<String>,
+    pub renaming_path: Option<String>,
+    pub rename_value: String,
+    pub show_create: bool,
+    pub create_value: String,
 }
 
 #[derive(Clone)]
@@ -42,6 +49,11 @@ impl Driver {
             entries: Vec::new(),
             selected_path: None,
             workspace_loaded: false,
+            expanded_folders: HashSet::new(),
+            renaming_path: None,
+            rename_value: String::new(),
+            show_create: false,
+            create_value: String::new(),
         })))
     }
 
@@ -53,6 +65,11 @@ impl Driver {
             Some(w) => w,
             None => return,
         };
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.renaming_path = None;
+            inner.show_create = false;
+        }
         wasm_bindgen_futures::spawn_local(async move {
             match ws.get_doc_id(&path_str).await {
                 Ok(Some(existing_id)) => {
@@ -98,7 +115,11 @@ impl Driver {
         }
         let path = match WorkspacePath::new(&name) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                self.0.borrow_mut().storage_error = Some(format!("Invalid file name: {}", name));
+                self.render();
+                return;
+            }
         };
         let path_str = path.as_str().to_string();
         let doc_id = DocId::new_v4();
@@ -212,11 +233,20 @@ impl Driver {
         }
         let new_path = match WorkspacePath::new(&new_name) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                self.0.borrow_mut().storage_error =
+                    Some(format!("Invalid file name: {}", new_name));
+                self.0.borrow_mut().renaming_path = None;
+                self.render();
+                return;
+            }
         };
         let old_path_wp = match WorkspacePath::new(old_path) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => {
+                self.0.borrow_mut().renaming_path = None;
+                return;
+            }
         };
         let this = self.clone();
         let ws = self.0.borrow().workspace_db.clone();
@@ -231,11 +261,13 @@ impl Driver {
                     if is_selected {
                         this.0.borrow_mut().selected_path = Some(new_name.clone());
                     }
+                    this.0.borrow_mut().renaming_path = None;
                     this.refresh_entries();
                     this.render();
                 }
                 Err(e) => {
                     this.0.borrow_mut().storage_error = Some(format!("Rename failed: {:?}", e));
+                    this.0.borrow_mut().renaming_path = None;
                     this.render();
                 }
             }
@@ -626,60 +658,114 @@ impl Driver {
 
         let file_list = document.create_element("div").unwrap();
         file_list.set_class_name("file-list");
-        for entry in entries.iter() {
-            let path_str = entry.path.as_str();
-            let is_active = selected_path.as_deref() == Some(path_str);
 
-            let file_entry = document.create_element("div").unwrap();
-            let class = if is_active {
-                "file-entry active"
+        if inner.show_create {
+            let create_row = document.create_element("div").unwrap();
+            create_row.set_class_name("explorer-create-row");
+            let create_input = document.create_element("input").unwrap();
+            let create_input: web_sys::HtmlInputElement = create_input.unchecked_into();
+            create_input.set_class_name("explorer-create-input");
+            create_input.set_placeholder("filename.md");
+            create_input.set_value(&inner.create_value);
+            create_row.append_child(&create_input).unwrap();
+            file_list.append_child(&create_row).unwrap();
+        } else {
+            let new_btn = document.create_element("button").unwrap();
+            new_btn.set_class_name("explorer-new-btn");
+            new_btn.set_text_content(Some("+ New File"));
+            file_list.append_child(&new_btn).unwrap();
+        }
+
+        let flat_tree = explorer::build_flat_tree(entries, &inner.expanded_folders);
+        for flat_node in &flat_tree {
+            let indent_px = 8 + flat_node.depth * 20;
+            if flat_node.is_folder {
+                let folder_div = document.create_element("div").unwrap();
+                let folder_class = if flat_node.is_expanded {
+                    "explorer-folder expanded"
+                } else {
+                    "explorer-folder"
+                };
+                folder_div.set_class_name(folder_class);
+                folder_div
+                    .set_attribute("data-path", &flat_node.path)
+                    .unwrap();
+                folder_div
+                    .set_attribute("data-depth", &flat_node.depth.to_string())
+                    .unwrap();
+                let toggle = document.create_element("span").unwrap();
+                toggle.set_class_name("explorer-toggle");
+                toggle.set_text_content(Some(if flat_node.is_expanded {
+                    "\u{25bc}"
+                } else {
+                    "\u{25b6}"
+                }));
+                folder_div.append_child(&toggle).unwrap();
+                let name_span = document.create_element("span").unwrap();
+                name_span.set_class_name("folder-name");
+                name_span.set_text_content(Some(&flat_node.name));
+                folder_div.append_child(&name_span).unwrap();
+                folder_div
+                    .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                    .unwrap();
+                file_list.append_child(&folder_div).unwrap();
             } else {
-                "file-entry"
-            };
-            file_entry.set_class_name(class);
-            file_entry.set_attribute("data-path", path_str).unwrap();
+                let is_active = selected_path.as_deref() == Some(&flat_node.path);
+                let is_renaming = inner.renaming_path.as_deref() == Some(&flat_node.path);
+                let file_entry = document.create_element("div").unwrap();
+                let entry_class = if is_active {
+                    "file-entry active"
+                } else {
+                    "file-entry"
+                };
+                file_entry.set_class_name(entry_class);
+                file_entry
+                    .set_attribute("data-path", &flat_node.path)
+                    .unwrap();
+                file_entry
+                    .set_attribute("data-depth", &flat_node.depth.to_string())
+                    .unwrap();
+                file_entry
+                    .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                    .unwrap();
 
-            let file_name = document.create_element("span").unwrap();
-            file_name.set_class_name("file-name");
-            file_name.set_text_content(Some(path_str));
-            file_entry.append_child(&file_name).unwrap();
+                if is_renaming {
+                    let rename_input = document.create_element("input").unwrap();
+                    let rename_input: web_sys::HtmlInputElement = rename_input.unchecked_into();
+                    rename_input.set_class_name("rename-input");
+                    rename_input.set_value(&inner.rename_value);
+                    file_entry.append_child(&rename_input).unwrap();
+                } else {
+                    let file_name = document.create_element("span").unwrap();
+                    file_name.set_class_name("file-name");
+                    file_name.set_text_content(Some(&flat_node.name));
+                    file_entry.append_child(&file_name).unwrap();
+                }
 
-            let file_actions = document.create_element("span").unwrap();
-            file_actions.set_class_name("file-actions");
+                let file_actions = document.create_element("span").unwrap();
+                file_actions.set_class_name("file-actions");
 
-            let rename_btn = document.create_element("button").unwrap();
-            rename_btn.set_class_name("rename-btn");
-            rename_btn.set_attribute("data-path", path_str).unwrap();
-            rename_btn.set_text_content(Some("Rename"));
-            file_actions.append_child(&rename_btn).unwrap();
+                let rename_btn = document.create_element("button").unwrap();
+                rename_btn.set_class_name("rename-btn");
+                rename_btn
+                    .set_attribute("data-path", &flat_node.path)
+                    .unwrap();
+                rename_btn.set_text_content(Some("Rename"));
+                file_actions.append_child(&rename_btn).unwrap();
 
-            let delete_btn = document.create_element("button").unwrap();
-            delete_btn.set_class_name("delete-btn");
-            delete_btn.set_attribute("data-path", path_str).unwrap();
-            delete_btn.set_text_content(Some("Delete"));
-            file_actions.append_child(&delete_btn).unwrap();
+                let delete_btn = document.create_element("button").unwrap();
+                delete_btn.set_class_name("delete-btn");
+                delete_btn
+                    .set_attribute("data-path", &flat_node.path)
+                    .unwrap();
+                delete_btn.set_text_content(Some("Delete"));
+                file_actions.append_child(&delete_btn).unwrap();
 
-            file_entry.append_child(&file_actions).unwrap();
-            file_list.append_child(&file_entry).unwrap();
+                file_entry.append_child(&file_actions).unwrap();
+                file_list.append_child(&file_entry).unwrap();
+            }
         }
         sidebar.append_child(&file_list).unwrap();
-
-        let new_file_row = document.create_element("div").unwrap();
-        new_file_row.set_class_name("new-file-row");
-
-        let new_file_input = document.create_element("input").unwrap();
-        let new_file_input: web_sys::HtmlInputElement = new_file_input.unchecked_into();
-        new_file_input.set_type("text");
-        new_file_input.set_class_name("new-file-input");
-        new_file_input.set_placeholder("filename.md");
-        new_file_row.append_child(&new_file_input).unwrap();
-
-        let create_btn = document.create_element("button").unwrap();
-        create_btn.set_class_name("new-file-btn");
-        create_btn.set_text_content(Some("Create"));
-        new_file_row.append_child(&create_btn).unwrap();
-
-        sidebar.append_child(&new_file_row).unwrap();
 
         let sidebar_footer = document.create_element("div").unwrap();
         sidebar_footer.set_class_name("sidebar-footer");
@@ -707,6 +793,13 @@ impl Driver {
             main_content.append_child(&empty_state).unwrap();
         }
 
+        if let Some(path) = selected_path {
+            let breadcrumb = document.create_element("div").unwrap();
+            breadcrumb.set_class_name("breadcrumb");
+            breadcrumb.set_text_content(Some(path));
+            main_content.append_child(&breadcrumb).unwrap();
+        }
+
         if let Some(err) = storage_error {
             let err_div = document.create_element("div").unwrap();
             err_div.set_class_name("storage-error");
@@ -727,67 +820,96 @@ impl Driver {
         }
 
         if editing_allowed && selected_path.is_some() {
-            let editor_container = document.create_element("div").unwrap();
-            editor_container.set_class_name("editor-container");
+            let is_asset = entries.iter().any(|e| {
+                selected_path.as_deref() == Some(e.path.as_str())
+                    && e.kind == WorkspaceEntryKind::Asset
+            });
 
-            let title_input = document.create_element("input").unwrap();
-            let title_input: web_sys::HtmlInputElement = title_input.unchecked_into();
-            title_input.set_type("text");
-            title_input.set_class_name("document-title-input");
-            title_input.set_placeholder("Document Title");
-            title_input.set_value(&view_doc.title);
-            editor_container.append_child(&title_input).unwrap();
+            if is_asset {
+                let asset_view = document.create_element("div").unwrap();
+                asset_view.set_class_name("asset-view");
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|e| selected_path.as_deref() == Some(e.path.as_str()))
+                {
+                    let name_p = document.create_element("p").unwrap();
+                    name_p.set_text_content(Some(&format!(
+                        "Name: {}",
+                        explorer::file_name_only(entry.path.as_str())
+                    )));
+                    asset_view.append_child(&name_p).unwrap();
+                    let path_p = document.create_element("p").unwrap();
+                    path_p.set_text_content(Some(&format!("Path: {}", entry.path.as_str())));
+                    asset_view.append_child(&path_p).unwrap();
+                    let size_p = document.create_element("p").unwrap();
+                    size_p.set_text_content(Some(&format!("Size: {} bytes", entry.size_bytes)));
+                    asset_view.append_child(&size_p).unwrap();
+                }
+                main_content.append_child(&asset_view).unwrap();
+            } else {
+                let editor_container = document.create_element("div").unwrap();
+                editor_container.set_class_name("editor-container");
 
-            let block_list = document.create_element("div").unwrap();
-            block_list.set_class_name("block-list");
+                let title_input = document.create_element("input").unwrap();
+                let title_input: web_sys::HtmlInputElement = title_input.unchecked_into();
+                title_input.set_type("text");
+                title_input.set_class_name("document-title-input");
+                title_input.set_placeholder("Document Title");
+                title_input.set_value(&view_doc.title);
+                editor_container.append_child(&title_input).unwrap();
 
-            for block in &view_doc.blocks {
-                let block_id = block.id;
-                let block_wrapper = document.create_element("div").unwrap();
-                block_wrapper.set_class_name("block-wrapper");
+                let block_list = document.create_element("div").unwrap();
+                block_list.set_class_name("block-list");
 
-                let block_label = document.create_element("div").unwrap();
-                block_label.set_class_name("block-label");
-                block_label.set_text_content(Some("MARKDOWN"));
-                block_wrapper.append_child(&block_label).unwrap();
+                for block in &view_doc.blocks {
+                    let block_id = block.id;
+                    let block_wrapper = document.create_element("div").unwrap();
+                    block_wrapper.set_class_name("block-wrapper");
 
-                let textarea = document.create_element("textarea").unwrap();
-                let textarea: web_sys::HtmlTextAreaElement = textarea.unchecked_into();
-                textarea.set_class_name("block-textarea");
-                textarea.set_placeholder("Write markdown here...");
-                textarea
-                    .set_attribute("data-block-id", &block_id.to_string())
-                    .unwrap();
+                    let block_label = document.create_element("div").unwrap();
+                    block_label.set_class_name("block-label");
+                    block_label.set_text_content(Some("MARKDOWN"));
+                    block_wrapper.append_child(&block_label).unwrap();
 
-                if let inkstone_core::document::BlockContent::Markdown { text } = &block.content {
-                    textarea.set_value(text);
+                    let textarea = document.create_element("textarea").unwrap();
+                    let textarea: web_sys::HtmlTextAreaElement = textarea.unchecked_into();
+                    textarea.set_class_name("block-textarea");
+                    textarea.set_placeholder("Write markdown here...");
+                    textarea
+                        .set_attribute("data-block-id", &block_id.to_string())
+                        .unwrap();
+
+                    if let inkstone_core::document::BlockContent::Markdown { text } = &block.content
+                    {
+                        textarea.set_value(text);
+                    }
+
+                    block_wrapper.append_child(&textarea).unwrap();
+                    block_list.append_child(&block_wrapper).unwrap();
                 }
 
-                block_wrapper.append_child(&textarea).unwrap();
-                block_list.append_child(&block_wrapper).unwrap();
-            }
+                editor_container.append_child(&block_list).unwrap();
 
-            editor_container.append_child(&block_list).unwrap();
+                let add_btn = document.create_element("button").unwrap();
+                let add_btn: web_sys::HtmlElement = add_btn.unchecked_into();
+                add_btn.set_class_name("add-block-btn");
+                add_btn.set_text_content(Some("+ Add Markdown Block"));
+                editor_container.append_child(&add_btn).unwrap();
 
-            let add_btn = document.create_element("button").unwrap();
-            let add_btn: web_sys::HtmlElement = add_btn.unchecked_into();
-            add_btn.set_class_name("add-block-btn");
-            add_btn.set_text_content(Some("+ Add Markdown Block"));
-            editor_container.append_child(&add_btn).unwrap();
-
-            if !client_state.errors().is_empty() {
-                let error_list = document.create_element("div").unwrap();
-                error_list.set_class_name("error-list");
-                for err in client_state.errors() {
-                    let err_item = document.create_element("div").unwrap();
-                    err_item.set_class_name("error-item");
-                    err_item.set_text_content(Some(err));
-                    error_list.append_child(&err_item).unwrap();
+                if !client_state.errors().is_empty() {
+                    let error_list = document.create_element("div").unwrap();
+                    error_list.set_class_name("error-list");
+                    for err in client_state.errors() {
+                        let err_item = document.create_element("div").unwrap();
+                        err_item.set_class_name("error-item");
+                        err_item.set_text_content(Some(err));
+                        error_list.append_child(&err_item).unwrap();
+                    }
+                    editor_container.append_child(&error_list).unwrap();
                 }
-                editor_container.append_child(&error_list).unwrap();
-            }
 
-            main_content.append_child(&editor_container).unwrap();
+                main_content.append_child(&editor_container).unwrap();
+            }
         } else if phase == SessionPhase::Error {
             let err_state = document.create_element("div").unwrap();
             err_state.set_class_name("error-state");
@@ -811,7 +933,18 @@ impl Driver {
         app_container.append_child(&main_content).unwrap();
         root.append_child(&app_container).unwrap();
 
-        if editing_allowed {
+        // Focus rename input if in rename mode
+        if inner.renaming_path.is_some() {
+            if let Some(el) = document.query_selector(".rename-input").unwrap() {
+                let input: web_sys::HtmlInputElement = el.unchecked_into();
+                let _ = input.focus();
+            }
+        } else if inner.show_create {
+            if let Some(el) = document.query_selector(".explorer-create-input").unwrap() {
+                let input: web_sys::HtmlInputElement = el.unchecked_into();
+                let _ = input.focus();
+            }
+        } else if editing_allowed {
             if let Some((target, start, end)) = focus_info {
                 if target == "title" {
                     if let Some(el) = document.query_selector(".document-title-input").unwrap() {
@@ -844,22 +977,39 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     let d_input = driver.clone();
     let on_input = Closure::wrap(Box::new(move |event: web_sys::InputEvent| {
-        let editing_allowed = {
-            let inner = d_input.0.borrow();
-            let state = &inner.client_state;
-            let phase = state.phase();
-            inner.storage_error.is_none()
-                && phase != SessionPhase::HydratingLocal
-                && phase != SessionPhase::Closed
-                && phase != SessionPhase::Error
-        };
-        if !editing_allowed {
-            return;
-        }
         let target = event.target();
         if let Some(target) = target {
             if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
-                if el.class_name() == "document-title-input" {
+                let class = el.class_name();
+
+                // ── Explorer rename input ────────────────────────
+                if class == "rename-input" {
+                    let input: web_sys::HtmlInputElement = el.unchecked_into();
+                    d_input.0.borrow_mut().rename_value = input.value();
+                    return;
+                }
+
+                // ── Explorer create input ────────────────────────
+                if class == "explorer-create-input" {
+                    let input: web_sys::HtmlInputElement = el.unchecked_into();
+                    d_input.0.borrow_mut().create_value = input.value();
+                    return;
+                }
+
+                let editing_allowed = {
+                    let inner = d_input.0.borrow();
+                    let state = &inner.client_state;
+                    let phase = state.phase();
+                    inner.storage_error.is_none()
+                        && phase != SessionPhase::HydratingLocal
+                        && phase != SessionPhase::Closed
+                        && phase != SessionPhase::Error
+                };
+                if !editing_allowed {
+                    return;
+                }
+
+                if class == "document-title-input" {
                     let input: web_sys::HtmlInputElement = el.unchecked_into();
                     let new_title = input.value();
 
@@ -871,7 +1021,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                         update_id,
                         applied_at_ms,
                     });
-                } else if el.class_name() == "block-textarea" {
+                } else if class == "block-textarea" {
                     let textarea: web_sys::HtmlTextAreaElement = el.unchecked_into();
                     let text = textarea.value();
                     if let Some(block_id_str) = textarea.get_attribute("data-block-id") {
@@ -921,22 +1071,40 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Workspace: new file button ──────────────────────────────
-        if class == "new-file-btn" {
-            let parent = el.parent_element().and_then(|p| p.parent_element());
-            let input_val = parent
-                .and_then(|p| p.query_selector(".new-file-input").ok().flatten())
-                .and_then(|input| {
-                    let html_input: web_sys::HtmlInputElement = input.unchecked_into();
-                    let val = html_input.value();
-                    if val.trim().is_empty() {
-                        None
+        // ── Explorer: new file button ──────────────────────────
+        if class == "explorer-new-btn" {
+            d_click.0.borrow_mut().show_create = true;
+            d_click.0.borrow_mut().create_value = String::new();
+            d_click.render();
+            return;
+        }
+
+        // ── Explorer: folder expand/collapse ────────────────────
+        if class == "explorer-folder" || class == "explorer-folder expanded" {
+            if let Some(path) = el.get_attribute("data-path") {
+                let mut inner = d_click.0.borrow_mut();
+                if inner.expanded_folders.contains(&path) {
+                    inner.expanded_folders.remove(&path);
+                } else {
+                    inner.expanded_folders.insert(path);
+                }
+                drop(inner);
+                d_click.render();
+            }
+            return;
+        }
+        if class == "explorer-toggle" {
+            if let Some(parent) = el.parent_element() {
+                if let Some(path) = parent.get_attribute("data-path") {
+                    let mut inner = d_click.0.borrow_mut();
+                    if inner.expanded_folders.contains(&path) {
+                        inner.expanded_folders.remove(&path);
                     } else {
-                        Some(val)
+                        inner.expanded_folders.insert(path);
                     }
-                });
-            if let Some(name) = input_val {
-                d_click.create_file(&name);
+                    drop(inner);
+                    d_click.render();
+                }
             }
             return;
         }
@@ -953,19 +1121,15 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Workspace: rename button ──────────────────────────────
+        // ── Workspace: rename button (inline rename) ─────────────
         if class == "rename-btn" {
             if let Some(path) = el.get_attribute("data-path") {
-                if let Some(window) = web_sys::window() {
-                    let new_name = window
-                        .prompt_with_message_and_default("Rename file to:", &path)
-                        .unwrap_or(None);
-                    if let Some(name) = new_name {
-                        if !name.trim().is_empty() && name != path {
-                            d_click.rename_entry(&path, &name);
-                        }
-                    }
-                }
+                let mut inner = d_click.0.borrow_mut();
+                let file_name = explorer::file_name_only(&path);
+                inner.renaming_path = Some(path);
+                inner.rename_value = file_name;
+                drop(inner);
+                d_click.render();
             }
             return;
         }
@@ -1032,9 +1196,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     let d_keydown = driver.clone();
     let on_keydown = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
-        if event.key() != "Enter" {
-            return;
-        }
         let target = match event.target() {
             Some(t) => t,
             None => return,
@@ -1043,13 +1204,55 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Ok(e) => e,
             Err(_) => return,
         };
-        if el.class_name() != "new-file-input" {
+        let class = el.class_name();
+
+        // ── Create input ──────────────────────────────────────────
+        if class == "explorer-create-input" {
+            let input: web_sys::HtmlInputElement = el.unchecked_into();
+            if event.key() == "Enter" {
+                event.prevent_default();
+                let val = input.value();
+                if !val.trim().is_empty() {
+                    d_keydown.create_file(&val);
+                }
+            } else if event.key() == "Escape" {
+                event.prevent_default();
+                d_keydown.0.borrow_mut().show_create = false;
+                d_keydown.0.borrow_mut().create_value = String::new();
+                d_keydown.render();
+            }
             return;
         }
-        let html_input: web_sys::HtmlInputElement = el.unchecked_into();
-        let val = html_input.value();
-        if !val.trim().is_empty() {
-            d_keydown.create_file(&val);
+
+        // ── Rename input ─────────────────────────────────────────
+        if class == "rename-input" {
+            let input: web_sys::HtmlInputElement = el.unchecked_into();
+            if event.key() == "Enter" {
+                event.prevent_default();
+                let new_name = input.value();
+                let old_path = d_keydown.0.borrow().renaming_path.clone();
+                if let Some(ref path) = old_path {
+                    if !new_name.trim().is_empty() {
+                        // Update path using parent folder
+                        let full_new_path = if let Some(parent) = explorer::parent_folder(path) {
+                            if parent.is_empty() {
+                                new_name.trim().to_string()
+                            } else {
+                                format!("{}/{}", parent, new_name.trim())
+                            }
+                        } else {
+                            new_name.trim().to_string()
+                        };
+                        d_keydown.rename_entry(path, &full_new_path);
+                    }
+                }
+            } else if event.key() == "Escape" {
+                event.prevent_default();
+                d_keydown.0.borrow_mut().renaming_path = None;
+                d_keydown.0.borrow_mut().rename_value = String::new();
+                d_keydown.render();
+            }
+            return;
         }
     }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
     root.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;

@@ -363,3 +363,128 @@ body {
   color: #c53030;
   font-size: 14px;
 }
+
+/* ── Explorer Tree ──────────────────────────────────── */
+
+.explorer-new-btn {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 1px dashed var(--accent-blue);
+  color: var(--accent-blue);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-style 0.15s ease;
+  margin-bottom: 8px;
+}
+
+.explorer-new-btn:hover {
+  background-color: #ebf8ff;
+  border-style: solid;
+}
+
+.explorer-create-row {
+  margin-bottom: 8px;
+}
+
+.explorer-create-input {
+  width: 100%;
+  border: 1px solid var(--accent-blue);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+  background: #fff;
+  color: var(--text-main);
+  outline: none;
+}
+
+.explorer-folder {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text-main);
+  transition: background 0.1s;
+  gap: 4px;
+}
+
+.explorer-folder:hover {
+  background-color: #e8e6e2;
+}
+
+.explorer-toggle {
+  display: inline-block;
+  width: 14px;
+  font-size: 10px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Inline Rename Input ────────────────────────────── */
+
+.rename-input {
+  flex: 1;
+  border: 1px solid var(--accent-blue);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 13px;
+  background: #fff;
+  color: var(--text-main);
+  outline: none;
+  min-width: 0;
+}
+
+/* ── Breadcrumb ─────────────────────────────────────── */
+
+.breadcrumb {
+  width: 100%;
+  max-width: 680px;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 0 12px 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 16px;
+  font-family: var(--font-sans);
+}
+
+/* ── Asset View ─────────────────────────────────────── */
+
+.asset-view {
+  width: 100%;
+  max-width: 680px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  background: #fff;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: var(--shadow-subtle);
+}
+
+.asset-view p {
+  font-size: 14px;
+  color: var(--text-main);
+  line-height: 1.6;
+}
+
+/* ── File entry adjustments for tree ────────────────── */
+
+.file-entry {
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-right: 8px;
+}
