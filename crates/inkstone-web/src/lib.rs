@@ -32,6 +32,7 @@ pub struct DriverInner {
     pub rename_value: String,
     pub show_create: bool,
     pub create_value: String,
+    pub create_folder: Option<String>,
 }
 
 #[derive(Clone)]
@@ -54,22 +55,39 @@ impl Driver {
             rename_value: String::new(),
             show_create: false,
             create_value: String::new(),
+            create_folder: None,
         })))
     }
 
     fn select_entry(&self, path: &str) {
-        let this = self.clone();
         let path_str = path.to_string();
-        let ws = self.0.borrow().workspace_db.clone();
-        let ws = match ws {
-            Some(w) => w,
-            None => return,
+        let is_asset = {
+            let inner = self.0.borrow();
+            inner
+                .entries
+                .iter()
+                .any(|e| e.path.as_str() == path_str && e.kind == WorkspaceEntryKind::Asset)
         };
         {
             let mut inner = self.0.borrow_mut();
             inner.renaming_path = None;
             inner.show_create = false;
+            inner.create_folder = None;
         }
+        if is_asset {
+            let mut inner = self.0.borrow_mut();
+            inner.selected_path = Some(path_str);
+            drop(inner);
+            self.render();
+            return;
+        }
+        let this = self.clone();
+        let ws = self.0.borrow().workspace_db.clone();
+        let ws = match ws {
+            Some(w) => w,
+            None => return,
+        };
+
         wasm_bindgen_futures::spawn_local(async move {
             match ws.get_doc_id(&path_str).await {
                 Ok(Some(existing_id)) => {
@@ -113,10 +131,18 @@ impl Driver {
         if name.is_empty() {
             return;
         }
-        let path = match WorkspacePath::new(&name) {
+        let full_path = {
+            let inner = self.0.borrow();
+            match &inner.create_folder {
+                Some(folder) => format!("{}/{}", folder, name),
+                None => name.clone(),
+            }
+        };
+        let path = match WorkspacePath::new(&full_path) {
             Ok(p) => p,
             Err(_) => {
-                self.0.borrow_mut().storage_error = Some(format!("Invalid file name: {}", name));
+                self.0.borrow_mut().storage_error =
+                    Some(format!("Invalid file name: {}", full_path));
                 self.render();
                 return;
             }
@@ -148,6 +174,7 @@ impl Driver {
             match ws.write_file(&path, &[]).await {
                 Ok(()) => match ws.set_doc_id(&path_str, doc_id.0).await {
                     Ok(()) => {
+                        this.0.borrow_mut().create_folder = None;
                         this.refresh_entries();
                         this.select_entry(&path_str);
                     }
@@ -681,10 +708,12 @@ impl Driver {
             let indent_px = 8 + flat_node.depth * 20;
             if flat_node.is_folder {
                 let folder_div = document.create_element("div").unwrap();
-                let folder_class = if flat_node.is_expanded {
-                    "explorer-folder expanded"
-                } else {
-                    "explorer-folder"
+                let is_target = inner.create_folder.as_deref() == Some(&flat_node.path);
+                let folder_class = match (flat_node.is_expanded, is_target) {
+                    (true, true) => "explorer-folder expanded active-target",
+                    (true, false) => "explorer-folder expanded",
+                    (false, true) => "explorer-folder active-target",
+                    (false, false) => "explorer-folder",
                 };
                 folder_div.set_class_name(folder_class);
                 folder_div
@@ -1071,23 +1100,25 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Explorer: new file button ──────────────────────────
+        // ── Explorer: new file button (root level) ─────────────
         if class == "explorer-new-btn" {
-            d_click.0.borrow_mut().show_create = true;
-            d_click.0.borrow_mut().create_value = String::new();
+            let mut inner = d_click.0.borrow_mut();
+            inner.show_create = true;
+            inner.create_value = String::new();
+            inner.create_folder = None;
+            drop(inner);
             d_click.render();
             return;
         }
 
-        // ── Explorer: folder expand/collapse ────────────────────
+        // ── Explorer: folder target (click row to target + expand) ──
         if class == "explorer-folder" || class == "explorer-folder expanded" {
             if let Some(path) = el.get_attribute("data-path") {
                 let mut inner = d_click.0.borrow_mut();
-                if inner.expanded_folders.contains(&path) {
-                    inner.expanded_folders.remove(&path);
-                } else {
-                    inner.expanded_folders.insert(path);
-                }
+                inner.expanded_folders.insert(path.clone());
+                inner.create_folder = Some(path);
+                inner.show_create = true;
+                inner.create_value = String::new();
                 drop(inner);
                 d_click.render();
             }
@@ -1219,6 +1250,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 event.prevent_default();
                 d_keydown.0.borrow_mut().show_create = false;
                 d_keydown.0.borrow_mut().create_value = String::new();
+                d_keydown.0.borrow_mut().create_folder = None;
                 d_keydown.render();
             }
             return;
