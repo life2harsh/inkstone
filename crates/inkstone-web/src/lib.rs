@@ -72,6 +72,16 @@ impl Driver {
 
     fn select_entry(&self, path: &str) {
         let path_str = path.to_string();
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.renaming_path = None;
+            inner.show_create = false;
+            inner.create_folder = None;
+            let ancestors = markdown_render::ancestor_folders(&path_str);
+            for folder in &ancestors {
+                inner.expanded_folders.insert(folder.clone());
+            }
+        }
         let is_asset = {
             let inner = self.0.borrow();
             inner
@@ -79,12 +89,6 @@ impl Driver {
                 .iter()
                 .any(|e| e.path.as_str() == path_str && e.kind == WorkspaceEntryKind::Asset)
         };
-        {
-            let mut inner = self.0.borrow_mut();
-            inner.renaming_path = None;
-            inner.show_create = false;
-            inner.create_folder = None;
-        }
         if is_asset {
             let mut inner = self.0.borrow_mut();
             inner.selected_path = Some(path_str);
@@ -186,6 +190,13 @@ impl Driver {
                 Ok(()) => match ws.set_doc_id(&path_str, doc_id.0).await {
                     Ok(()) => {
                         this.0.borrow_mut().create_folder = None;
+                        let ancestors = markdown_render::ancestor_folders(&path_str);
+                        {
+                            let mut inner = this.0.borrow_mut();
+                            for folder in &ancestors {
+                                inner.expanded_folders.insert(folder.clone());
+                            }
+                        }
                         this.refresh_entries();
                         this.select_entry(&path_str);
                     }

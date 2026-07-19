@@ -30,15 +30,26 @@ pub fn render_to_html(text: &str, current_path: &str) -> String {
 }
 
 fn has_url_scheme(s: &str) -> bool {
-    // Match any alphanumeric scheme followed by `://` or `:`
+    // Match RFC 3986 scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) followed by ":"
+    // Minimum 1 char to catch single-letter explicit schemes (x:Note.md).
+    if let Some(pos) = s.find(':') {
+        if pos >= 1 {
+            let scheme = &s[..pos];
+            if scheme
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_alphabetic())
+                && scheme[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+            {
+                return true;
+            }
+        }
+    }
+    // Also catch :// patterns like ftp://
     if s.contains("://") {
         return true;
-    }
-    // Check for `scheme:` where scheme is 2+ alphanumeric chars
-    if let Some(pos) = s.find(':') {
-        if pos >= 2 && s[..pos].chars().all(|c| c.is_alphanumeric()) {
-            return true;
-        }
     }
     false
 }
@@ -59,7 +70,7 @@ fn classify_link(href: &str) -> LinkKind {
     if trimmed.starts_with('#') {
         return LinkKind::FragmentOnly;
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
         return LinkKind::ExternalHttp;
     }
     // Reject any explicit URL scheme (mailto:, tel:, ftp:, etc.)
@@ -147,12 +158,15 @@ fn process_links(html: &str, current_path: &str) -> String {
         let kind = classify_link(href);
         match kind {
             LinkKind::InternalWorkspace => {
-                let resolved =
-                    resolve_workspace_path(href, current_path).unwrap_or_else(|| href.to_string());
-                format!(
-                    "{}#{} data-workspace-path=\"{}\"{}{}",
-                    prefix, href_close, resolved, suffix_rest, gt
-                )
+                if let Some(resolved) = resolve_workspace_path(href, current_path) {
+                    format!(
+                        "{}#{} data-workspace-path=\"{}\"{}{}",
+                        prefix, href_close, resolved, suffix_rest, gt
+                    )
+                } else {
+                    // Resolution failed — render as plain link without workspace attributes
+                    format!("{}{}{}{}{}", prefix, href, href_close, suffix_rest, gt)
+                }
             }
             LinkKind::Unsafe => {
                 format!("{}#{}{}{}", prefix, href_close, suffix_rest, gt)
@@ -362,6 +376,30 @@ mod tests {
         assert!(!html.contains(">rel"));
     }
 
+    // ── Invalid resolution never emits data-workspace-path ──
+
+    #[test]
+    fn test_invalid_traversal_no_workspace_path() {
+        let html = process_links(
+            "<a href=\"../../../Outside.md\">outside</a>",
+            "Projects/Inkstone.md",
+        );
+        // Must NOT have data-workspace-path — traversal above root was rejected
+        assert!(!html.contains("data-workspace-path"));
+        // href must remain unchanged (not replaced with workspace path)
+        assert!(html.contains("href=\"../../../Outside.md\""));
+        // No target/rel either
+        assert!(!html.contains("target=\"_blank\""));
+    }
+
+    #[test]
+    fn test_invalid_workspace_path_no_data_attribute() {
+        let html = process_links("<a href=\"/etc/passwd\">abs</a>", "Projects/Inkstone.md");
+        // Absolute path rejected by WorkspacePath — no data-workspace-path
+        assert!(!html.contains("data-workspace-path"));
+        assert!(html.contains("href=\"/etc/passwd\""));
+    }
+
     // ── Non-Markdown relative links ───────────────────
 
     #[test]
@@ -408,6 +446,51 @@ mod tests {
     fn test_unknown_scheme_not_internal() {
         let info = classify_and_resolve("unknown-scheme:value", "note.md");
         assert!(matches!(info.kind, LinkKind::Other));
+    }
+
+    #[test]
+    fn test_custom_scheme_not_internal() {
+        let info = classify_and_resolve("custom-scheme:Note.md", "note.md");
+        assert!(matches!(info.kind, LinkKind::Other));
+        assert!(info.resolved_path.is_none());
+        // process_links must not emit data-workspace-path
+        let html = process_links("<a href=\"custom-scheme:Note.md\">link</a>", "note.md");
+        assert!(!html.contains("data-workspace-path"));
+    }
+
+    #[test]
+    fn test_foo_plus_bar_scheme_not_internal() {
+        let info = classify_and_resolve("foo+bar:Note.md", "note.md");
+        assert!(matches!(info.kind, LinkKind::Other));
+        let html = process_links("<a href=\"foo+bar:Note.md\">link</a>", "note.md");
+        assert!(!html.contains("data-workspace-path"));
+    }
+
+    #[test]
+    fn test_foo_dot_bar_scheme_not_internal() {
+        let info = classify_and_resolve("foo.bar:Note.md", "note.md");
+        assert!(matches!(info.kind, LinkKind::Other));
+        let html = process_links("<a href=\"foo.bar:Note.md\">link</a>", "note.md");
+        assert!(!html.contains("data-workspace-path"));
+    }
+
+    #[test]
+    fn test_single_char_scheme_x_not_internal() {
+        let info = classify_and_resolve("x:Note.md", "Projects/Current.md");
+        assert!(matches!(info.kind, LinkKind::Other));
+        assert!(info.resolved_path.is_none());
+        let html = process_links("<a href=\"x:Note.md\">link</a>", "Projects/Current.md");
+        assert!(!html.contains("data-workspace-path"));
+        assert!(html.contains("href=\"x:Note.md\""));
+    }
+
+    #[test]
+    fn test_single_char_scheme_a_not_internal() {
+        let info = classify_and_resolve("a:Roadmap.md", "note.md");
+        assert!(matches!(info.kind, LinkKind::Other));
+        assert!(info.resolved_path.is_none());
+        let html = process_links("<a href=\"a:Roadmap.md\">link</a>", "note.md");
+        assert!(!html.contains("data-workspace-path"));
     }
 
     // ── Workspace path resolution ─────────────────────
@@ -499,6 +582,26 @@ mod tests {
     fn test_external_link_classification() {
         let info = classify_and_resolve("https://example.com", "note.md");
         assert!(matches!(info.kind, LinkKind::ExternalHttp));
+    }
+
+    #[test]
+    fn test_uppercase_https_external() {
+        let info = classify_and_resolve("HTTPS://EXAMPLE.COM", "note.md");
+        assert!(matches!(info.kind, LinkKind::ExternalHttp));
+        let html = process_links("<a href=\"HTTPS://EXAMPLE.COM\">x</a>", "note.md");
+        assert!(html.contains("target=\"_blank\""));
+        assert!(html.contains("rel=\"noopener noreferrer\""));
+        assert!(!html.contains("data-workspace-path"));
+    }
+
+    #[test]
+    fn test_mixed_case_http_external() {
+        let info = classify_and_resolve("Http://Example.Com/Page.md", "note.md");
+        assert!(matches!(info.kind, LinkKind::ExternalHttp));
+        let html = process_links("<a href=\"Http://Example.Com/Page.md\">x</a>", "note.md");
+        assert!(html.contains("target=\"_blank\""));
+        assert!(html.contains("rel=\"noopener noreferrer\""));
+        assert!(!html.contains("data-workspace-path"));
     }
 
     #[test]
