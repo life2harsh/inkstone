@@ -7,3 +7,4 @@ apps/web/dist/
 AGENTS.md
 SKILLS.md
 /apps/web/pkg/
+.mcp-repo-agent/
