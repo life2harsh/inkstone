@@ -286,6 +286,17 @@ impl ClientState {
         &self.view_doc
     }
 
+    /// Returns the effective view document, incorporating any in-flight
+    /// local intent that has not yet been persisted. This is needed for
+    /// preview rendering that must reflect the most recent edit even
+    /// before the async IndexedDB write completes.
+    pub fn effective_view_doc(&self) -> &InkstoneDocument {
+        match &self.pending_intent {
+            Some(prepared) => &prepared.candidate_view_doc,
+            None => &self.view_doc,
+        }
+    }
+
     pub fn pending_local(&self) -> &[DocumentUpdate] {
         &self.pending_local
     }

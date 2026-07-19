@@ -20,6 +20,8 @@ uuid = { version = "1", features = ["v4", "serde", "js"] }
 console_error_panic_hook = "0.1"
 futures-channel = "0.3"
 async-trait = "0.1"
+comrak = "0.29"
+regex = "1"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -48,4 +50,5 @@ features = [
     "console",
     "IdbVersionChangeEvent",
     "DomStringList",
+    "HtmlAnchorElement",
 ]

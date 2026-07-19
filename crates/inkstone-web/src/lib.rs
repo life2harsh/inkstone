@@ -1,5 +1,6 @@
 pub mod explorer;
 pub mod indexed_db;
+pub mod markdown_render;
 pub mod storage;
 pub mod workspace_db;
 
@@ -17,6 +18,12 @@ use inkstone_workspace::{WorkspaceEntry, WorkspaceEntryKind, WorkspacePath, Work
 use indexed_db::IndexedDb;
 use workspace_db::WorkspaceDb;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentMode {
+    Edit,
+    Preview,
+}
+
 pub struct DriverInner {
     pub client_state: ClientState,
     pub db: Option<IndexedDb>,
@@ -33,6 +40,8 @@ pub struct DriverInner {
     pub show_create: bool,
     pub create_value: String,
     pub create_folder: Option<String>,
+    pub document_mode: DocumentMode,
+    pub link_message: Option<String>,
 }
 
 #[derive(Clone)]
@@ -56,6 +65,8 @@ impl Driver {
             show_create: false,
             create_value: String::new(),
             create_folder: None,
+            document_mode: DocumentMode::Edit,
+            link_message: None,
         })))
     }
 
@@ -299,6 +310,42 @@ impl Driver {
                 }
             }
         });
+    }
+
+    fn navigate_to_link(&self, target_path: &str) {
+        let entry = {
+            let inner = self.0.borrow();
+            inner
+                .entries
+                .iter()
+                .find(|e| e.path.as_str() == target_path)
+                .cloned()
+        };
+        match entry {
+            Some(e) if e.kind == WorkspaceEntryKind::Markdown => {
+                let ancestors = markdown_render::ancestor_folders(target_path);
+                {
+                    let mut inner = self.0.borrow_mut();
+                    for folder in &ancestors {
+                        inner.expanded_folders.insert(folder.clone());
+                    }
+                }
+                self.select_entry(target_path);
+            }
+            Some(_) => {
+                // Asset or internal entry — do not navigate
+                self.0.borrow_mut().link_message = Some(format!(
+                    "Cannot navigate: not a Markdown note ({})",
+                    target_path
+                ));
+                self.render();
+            }
+            None => {
+                self.0.borrow_mut().link_message =
+                    Some(format!("Linked note not found: {}", target_path));
+                self.render();
+            }
+        }
     }
 
     fn refresh_entries(&self) {
@@ -655,7 +702,7 @@ impl Driver {
 
         let inner = self.0.borrow();
         let client_state = &inner.client_state;
-        let view_doc = client_state.view_doc();
+        let view_doc = client_state.effective_view_doc();
         let phase = client_state.phase();
         let persistence_status = &inner.persistence_status;
         let storage_error = &inner.storage_error;
@@ -879,62 +926,132 @@ impl Driver {
                 let editor_container = document.create_element("div").unwrap();
                 editor_container.set_class_name("editor-container");
 
-                let title_input = document.create_element("input").unwrap();
-                let title_input: web_sys::HtmlInputElement = title_input.unchecked_into();
-                title_input.set_type("text");
-                title_input.set_class_name("document-title-input");
-                title_input.set_placeholder("Document Title");
-                title_input.set_value(&view_doc.title);
-                editor_container.append_child(&title_input).unwrap();
-
-                let block_list = document.create_element("div").unwrap();
-                block_list.set_class_name("block-list");
-
-                for block in &view_doc.blocks {
-                    let block_id = block.id;
-                    let block_wrapper = document.create_element("div").unwrap();
-                    block_wrapper.set_class_name("block-wrapper");
-
-                    let block_label = document.create_element("div").unwrap();
-                    block_label.set_class_name("block-label");
-                    block_label.set_text_content(Some("MARKDOWN"));
-                    block_wrapper.append_child(&block_label).unwrap();
-
-                    let textarea = document.create_element("textarea").unwrap();
-                    let textarea: web_sys::HtmlTextAreaElement = textarea.unchecked_into();
-                    textarea.set_class_name("block-textarea");
-                    textarea.set_placeholder("Write markdown here...");
-                    textarea
-                        .set_attribute("data-block-id", &block_id.to_string())
-                        .unwrap();
-
-                    if let inkstone_core::document::BlockContent::Markdown { text } = &block.content
-                    {
-                        textarea.set_value(text);
+                // ── Mode Toggle ──────────────────────────────────
+                let mode_bar = document.create_element("div").unwrap();
+                mode_bar.set_class_name("mode-bar");
+                {
+                    let edit_btn = document.create_element("button").unwrap();
+                    let edit_btn: web_sys::HtmlElement = edit_btn.unchecked_into();
+                    edit_btn.set_class_name("mode-toggle-btn");
+                    edit_btn.set_text_content(Some("Edit"));
+                    if inner.document_mode == DocumentMode::Edit {
+                        let _ = edit_btn.set_attribute("data-active", "true");
                     }
+                    mode_bar.append_child(&edit_btn).unwrap();
+                }
+                {
+                    let prev_btn = document.create_element("button").unwrap();
+                    let prev_btn: web_sys::HtmlElement = prev_btn.unchecked_into();
+                    prev_btn.set_class_name("mode-toggle-btn");
+                    prev_btn.set_text_content(Some("Preview"));
+                    prev_btn.set_attribute("data-mode", "preview").unwrap();
+                    if inner.document_mode == DocumentMode::Preview {
+                        let _ = prev_btn.set_attribute("data-active", "true");
+                    }
+                    mode_bar.append_child(&prev_btn).unwrap();
+                }
+                editor_container.append_child(&mode_bar).unwrap();
 
-                    block_wrapper.append_child(&textarea).unwrap();
-                    block_list.append_child(&block_wrapper).unwrap();
+                // ── Link message (non-fatal) ────────────────────
+                if let Some(ref msg) = inner.link_message {
+                    let msg_div = document.create_element("div").unwrap();
+                    msg_div.set_class_name("link-message");
+                    let msg_span = document.create_element("span").unwrap();
+                    msg_span.set_text_content(Some(msg));
+                    msg_div.append_child(&msg_span).unwrap();
+                    let dismiss_btn = document.create_element("button").unwrap();
+                    dismiss_btn.set_class_name("link-message-dismiss");
+                    dismiss_btn.set_text_content(Some("×"));
+                    msg_div.append_child(&dismiss_btn).unwrap();
+                    editor_container.append_child(&msg_div).unwrap();
                 }
 
-                editor_container.append_child(&block_list).unwrap();
+                if inner.document_mode == DocumentMode::Edit {
+                    // ── Edit Mode ────────────────────────────────
+                    let title_input = document.create_element("input").unwrap();
+                    let title_input: web_sys::HtmlInputElement = title_input.unchecked_into();
+                    title_input.set_type("text");
+                    title_input.set_class_name("document-title-input");
+                    title_input.set_placeholder("Document Title");
+                    title_input.set_value(&view_doc.title);
+                    editor_container.append_child(&title_input).unwrap();
 
-                let add_btn = document.create_element("button").unwrap();
-                let add_btn: web_sys::HtmlElement = add_btn.unchecked_into();
-                add_btn.set_class_name("add-block-btn");
-                add_btn.set_text_content(Some("+ Add Markdown Block"));
-                editor_container.append_child(&add_btn).unwrap();
+                    let block_list = document.create_element("div").unwrap();
+                    block_list.set_class_name("block-list");
 
-                if !client_state.errors().is_empty() {
-                    let error_list = document.create_element("div").unwrap();
-                    error_list.set_class_name("error-list");
-                    for err in client_state.errors() {
-                        let err_item = document.create_element("div").unwrap();
-                        err_item.set_class_name("error-item");
-                        err_item.set_text_content(Some(err));
-                        error_list.append_child(&err_item).unwrap();
+                    for block in &view_doc.blocks {
+                        let block_id = block.id;
+                        let block_wrapper = document.create_element("div").unwrap();
+                        block_wrapper.set_class_name("block-wrapper");
+
+                        let block_label = document.create_element("div").unwrap();
+                        block_label.set_class_name("block-label");
+                        block_label.set_text_content(Some("MARKDOWN"));
+                        block_wrapper.append_child(&block_label).unwrap();
+
+                        let textarea = document.create_element("textarea").unwrap();
+                        let textarea: web_sys::HtmlTextAreaElement = textarea.unchecked_into();
+                        textarea.set_class_name("block-textarea");
+                        textarea.set_placeholder("Write markdown here...");
+                        textarea
+                            .set_attribute("data-block-id", &block_id.to_string())
+                            .unwrap();
+
+                        if let inkstone_core::document::BlockContent::Markdown { text } =
+                            &block.content
+                        {
+                            textarea.set_value(text);
+                        }
+
+                        block_wrapper.append_child(&textarea).unwrap();
+                        block_list.append_child(&block_wrapper).unwrap();
                     }
-                    editor_container.append_child(&error_list).unwrap();
+
+                    editor_container.append_child(&block_list).unwrap();
+
+                    let add_btn = document.create_element("button").unwrap();
+                    let add_btn: web_sys::HtmlElement = add_btn.unchecked_into();
+                    add_btn.set_class_name("add-block-btn");
+                    add_btn.set_text_content(Some("+ Add Markdown Block"));
+                    editor_container.append_child(&add_btn).unwrap();
+
+                    if !client_state.errors().is_empty() {
+                        let error_list = document.create_element("div").unwrap();
+                        error_list.set_class_name("error-list");
+                        for err in client_state.errors() {
+                            let err_item = document.create_element("div").unwrap();
+                            err_item.set_class_name("error-item");
+                            err_item.set_text_content(Some(err));
+                            error_list.append_child(&err_item).unwrap();
+                        }
+                        editor_container.append_child(&error_list).unwrap();
+                    }
+                } else {
+                    // ── Preview Mode ─────────────────────────────
+                    let mut md = String::new();
+                    if !view_doc.title.is_empty() {
+                        md.push_str(&format!("# {}\n\n", view_doc.title));
+                    }
+                    let _block_count = view_doc.blocks.len();
+                    for block in &view_doc.blocks {
+                        if let inkstone_core::document::BlockContent::Markdown { text } =
+                            &block.content
+                        {
+                            if !text.is_empty() {
+                                md.push_str(text);
+                                md.push('\n');
+                                md.push('\n');
+                            }
+                        }
+                    }
+                    let html = markdown_render::render_to_html(
+                        &md,
+                        selected_path.as_deref().unwrap_or(""),
+                    );
+                    let preview_div = document.create_element("div").unwrap();
+                    preview_div.set_class_name("preview-content");
+                    preview_div.set_inner_html(&html);
+                    editor_container.append_child(&preview_div).unwrap();
                 }
 
                 main_content.append_child(&editor_container).unwrap();
@@ -1180,6 +1297,44 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     }
                 }
             }
+            return;
+        }
+
+        // ── Mode toggle ────────────────────────────────────
+        if class == "mode-toggle-btn" {
+            let is_preview = el.get_attribute("data-mode").as_deref() == Some("preview");
+            {
+                let mut inner = d_click.0.borrow_mut();
+                inner.document_mode = if is_preview {
+                    DocumentMode::Preview
+                } else {
+                    DocumentMode::Edit
+                };
+                inner.link_message = None;
+            }
+            d_click.render();
+            return;
+        }
+
+        // ── Preview internal link ─────────────────────────
+        let workspace_path = el.get_attribute("data-workspace-path").or_else(|| {
+            let element: &web_sys::Element = el.as_ref();
+            element
+                .closest("[data-workspace-path]")
+                .ok()
+                .flatten()
+                .and_then(|p| p.get_attribute("data-workspace-path"))
+        });
+        if let Some(ref target_path) = workspace_path {
+            event.prevent_default();
+            d_click.navigate_to_link(target_path);
+            return;
+        }
+
+        // ── Dismiss link message ──────────────────────────
+        if class == "link-message-dismiss" {
+            d_click.0.borrow_mut().link_message = None;
+            d_click.render();
             return;
         }
 
