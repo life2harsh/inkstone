@@ -4,10 +4,20 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkdownIndex {
     pub wikilinks: Vec<WikiLink>,
+    pub md_links: Vec<MdLink>,
     pub embeds: Vec<EmbedRef>,
     pub tags: Vec<TagRef>,
     pub headings: Vec<HeadingRef>,
     pub has_code_block: bool,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdLink {
+    pub target: String,
+    pub title: Option<String>,
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +52,7 @@ pub struct HeadingRef {
 
 pub fn parse_markdown(text: &str) -> MarkdownIndex {
     let mut wikilinks = Vec::new();
+    let mut md_links = Vec::new();
     let mut embeds = Vec::new();
     let mut tags = Vec::new();
     let mut headings = Vec::new();
@@ -95,6 +106,11 @@ pub fn parse_markdown(text: &str) -> MarkdownIndex {
                 continue;
             }
 
+                        if let Some(end) = try_parse_md_link(&chars, pos, &mut md_links, line_idx) {
+                pos = end;
+                continue;
+            }
+
             if let Some(end) = try_parse_wikilink(&chars, pos, &mut wikilinks, line_idx) {
                 pos = end;
                 continue;
@@ -111,6 +127,7 @@ pub fn parse_markdown(text: &str) -> MarkdownIndex {
 
     MarkdownIndex {
         wikilinks,
+        md_links,
         embeds,
         tags,
         headings,
@@ -493,4 +510,38 @@ mod tests {
         let links = derive_outbound_links(&doc);
         assert_eq!(links.len(), 0);
     }
+}
+
+fn try_parse_md_link(
+    chars: &[char],
+    pos: usize,
+    md_links: &mut Vec<MdLink>,
+    line: usize,
+) -> Option<usize> {
+    if pos + 1 < chars.len() && chars[pos] == '[' && chars[pos + 1] != '[' {
+        if let Some(text_end) = find_closing_brackets(chars, pos + 1) {
+            if text_end < chars.len() && chars[text_end] == '(' {
+                let text: String = chars[pos + 1..text_end - 1].iter().collect();
+                if let Some(url_end) = chars[text_end + 1..].iter().position(|&c| c == ')').map(|i| text_end + 1 + i) {
+                    let url_full: String = chars[text_end + 1..url_end].iter().collect();
+                    let (target, title) = if let Some(space) = url_full.find(' ') {
+                        let t = url_full[..space].to_string();
+                        let title = url_full[space + 1..].trim_matches('"').trim_matches('\'').to_string();
+                        (t, Some(title))
+                    } else {
+                        (url_full, None)
+                    };
+                    
+                    md_links.push(MdLink {
+                        target,
+                        title,
+                        line,
+                        col: pos,
+                    });
+                    return Some(url_end + 1);
+                }
+            }
+        }
+    }
+    None
 }

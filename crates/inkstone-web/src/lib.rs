@@ -1,3 +1,9 @@
+#[derive(Clone)]
+pub struct PendingSelection {
+    pub path: String,
+    pub revision: u64,
+}
+
 pub mod explorer;
 pub mod indexed_db;
 pub mod knowledge;
@@ -44,6 +50,7 @@ pub struct DriverInner {
     pub create_folder: Option<String>,
     pub document_mode: DocumentMode,
     pub link_message: Option<String>,
+    pub tag_filter: Option<String>,
     pub search_query: String,
     pub search_indexing: bool,
     pub search_documents: Vec<search::SearchDocument>,
@@ -52,7 +59,10 @@ pub struct DriverInner {
     pub recent_notes: Vec<String>,
     pub knowledge: knowledge::KnowledgeIndex,
     pub knowledge_tab: String,
+pub inspector_open: bool,
     pub selection_revision: u64,
+    pub pending_selection: Option<PendingSelection>,
+    pub recent_notes_revision: u64,
 }
 
 #[derive(Clone)]
@@ -78,6 +88,7 @@ impl Driver {
             create_folder: None,
             document_mode: DocumentMode::Edit,
             link_message: None,
+            tag_filter: None,
             search_query: String::new(),
             search_indexing: false,
             search_documents: Vec::new(),
@@ -86,7 +97,10 @@ impl Driver {
             recent_notes: Vec::new(),
             knowledge: knowledge::KnowledgeIndex::new(),
             knowledge_tab: "Outline".to_string(),
+inspector_open: false,
             selection_revision: 0,
+            pending_selection: None,
+            recent_notes_revision: 0,
         })))
     }
 
@@ -134,7 +148,11 @@ impl Driver {
             match ws.get_doc_id(&path_str).await {
                 Ok(Some(existing_id)) => {
                     if is_markdown {
-                        this.add_recent_note(&path_str, selection_rev);
+                        let mut inner = this.0.borrow_mut();
+                        inner.pending_selection = Some(PendingSelection {
+                            path: path_str.clone(),
+                            revision: selection_rev,
+                        });
                     }
                     let doc_id = DocId(existing_id);
                     {
@@ -155,7 +173,11 @@ impl Driver {
                         return;
                     }
                     if is_markdown {
-                        this.add_recent_note(&path_str, selection_rev);
+                        let mut inner = this.0.borrow_mut();
+                        inner.pending_selection = Some(PendingSelection {
+                            path: path_str.clone(),
+                            revision: selection_rev,
+                        });
                     }
                     {
                         let mut inner = this.0.borrow_mut();
@@ -451,8 +473,9 @@ impl Driver {
                         this.0.borrow_mut().db = Some(d.clone());
                         d
                     }
-                    Err(_) => {
+                    Err(e) => {
                         this.0.borrow_mut().search_indexing = false;
+                        this.0.borrow_mut().storage_error = Some(format!("Search index fail-closed (db open): {:?}", e));
                         this.render();
                         return;
                     }
@@ -501,7 +524,12 @@ impl Driver {
                             Ok(record) => {
                                 let mut doc = record.confirmed_doc;
                                 for update in record.pending_updates {
-                                    let _ = inkstone_core::doc_ops::apply_update(&mut doc, update);
+                                    if let Err(e) = inkstone_core::doc_ops::apply_update(&mut doc, update) {
+                                        this.0.borrow_mut().storage_error = Some(format!("Search index fail-closed (apply_update): {:?}", e));
+                                        this.0.borrow_mut().search_indexing = false;
+                                        this.render();
+                                        return;
+                                    }
                                 }
                                 title = doc.title.clone();
                                 md_blocks_for_knowledge = inkstone_core::markdown::index_document_blocks(&doc);
@@ -653,6 +681,7 @@ impl Driver {
     fn search_clear(&self) {
         let mut inner = self.0.borrow_mut();
         inner.search_query.clear();
+        inner.tag_filter = None;
         inner.search_results.clear();
         inner.search_highlighted_index = None;
         drop(inner);
@@ -671,6 +700,7 @@ impl Driver {
     fn search_clear_query_only(&self) {
         let mut inner = self.0.borrow_mut();
         inner.search_query.clear();
+        inner.tag_filter = None;
         inner.search_results.clear();
         inner.search_highlighted_index = None;
         drop(inner);
@@ -678,15 +708,153 @@ impl Driver {
     }
 
     fn clean_and_set_recent_notes(&self, mut recents: Vec<String>) {
-        let mut inner = self.0.borrow_mut();
-        let entries = &inner.entries;
-        recents.retain(|path| {
-            let is_valid = entries
-                .iter()
-                .any(|e| e.path.as_str() == path && e.kind == WorkspaceEntryKind::Markdown);
-            is_valid && !path.starts_with('.') && !path.contains("/.")
-        });
-        inner.recent_notes = recents;
+        let valid_paths: std::collections::HashSet<String> = {
+            let inner = self.0.borrow();
+            inner.entries.iter()
+                .filter(|e| e.kind == WorkspaceEntryKind::Markdown)
+                .map(|e| e.path.as_str().to_string())
+                .collect()
+        };
+        
+        let old_len = recents.len();
+        let old_recents = recents.clone();
+        
+        let mut i = 0;
+        let mut seen = std::collections::HashSet::new();
+        while i < recents.len() {
+            let path = &recents[i];
+            let is_valid = valid_paths.contains(path)
+                && path.to_lowercase().ends_with(".md")
+                && !path.starts_with('.')
+                && !path.contains("/.");
+                
+            if !is_valid || !seen.insert(path.clone()) {
+                recents.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        
+        if recents.len() > 8 {
+            recents.truncate(8);
+        }
+        
+        let changed = recents != old_recents;
+        
+        if changed {
+            let ws = self.0.borrow().workspace_db.clone();
+            let this = self.clone();
+            let rev = {
+                let mut inner = self.0.borrow_mut();
+                inner.recent_notes_revision += 1;
+                inner.recent_notes_revision
+            };
+            if let Some(ws) = ws {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ws.save_recent_notes(&recents).await {
+                        Ok(()) => {
+                            let mut inner = this.0.borrow_mut();
+                            if inner.recent_notes_revision == rev {
+                                inner.recent_notes = recents;
+                                drop(inner);
+                                this.render();
+                            }
+                        }
+                        Err(e) => {
+                            this.0.borrow_mut().storage_error =
+                                Some(format!("Failed to normalize recent notes: {:?}", e));
+                            this.render();
+                        }
+                    }
+                });
+            }
+        } else {
+            self.0.borrow_mut().recent_notes = recents;
+        }
+    }
+
+    fn process_pending_recent(&self) {
+        let (path, rev) = {
+            let mut inner = self.0.borrow_mut();
+            if let Some(pending) = inner.pending_selection.take() {
+                if pending.revision == inner.selection_revision {
+                    (pending.path, pending.revision)
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        };
+        self.add_recent_note(&path, rev);
+    }
+
+    fn normalize_recent_notes(&self) {
+        let (mut recents, valid_paths) = {
+            let inner = self.0.borrow();
+            let mut valid = std::collections::HashSet::new();
+            for e in &inner.entries {
+                valid.insert(e.path.as_str().to_string());
+            }
+            (inner.recent_notes.clone(), valid)
+        };
+        
+        let old_len = recents.len();
+        let mut i = 0;
+        let mut seen = std::collections::HashSet::new();
+        while i < recents.len() {
+            let path = &recents[i];
+            let is_valid = valid_paths.contains(path)
+                && path.to_lowercase().ends_with(".md")
+                && !path.starts_with('.')
+                && !path.contains("/.");
+                
+            if !is_valid || !seen.insert(path.clone()) {
+                recents.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        
+        if recents.len() > 8 {
+            recents.truncate(8);
+        }
+        
+        let changed = recents.len() != old_len || {
+            let inner = self.0.borrow();
+            recents != inner.recent_notes
+        };
+        
+        if changed {
+            let ws = self.0.borrow().workspace_db.clone();
+            let this = self.clone();
+            let rev = {
+                let mut inner = self.0.borrow_mut();
+                inner.recent_notes_revision += 1;
+                inner.recent_notes_revision
+            };
+            if let Some(ws) = ws {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ws.save_recent_notes(&recents).await {
+                        Ok(()) => {
+                            let mut inner = this.0.borrow_mut();
+                            if inner.recent_notes_revision == rev {
+                                inner.recent_notes = recents;
+                                drop(inner);
+                                this.render();
+                            }
+                        }
+                        Err(e) => {
+                            this.0.borrow_mut().storage_error =
+                                Some(format!("Failed to normalize recent notes: {:?}", e));
+                            this.render();
+                        }
+                    }
+                });
+            }
+        } else {
+            self.0.borrow_mut().recent_notes = recents;
+        }
     }
 
     fn add_recent_note(&self, path: &str, revision: u64) {
@@ -725,12 +893,21 @@ impl Driver {
     fn clear_recent_notes(&self) {
         let ws = self.0.borrow().workspace_db.clone();
         let this = self.clone();
+        let rev = {
+            let mut inner = self.0.borrow_mut();
+            inner.recent_notes_revision += 1;
+            inner.recent_notes_revision
+        };
         if let Some(ws) = ws {
             wasm_bindgen_futures::spawn_local(async move {
                 match ws.save_recent_notes(&[]).await {
                     Ok(()) => {
-                        this.0.borrow_mut().recent_notes.clear();
-                        this.render();
+                        let mut inner = this.0.borrow_mut();
+                        if inner.recent_notes_revision == rev {
+                            inner.recent_notes.clear();
+                            drop(inner);
+                            this.render();
+                        }
                     }
                     Err(e) => {
                         this.0.borrow_mut().storage_error =
@@ -757,12 +934,21 @@ impl Driver {
         if changed {
             let ws = self.0.borrow().workspace_db.clone();
             let this = self.clone();
+            let rev = {
+                let mut inner = self.0.borrow_mut();
+                inner.recent_notes_revision += 1;
+                inner.recent_notes_revision
+            };
             if let Some(ws) = ws {
                 wasm_bindgen_futures::spawn_local(async move {
                     match ws.save_recent_notes(&recents).await {
                         Ok(()) => {
-                            this.0.borrow_mut().recent_notes = recents;
-                            this.render();
+                            let mut inner = this.0.borrow_mut();
+                            if inner.recent_notes_revision == rev {
+                                inner.recent_notes = recents;
+                                drop(inner);
+                                this.render();
+                            }
                         }
                         Err(e) => {
                             this.0.borrow_mut().storage_error =
@@ -877,6 +1063,7 @@ impl Driver {
                                     confirmed_seq: record.confirmed_seq,
                                     pending_updates: record.pending_updates,
                                 });
+                                this.process_pending_recent();
                             }
                             Err(e) => {
                                 let err_str = format!("Parse Error: {:?}", e);
@@ -895,6 +1082,7 @@ impl Driver {
                                 confirmed_seq: 0,
                                 pending_updates: Vec::new(),
                             });
+                            this.process_pending_recent();
 
                             let doc_is_empty =
                                 this.0.borrow().client_state.view_doc().blocks.is_empty();
@@ -1178,6 +1366,23 @@ impl Driver {
         // Search Input
         let search_container = document.create_element("div").unwrap();
         search_container.set_class_name("search-container");
+        
+        let is_tag_filter_active = inner.tag_filter.is_some();
+        if let Some(ref tag) = inner.tag_filter {
+            let active_tag_div = document.create_element("div").unwrap();
+            active_tag_div.set_class_name("active-tag-filter");
+            
+            let tag_label = document.create_element("span").unwrap();
+            tag_label.set_text_content(Some(&format!("#{}", tag)));
+            
+            let clear_btn = document.create_element("button").unwrap();
+            clear_btn.set_class_name("clear-tag-btn");
+            clear_btn.set_text_content(Some("×"));
+            
+            active_tag_div.append_child(&tag_label).unwrap();
+            active_tag_div.append_child(&clear_btn).unwrap();
+            search_container.append_child(&active_tag_div).unwrap();
+        }
 
         let search_input = document.create_element("input").unwrap();
         let search_input: web_sys::HtmlInputElement = search_input.unchecked_into();
@@ -1528,6 +1733,13 @@ impl Driver {
                     }
                     mode_bar.append_child(&prev_btn).unwrap();
                 }
+                {
+                    let toggle_btn = document.create_element("button").unwrap();
+                    let toggle_btn: web_sys::HtmlElement = toggle_btn.unchecked_into();
+                    toggle_btn.set_class_name("toggle-inspector-btn");
+                    toggle_btn.set_text_content(Some(if inner.inspector_open { "Hide Inspector" } else { "Show Inspector" }));
+                    mode_bar.append_child(&toggle_btn).unwrap();
+                }
                 editor_container.append_child(&mode_bar).unwrap();
 
                 // ── Link message (non-fatal) ────────────────────
@@ -1622,9 +1834,10 @@ impl Driver {
                             }
                         }
                     }
-                    let html = markdown_render::render_to_html(
+                    let html = markdown_render::render_with_knowledge(
                         &md,
                         selected_path.as_deref().unwrap_or(""),
+                        &inner.knowledge,
                     );
                     let preview_div = document.create_element("div").unwrap();
                     preview_div.set_class_name("preview-content");
@@ -1657,7 +1870,11 @@ impl Driver {
         app_container.append_child(&main_content).unwrap();
 
         let inspector = document.create_element("div").unwrap();
-        inspector.set_class_name("inspector");
+        if inner.inspector_open {
+            inspector.set_class_name("inspector open");
+        } else {
+            inspector.set_class_name("inspector");
+        }
         
         let tabs_div = document.create_element("div").unwrap();
         tabs_div.set_class_name("inspector-tabs");
@@ -2167,16 +2384,50 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
+        if class == "clear-tag-btn" {
+            d_click.search_clear();
+            return;
+        }
+        
         // ── Inspector Outline Click ────────────────────────
         if class == "outline-item" {
-            if let Some(anchor) = el.get_attribute("data-anchor") {
-                if let Some(heading_el) = document.get_element_by_id(&anchor) {
-                    heading_el.scroll_into_view();
-                } else if let Some(line_str) = el.get_attribute("data-heading-line") {
-                    // Fallback to scrolling block editor
-                    // In edit mode we just have a bunch of blocks. It's harder to scroll to a specific block
-                    // but we can try to find the block-textarea that corresponds to the line if we knew the block ID.
-                    // For now, no-op in edit mode if no ID is found.
+            let inner = d_click.0.borrow();
+            let is_preview = inner.document_mode == DocumentMode::Preview;
+            drop(inner);
+            
+            if is_preview {
+                if let Some(anchor) = el.get_attribute("data-anchor") {
+                    if let Some(heading_el) = document.get_element_by_id(&anchor) {
+                        heading_el.scroll_into_view();
+                    }
+                }
+            } else {
+                if let Some(block_id) = el.get_attribute("data-block-id") {
+                    let selector = format!(".block-textarea[data-block-id=\"{}\"]", block_id);
+                    if let Ok(Some(textarea_el)) = document.query_selector(&selector) {
+                        textarea_el.scroll_into_view();
+                        if let Ok(textarea) = textarea_el.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                            let _ = textarea.focus();
+                            if let Some(line_str) = el.get_attribute("data-heading-line") {
+                                if let Ok(line) = line_str.parse::<usize>() {
+                                    let text = textarea.value();
+                                    let mut current_line = 1;
+                                    let mut offset = 0;
+                                    for ch in text.chars() {
+                                        if current_line == line {
+                                            break;
+                                        }
+                                        offset += ch.len_utf16() as u32;
+                                        if ch == '\n' {
+                                            current_line += 1;
+                                        }
+                                    }
+                                    let _ = textarea.set_selection_start(Some(offset));
+                                    let _ = textarea.set_selection_end(Some(offset));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             return;

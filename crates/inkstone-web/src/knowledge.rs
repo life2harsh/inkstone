@@ -55,7 +55,6 @@ pub struct KnowledgeIndex {
 
     // Target path -> Set of source paths that link to it
     // Note: The target path here is fully resolved
-    pub backlinks: BTreeMap<String, BTreeSet<String>>,
 
     // path -> all raw target links (unresolved) extracted from it
     pub path_to_outlinks: HashMap<String, Vec<OutgoingLink>>,
@@ -123,6 +122,17 @@ impl KnowledgeIndex {
                 self.tag_to_paths.entry(tag_lower).or_default().insert(path.to_string());
             }
             
+            
+            for m in &index.md_links {
+                if m.target.ends_with(".md") {
+                    doc_outlinks.push(OutgoingLink {
+                        target_raw: m.target.clone(),
+                        alias: m.title.clone(),
+                        block_id: *block_id,
+                        is_wikilink: false,
+                    });
+                }
+            }
             for w in &index.wikilinks {
                 doc_outlinks.push(OutgoingLink {
                     target_raw: w.target.clone(),
@@ -131,10 +141,7 @@ impl KnowledgeIndex {
                     is_wikilink: true,
                 });
                 
-                let resolved = self.resolve_wikilink(path, &w.target);
-                if let WikilinkResolution::Resolved(target_path) = resolved {
-                    self.backlinks.entry(target_path).or_default().insert(path.to_string());
-                }
+
             }
             
             // Standard relative markdown links ending in .md
@@ -165,25 +172,12 @@ impl KnowledgeIndex {
             }
         }
         
-        // Remove backlinks pointing *from* this doc
-        if let Some(doc) = self.path_to_doc.remove(path) {
-            for link in doc.outgoing_links {
-                let resolved = self.resolve_wikilink(path, &link.target_raw);
-                if let WikilinkResolution::Resolved(target_path) = resolved {
-                    if let Some(sources) = self.backlinks.get_mut(&target_path) {
-                        sources.remove(path);
-                        if sources.is_empty() {
-                            self.backlinks.remove(&target_path);
-                        }
-                    }
-                }
-            }
-        }
+        self.path_to_doc.remove(path);
         
-        // We do NOT remove from backlinks pointing *to* this doc here,
-        // because the source docs still have the link text. They just become unresolved.
-        // The prompt says: "deleted notes disappear from links and backlinks, links pointing to deleted notes become unresolved"
-        // When a doc is deleted, `resolve_wikilink` will dynamically fail if the path is missing.
+        // Backlinks are computed dynamically now.
+
+
+
         // Wait, backlinks relies on the `backlinks` map which was populated during `index_document` of the source.
         // If a target doc is deleted, we must remove it from `basename_to_paths` (via remove_path),
         // which makes `resolve_wikilink` fail.
@@ -258,16 +252,55 @@ impl KnowledgeIndex {
 
     pub fn get_backlinks(&self, target_path: &str) -> Vec<Backlink> {
         let mut result = Vec::new();
-        if let Some(sources) = self.backlinks.get(target_path) {
-            for source in sources {
-                let source_name = source.split('/').last().unwrap_or(source).to_string();
-                result.push(Backlink {
-                    source_path: source.clone(),
-                    source_name,
-                    context_snippet: None,
-                });
+        let target_basename = target_path.split('/').last().unwrap_or(target_path).to_lowercase();
+        
+        for (source_path, doc) in &self.path_to_doc {
+            if source_path == target_path { continue; }
+            for link in &doc.outgoing_links {
+                let mut matches = false;
+                if link.is_wikilink {
+                    let resolved = self.resolve_wikilink(source_path, &link.target_raw);
+                    if let WikilinkResolution::Resolved(rp) = resolved {
+                        if rp == target_path { matches = true; }
+                    }
+                } else {
+                    // Standard markdown link ending in .md
+                    // In a real local-first workspace, resolve relative to source
+                    let mut is_match = false;
+                    if link.target_raw.starts_with('/') {
+                        let abs = link.target_raw[1..].to_string();
+                        if abs == target_path { is_match = true; }
+                    } else if let Some(slash_idx) = source_path.rfind('/') {
+                        let prefix = &source_path[..slash_idx];
+                        // Simplistic relative resolution
+                        let mut segments: Vec<&str> = prefix.split('/').collect();
+                        for seg in link.target_raw.split('/') {
+                            if seg == ".." {
+                                segments.pop();
+                            } else if seg != "." && !seg.is_empty() {
+                                segments.push(seg);
+                            }
+                        }
+                        let abs = segments.join("/");
+                        if abs == target_path { is_match = true; }
+                    } else {
+                        if link.target_raw == target_path { is_match = true; }
+                    }
+                    if is_match { matches = true; }
+                }
+                
+                if matches {
+                    let source_name = source_path.split('/').last().unwrap_or(source_path).to_string();
+                    result.push(Backlink {
+                        source_path: source_path.clone(),
+                        source_name,
+                        context_snippet: None, // Context extraction logic would go here
+                    });
+                    break; // one backlink per source
+                }
             }
         }
+        
         result.sort_by(|a, b| a.source_name.cmp(&b.source_name));
         result
     }
@@ -349,7 +382,7 @@ mod tests {
                 line: 1,
                 col: 1,
             }],
-            embeds: vec![],
+            md_links: vec![], embeds: vec![],
             tags: vec![
                 TagRef { tag: "Rust".to_string(), line: 2, col: 1 },
                 TagRef { tag: "rust".to_string(), line: 2, col: 10 },
@@ -379,13 +412,13 @@ mod tests {
         assert_eq!(headings[1].anchor, "title-2"); // Duplicate anchor uniqueness
         
         // Backlinks
-        let backlinks = idx.backlinks.get("Notes/Target.md").unwrap();
+        let backlinks = idx.get_backlinks("Notes/Target.md");
         assert_eq!(backlinks.len(), 1);
-        assert!(backlinks.contains("Notes/Source.md"));
+        assert_eq!(backlinks[0].source_path, "Notes/Source.md");
         
         // Remove document (deletion/rename rebuild)
         idx.remove_document("Notes/Source.md");
         assert!(!idx.tag_to_paths.contains_key("rust"));
-        assert!(!idx.backlinks.contains_key("Notes/Target.md"));
+        assert_eq!(idx.get_backlinks("Notes/Target.md").len(), 0);
     }
 }

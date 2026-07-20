@@ -31,6 +31,7 @@ body {
 
 .app-container {
   display: flex;
+  position: relative;
   height: 100%;
   width: 100%;
 }
@@ -41,6 +42,7 @@ body {
   background-color: var(--bg-sidebar);
   border-right: 1px solid var(--border-color);
   display: flex;
+  position: relative;
   flex-direction: column;
   padding: 24px;
 }
@@ -83,6 +85,7 @@ body {
 .sidebar-footer {
   margin-top: auto;
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 12px;
   padding-top: 16px;
@@ -121,6 +124,7 @@ body {
   overflow-y: auto;
   padding: 48px 24px;
   display: flex;
+  position: relative;
   justify-content: center;
 }
 
@@ -128,6 +132,7 @@ body {
   width: 100%;
   max-width: 680px;
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 24px;
 }
@@ -153,6 +158,7 @@ body {
 /* Block list */
 .block-list {
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 16px;
 }
@@ -164,6 +170,7 @@ body {
   padding: 16px;
   box-shadow: var(--shadow-subtle);
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 8px;
 }
@@ -213,6 +220,7 @@ body {
   border-radius: 8px;
   padding: 16px;
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 8px;
 }
@@ -226,6 +234,7 @@ body {
 
 .file-list {
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 2px;
   margin-bottom: 16px;
@@ -233,6 +242,7 @@ body {
 
 .file-entry {
   display: flex;
+  position: relative;
   align-items: center;
   justify-content: space-between;
   padding: 6px 8px;
@@ -281,6 +291,7 @@ body {
 
 .file-entry:hover .file-actions {
   display: flex;
+  position: relative;
 }
 
 .rename-btn,
@@ -308,6 +319,7 @@ body {
 
 .new-file-row {
   display: flex;
+  position: relative;
   gap: 6px;
   margin-bottom: 16px;
 }
@@ -403,6 +415,7 @@ body {
 
 .explorer-folder {
   display: flex;
+  position: relative;
   align-items: center;
   padding: 4px 8px;
   border-radius: 4px;
@@ -470,6 +483,7 @@ body {
 
 .mode-bar {
   display: flex;
+  position: relative;
   gap: 0;
   margin-bottom: 16px;
   border: 1px solid var(--border-color);
@@ -590,6 +604,7 @@ body {
 
 .link-message {
   display: flex;
+  position: relative;
   align-items: center;
   gap: 8px;
   background-color: #fffbea;
@@ -628,6 +643,7 @@ body {
   width: 100%;
   max-width: 680px;
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 12px;
   padding: 24px;
@@ -779,6 +795,7 @@ body {
 /* Recent Notes */
 .recent-heading {
   display: flex;
+  position: relative;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
@@ -804,6 +821,7 @@ body {
 .recent-list {
   margin-bottom: 24px;
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 4px;
 }
@@ -847,6 +865,7 @@ body {
   background-color: var(--bg-sidebar);
   border-left: 1px solid var(--border-color);
   display: flex;
+  position: relative;
   flex-direction: column;
   padding: 24px;
   overflow-y: auto;
@@ -854,6 +873,7 @@ body {
 
 .inspector-tabs {
   display: flex;
+  position: relative;
   gap: 16px;
   border-bottom: 1px solid var(--border-color);
   margin-bottom: 16px;
@@ -880,6 +900,7 @@ body {
 
 .inspector-section {
   display: flex;
+  position: relative;
   flex-direction: column;
   gap: 8px;
 }
@@ -927,6 +948,7 @@ body {
 
 .tag-item {
   display: flex;
+  position: relative;
   justify-content: space-between;
   font-size: 13px;
   padding: 4px 8px;
@@ -949,4 +971,69 @@ body {
   .inspector {
     display: none;
   }
+}
+
+.active-tag-filter {
+    display: flex;
+  position: relative;
+    align-items: center;
+    background-color: var(--selected-bg);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+    justify-content: space-between;
+}
+
+.clear-tag-btn {
+    background: none;
+    border: none;
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 1.2rem;
+    line-height: 1;
+    padding: 0 0.25rem;
+}
+
+.clear-tag-btn:hover {
+    color: var(--accent-color);
+}
+
+.inspector-section-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: #888;
+    margin-bottom: 0.5rem;
+    margin-top: 1rem;
+}
+
+@media (max-width: 900px) {
+  .inspector.open {
+    display: flex;
+  position: relative;
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 250px;
+    z-index: 100;
+    background: var(--bg-color);
+    box-shadow: -2px 0 5px rgba(0,0,0,0.1);
+  }
+}
+
+.toggle-inspector-btn {
+  display: none;
+}
+@media (max-width: 900px) {
+  .toggle-inspector-btn {
+    display: inline-block;
+  }
+}
+
+.inspector a, .inspector span, .inspector .link-item, .inspector .outline-item {
+    word-break: break-word;
+    overflow-wrap: break-word;
+    white-space: normal;
 }
