@@ -840,3 +840,113 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Inspector / Knowledge Sidebar */
+.inspector {
+  width: 280px;
+  background-color: var(--bg-sidebar);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.inspector-tabs {
+  display: flex;
+  gap: 16px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 16px;
+  flex-shrink: 0;
+}
+
+.inspector-tab {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding-bottom: 8px;
+  border-bottom: 2px solid transparent;
+}
+
+.inspector-tab:hover {
+  color: var(--text-main);
+}
+
+.inspector-tab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+}
+
+.inspector-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inspector-section h4 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+  margin-top: 12px;
+  margin-bottom: 4px;
+}
+
+.outline-item {
+  font-size: 13px;
+  color: var(--text-main);
+  cursor: pointer;
+  padding: 4px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.outline-item:hover {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
+.link-item {
+  font-size: 13px;
+  color: var(--accent-blue);
+  cursor: pointer;
+  padding: 4px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.link-item:hover {
+  text-decoration: underline;
+}
+.link-item.missing {
+  color: #c53030;
+  text-decoration: underline dashed;
+}
+
+.tag-item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  padding: 4px 8px;
+  background-color: #e2e8f0;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 4px;
+}
+.tag-item:hover {
+  background-color: #cbd5e0;
+}
+.tag-name {
+  font-weight: 500;
+}
+.tag-count {
+  color: var(--text-muted);
+}
+
+@media (max-width: 900px) {
+  .inspector {
+    display: none;
+  }
+}

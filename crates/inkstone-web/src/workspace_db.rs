@@ -525,7 +525,40 @@ impl WorkspaceDb {
                         e
                     ))
                 })?;
-                Ok(list)
+                
+                let mut seen = std::collections::HashSet::new();
+                let mut normalized = Vec::new();
+                let mut modified = false;
+
+                let original_len = list.len();
+                for path in list {
+                    if path.starts_with('.') || path.contains("/.") || !path.ends_with(".md") {
+                        modified = true;
+                        continue;
+                    }
+                    if seen.insert(path.clone()) {
+                        normalized.push(path);
+                        if normalized.len() == 8 {
+                            // If the original list was larger than 8, we consider it modified
+                            break;
+                        }
+                    } else {
+                        modified = true;
+                    }
+                }
+                
+                // Also check if we broke early due to >8 items
+                // Wait, if list had 10 unique valid items, `normalized.len()` will reach 8 and break.
+                // We haven't set `modified = true` for the ignored tail elements explicitly if we just `break`.
+                // Actually, if we `break`, it means `list` had more elements. Let's just track it by comparing lengths.
+                // Oh wait, `seen.insert` is O(1). We can just do:
+                // if list.len() != normalized.len() { modified = true; }
+                
+                if original_len != normalized.len() || modified {
+                    self.save_recent_notes(&normalized).await?;
+                }
+
+                Ok(normalized)
             }
         }
     }

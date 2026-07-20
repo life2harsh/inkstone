@@ -76,13 +76,34 @@ fn score_doc(doc: &SearchDocument, q: &str) -> Option<u32> {
     None
 }
 
+pub fn find_case_insensitive_range(text: &str, lower_query: &str) -> Option<(usize, usize)> {
+    let mut lower_text = String::with_capacity(text.len());
+    let mut orig_offsets = Vec::with_capacity(text.len() + 4);
+
+    for (orig_idx, ch) in text.char_indices() {
+        let start_len = lower_text.len();
+        lower_text.extend(ch.to_lowercase());
+        let end_len = lower_text.len();
+        for _ in start_len..end_len {
+            orig_offsets.push(orig_idx);
+        }
+    }
+    orig_offsets.push(text.len()); // for the very end
+
+    if let Some(byte_idx) = lower_text.find(lower_query) {
+        let orig_start = orig_offsets[byte_idx];
+        let orig_end = orig_offsets[byte_idx + lower_query.len()];
+        Some((orig_start, orig_end))
+    } else {
+        None
+    }
+}
+
 fn generate_snippet(doc: &SearchDocument, q: &str) -> Option<String> {
     for block in &doc.blocks {
-        let block_lower = block.to_lowercase();
-        if let Some(byte_idx) = block_lower.find(q) {
-            // Locate the char index of the match start.
-            let char_start = block_lower[..byte_idx].chars().count();
-            let query_char_len = q.chars().count();
+        if let Some((match_start, match_end)) = find_case_insensitive_range(block, q) {
+            let char_start = block[..match_start].chars().count();
+            let query_char_len = block[match_start..match_end].chars().count();
             let total_chars = block.chars().count();
             let context: usize = 30;
 
@@ -288,5 +309,15 @@ mod tests {
         // Same score; A/Note.md sorts before Z/Note.md
         assert_eq!(results[0].path, "A/Note.md");
         assert_eq!(results[1].path, "Z/Note.md");
+    }
+
+    #[test]
+    fn test_find_case_insensitive_range() {
+        let text = "İstanbul 🌍 Roadmap";
+        let query = "roadmap";
+        let res = find_case_insensitive_range(text, query);
+        assert!(res.is_some());
+        let (start, end) = res.unwrap();
+        assert_eq!(&text[start..end], "Roadmap");
     }
 }

@@ -1,5 +1,6 @@
 pub mod explorer;
 pub mod indexed_db;
+pub mod knowledge;
 pub mod markdown_render;
 pub mod search;
 pub mod storage;
@@ -49,6 +50,9 @@ pub struct DriverInner {
     pub search_results: Vec<search::SearchResult>,
     pub search_highlighted_index: Option<usize>,
     pub recent_notes: Vec<String>,
+    pub knowledge: knowledge::KnowledgeIndex,
+    pub knowledge_tab: String,
+    pub selection_revision: u64,
 }
 
 #[derive(Clone)]
@@ -80,6 +84,9 @@ impl Driver {
             search_results: Vec::new(),
             search_highlighted_index: None,
             recent_notes: Vec::new(),
+            knowledge: knowledge::KnowledgeIndex::new(),
+            knowledge_tab: "Outline".to_string(),
+            selection_revision: 0,
         })))
     }
 
@@ -88,11 +95,10 @@ impl Driver {
         let is_markdown = path_str.to_lowercase().ends_with(".md")
             && !path_str.starts_with('.')
             && !path_str.contains("/.");
-        if is_markdown {
-            self.add_recent_note(&path_str);
-        }
-        {
+            
+        let selection_rev = {
             let mut inner = self.0.borrow_mut();
+            inner.selection_revision += 1;
             inner.renaming_path = None;
             inner.show_create = false;
             inner.create_folder = None;
@@ -100,7 +106,9 @@ impl Driver {
             for folder in &ancestors {
                 inner.expanded_folders.insert(folder.clone());
             }
-        }
+            inner.selection_revision
+        };
+
         let is_asset = {
             let inner = self.0.borrow();
             inner
@@ -125,6 +133,9 @@ impl Driver {
         wasm_bindgen_futures::spawn_local(async move {
             match ws.get_doc_id(&path_str).await {
                 Ok(Some(existing_id)) => {
+                    if is_markdown {
+                        this.add_recent_note(&path_str, selection_rev);
+                    }
                     let doc_id = DocId(existing_id);
                     {
                         let mut inner = this.0.borrow_mut();
@@ -143,10 +154,13 @@ impl Driver {
                         this.render();
                         return;
                     }
+                    if is_markdown {
+                        this.add_recent_note(&path_str, selection_rev);
+                    }
                     {
                         let mut inner = this.0.borrow_mut();
                         inner.selected_doc_id = doc_id;
-                        inner.selected_path = Some(path_str);
+                        inner.selected_path = Some(path_str.clone());
                         inner.client_state = ClientState::new(doc_id);
                     }
                     this.dispatch(ClientEvent::OpenDocument { doc_id });
@@ -217,6 +231,7 @@ impl Driver {
                             }
                         }
                         this.refresh_entries();
+                        this.index_workspace();
                         this.select_entry(&path_str);
                     }
                     Err(e) => {
@@ -291,6 +306,7 @@ impl Driver {
                 this.0.borrow_mut().selected_path = None;
             }
             this.refresh_entries();
+            this.index_workspace();
             this.render();
         });
     }
@@ -334,6 +350,7 @@ impl Driver {
                     this.0.borrow_mut().renaming_path = None;
                     this.handle_rename_recent_note(&old_path, &new_name);
                     this.refresh_entries();
+                    this.index_workspace();
                     this.render();
                 }
                 Err(e) => {
@@ -452,48 +469,84 @@ impl Driver {
                 .collect();
 
             let mut search_docs = Vec::new();
+            
+            // Rebuild knowledge index completely from scratch
+            let mut new_knowledge = knowledge::KnowledgeIndex::new();
+            // First pass: register all paths for wikilink resolution
+            for path in &markdown_files {
+                new_knowledge.register_path(path);
+            }
+
             for path in markdown_files {
                 let file_name = explorer::file_name_only(&path).to_string();
                 let doc_id_opt = match ws.get_doc_id(&path).await {
                     Ok(Some(uuid)) => Some(DocId(uuid)),
-                    _ => None,
+                    Ok(None) => None,
+                    Err(e) => {
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Search index fail-closed (get_doc_id): {:?}", e));
+                        this.0.borrow_mut().search_indexing = false;
+                        this.render();
+                        return;
+                    }
                 };
 
                 let mut title = String::new();
                 let mut blocks = Vec::new();
+                let mut md_blocks_for_knowledge = Vec::new();
 
                 if let Some(doc_id) = doc_id_opt {
-                    if let Ok(Some(record_json)) = db.get_document_record(&doc_id.to_string()).await
-                    {
-                        if let Ok(record) = storage::deserialize_record(&record_json) {
-                            let mut doc = record.confirmed_doc;
-                            for update in record.pending_updates {
-                                let _ = inkstone_core::doc_ops::apply_update(&mut doc, update);
-                            }
-                            title = doc.title;
-                            for block in doc.blocks {
-                                if let inkstone_core::document::BlockContent::Markdown { text } =
-                                    block.content
-                                {
-                                    blocks.push(text);
+                    match db.get_document_record(&doc_id.to_string()).await {
+                        Ok(Some(record_json)) => match storage::deserialize_record(&record_json) {
+                            Ok(record) => {
+                                let mut doc = record.confirmed_doc;
+                                for update in record.pending_updates {
+                                    let _ = inkstone_core::doc_ops::apply_update(&mut doc, update);
+                                }
+                                title = doc.title.clone();
+                                md_blocks_for_knowledge = inkstone_core::markdown::index_document_blocks(&doc);
+                                for block in doc.blocks {
+                                    if let inkstone_core::document::BlockContent::Markdown { text } =
+                                        block.content
+                                    {
+                                        blocks.push(text);
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                this.0.borrow_mut().storage_error =
+                                    Some(format!("Search index fail-closed (deserialize): {:?}", e));
+                                this.0.borrow_mut().search_indexing = false;
+                                this.render();
+                                return;
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            this.0.borrow_mut().storage_error =
+                                Some(format!("Search index fail-closed (get_document_record): {:?}", e));
+                            this.0.borrow_mut().search_indexing = false;
+                            this.render();
+                            return;
                         }
                     }
                 }
 
                 search_docs.push(search::SearchDocument {
-                    path,
+                    path: path.clone(),
                     file_name,
                     doc_id: doc_id_opt,
                     title,
                     blocks,
                 });
+                
+                new_knowledge.index_document(&path, &md_blocks_for_knowledge);
             }
 
             {
                 let mut inner = this.0.borrow_mut();
                 inner.search_documents = search_docs;
+                inner.knowledge = new_knowledge;
                 inner.search_indexing = false;
             }
             this.perform_search_and_render();
@@ -508,7 +561,7 @@ impl Driver {
                 .iter()
                 .position(|doc| doc.path == path)
             {
-                let effective_doc = inner.client_state.effective_view_doc();
+                let effective_doc = inner.client_state.effective_view_doc().clone();
                 let mut blocks = Vec::new();
                 for block in &effective_doc.blocks {
                     if let inkstone_core::document::BlockContent::Markdown { text } = &block.content
@@ -518,6 +571,10 @@ impl Driver {
                 }
                 inner.search_documents[pos].title = effective_doc.title.clone();
                 inner.search_documents[pos].blocks = blocks;
+                
+                let md_blocks_for_knowledge = inkstone_core::markdown::index_document_blocks(&effective_doc);
+                inner.knowledge.index_document(path, &md_blocks_for_knowledge);
+                
                 !inner.search_query.trim().is_empty()
             } else {
                 false
@@ -632,22 +689,27 @@ impl Driver {
         inner.recent_notes = recents;
     }
 
-    fn add_recent_note(&self, path: &str) {
-        let mut recents = {
-            let inner = self.0.borrow();
-            inner.recent_notes.clone()
-        };
+    fn add_recent_note(&self, path: &str, revision: u64) {
+        let mut inner = self.0.borrow_mut();
+        if inner.selection_revision != revision {
+            return;
+        }
+        
+        let mut recents = inner.recent_notes.clone();
         recents.retain(|p| p != path);
         recents.insert(0, path.to_string());
         recents.truncate(8);
-
-        let ws = self.0.borrow().workspace_db.clone();
+        
+        inner.recent_notes = recents.clone();
+        
+        let ws = inner.workspace_db.clone();
         let this = self.clone();
+        drop(inner);
+        
         if let Some(ws) = ws {
             wasm_bindgen_futures::spawn_local(async move {
                 match ws.save_recent_notes(&recents).await {
                     Ok(()) => {
-                        this.0.borrow_mut().recent_notes = recents;
                         this.render();
                     }
                     Err(e) => {
@@ -1593,6 +1655,138 @@ impl Driver {
         }
 
         app_container.append_child(&main_content).unwrap();
+
+        let inspector = document.create_element("div").unwrap();
+        inspector.set_class_name("inspector");
+        
+        let tabs_div = document.create_element("div").unwrap();
+        tabs_div.set_class_name("inspector-tabs");
+        
+        for tab_name in &["Outline", "Links", "Tags"] {
+            let tab = document.create_element("div").unwrap();
+            if &inner.knowledge_tab == tab_name {
+                tab.set_class_name("inspector-tab active");
+            } else {
+                tab.set_class_name("inspector-tab");
+            }
+            tab.set_attribute("data-tab", tab_name).unwrap();
+            tab.set_text_content(Some(tab_name));
+            tabs_div.append_child(&tab).unwrap();
+        }
+        inspector.append_child(&tabs_div).unwrap();
+        
+        let section = document.create_element("div").unwrap();
+        section.set_class_name("inspector-section");
+        
+        if inner.knowledge_tab == "Outline" {
+            if let Some(path) = selected_path {
+                if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
+                    for heading in &knowledge.headings {
+                        let item = document.create_element("div").unwrap();
+                        item.set_class_name("outline-item");
+                        item.set_text_content(Some(&heading.text));
+                        item.set_attribute("data-heading-line", &heading.line.to_string()).unwrap();
+                        let pad = if heading.level > 0 { (heading.level - 1) * 12 } else { 0 };
+                        item.set_attribute("style", &format!("padding-left: {}px", pad)).unwrap();
+                        section.append_child(&item).unwrap();
+                    }
+                    if knowledge.headings.is_empty() {
+                        let empty = document.create_element("div").unwrap();
+                        empty.set_class_name("outline-item");
+                        empty.set_text_content(Some("No headings"));
+                        empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                        section.append_child(&empty).unwrap();
+                    }
+                }
+            }
+        } else if inner.knowledge_tab == "Links" {
+            // Outgoing Links
+            let out_header = document.create_element("h4").unwrap();
+            out_header.set_text_content(Some("Outgoing Links"));
+            section.append_child(&out_header).unwrap();
+            
+            if let Some(path) = selected_path {
+                if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
+                    let mut has_links = false;
+                    for outlink in &knowledge.outgoing_links {
+                        has_links = true;
+                        let item = document.create_element("div").unwrap();
+                        let resolved_path = inner.knowledge.resolve_wikilink(path, &outlink.target_raw);
+                        if let knowledge::WikilinkResolution::Resolved(resolved) = resolved_path {
+                            item.set_class_name("link-item");
+                            item.set_text_content(Some(&outlink.target_raw));
+                            item.set_attribute("data-path", &resolved).unwrap();
+                        } else {
+                            item.set_class_name("link-item missing");
+                            item.set_text_content(Some(&outlink.target_raw));
+                            item.set_attribute("data-missing-target", &outlink.target_raw).unwrap();
+                        }
+                        section.append_child(&item).unwrap();
+                    }
+                    if !has_links {
+                        let empty = document.create_element("div").unwrap();
+                        empty.set_class_name("outline-item");
+                        empty.set_text_content(Some("No outgoing links"));
+                        empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                        section.append_child(&empty).unwrap();
+                    }
+                }
+            }
+            
+            // Backlinks
+            let back_header = document.create_element("h4").unwrap();
+            back_header.set_text_content(Some("Backlinks"));
+            section.append_child(&back_header).unwrap();
+            
+            if let Some(path) = selected_path {
+                let backlinks = inner.knowledge.get_backlinks(path);
+                if backlinks.is_empty() {
+                    let empty = document.create_element("div").unwrap();
+                    empty.set_class_name("outline-item");
+                    empty.set_text_content(Some("No backlinks"));
+                    empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                    section.append_child(&empty).unwrap();
+                } else {
+                    for backlink in backlinks {
+                        let item = document.create_element("div").unwrap();
+                        item.set_class_name("link-item");
+                        item.set_text_content(Some(&backlink.source_name));
+                        item.set_attribute("data-path", &backlink.source_path).unwrap();
+                        section.append_child(&item).unwrap();
+                    }
+                }
+            }
+        } else if inner.knowledge_tab == "Tags" {
+            let tags = inner.knowledge.get_all_tags_with_counts();
+            if tags.is_empty() {
+                let empty = document.create_element("div").unwrap();
+                empty.set_class_name("outline-item");
+                empty.set_text_content(Some("No tags in workspace"));
+                empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                section.append_child(&empty).unwrap();
+            } else {
+                for (tag, count) in tags {
+                    let item = document.create_element("div").unwrap();
+                    item.set_class_name("tag-item");
+                    item.set_attribute("data-tag", &tag).unwrap();
+                    
+                    let name_span = document.create_element("span").unwrap();
+                    name_span.set_class_name("tag-name");
+                    name_span.set_text_content(Some(&format!("#{}", tag)));
+                    
+                    let count_span = document.create_element("span").unwrap();
+                    count_span.set_class_name("tag-count");
+                    count_span.set_text_content(Some(&count.to_string()));
+                    
+                    item.append_child(&name_span).unwrap();
+                    item.append_child(&count_span).unwrap();
+                    section.append_child(&item).unwrap();
+                }
+            }
+        }
+        
+        inspector.append_child(&section).unwrap();
+        app_container.append_child(&inspector).unwrap();
         root.append_child(&app_container).unwrap();
 
         // Focus rename input if in rename mode
@@ -1959,6 +2153,84 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if class == "link-message-dismiss" {
             d_click.0.borrow_mut().link_message = None;
             d_click.render();
+            return;
+        }
+
+        // ── Inspector Tab Switch ───────────────────────────
+        if class == "inspector-tab" || class == "inspector-tab active" {
+            if let Some(tab_name) = el.get_attribute("data-tab") {
+                let mut inner = d_click.0.borrow_mut();
+                inner.knowledge_tab = tab_name;
+                drop(inner);
+                d_click.render();
+            }
+            return;
+        }
+
+        // ── Inspector Outline Click ────────────────────────
+        if class == "outline-item" {
+            if let Some(anchor) = el.get_attribute("data-anchor") {
+                if let Some(heading_el) = document.get_element_by_id(&anchor) {
+                    heading_el.scroll_into_view();
+                } else if let Some(line_str) = el.get_attribute("data-heading-line") {
+                    // Fallback to scrolling block editor
+                    // In edit mode we just have a bunch of blocks. It's harder to scroll to a specific block
+                    // but we can try to find the block-textarea that corresponds to the line if we knew the block ID.
+                    // For now, no-op in edit mode if no ID is found.
+                }
+            }
+            return;
+        }
+
+        // ── Inspector Link Click ───────────────────────────
+        if class == "link-item" {
+            if let Some(path) = el.get_attribute("data-path") {
+                d_click.select_entry(&path);
+            }
+            return;
+        }
+        
+        // ── Inspector Missing Link Click ───────────────────
+        if class == "link-item missing" {
+            if let Some(target) = el.get_attribute("data-missing-target") {
+                let mut inner = d_click.0.borrow_mut();
+                inner.create_folder = None; // Ensure we don't prepend random explorer folder
+                
+                // Construct target with .md extension
+                let target_with_ext = if target.ends_with(".md") {
+                    target
+                } else {
+                    format!("{}.md", target)
+                };
+                
+                // Create sibling of current active document if possible
+                let active_path = inner.selected_path.clone();
+                drop(inner);
+                
+                let missing_file = if let Some(path) = active_path {
+                    if let Some(slash_idx) = path.rfind('/') {
+                        format!("{}/{}", &path[..slash_idx], target_with_ext)
+                    } else {
+                        target_with_ext
+                    }
+                } else {
+                    target_with_ext
+                };
+                
+                d_click.create_file(&missing_file);
+            }
+            return;
+        }
+
+        // ── Inspector Tag Click ────────────────────────────
+        if class == "tag-item" || class == "tag-name" || class == "tag-count" {
+            let tag = el.get_attribute("data-tag").or_else(|| {
+                el.parent_element()
+                    .and_then(|p| p.get_attribute("data-tag"))
+            });
+            if let Some(t) = tag {
+                d_click.update_search_query(&format!("#{}", t));
+            }
             return;
         }
 
