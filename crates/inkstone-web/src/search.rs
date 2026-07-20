@@ -77,26 +77,44 @@ fn score_doc(doc: &SearchDocument, q: &str) -> Option<u32> {
 }
 
 pub fn find_case_insensitive_range(text: &str, lower_query: &str) -> Option<(usize, usize)> {
+    find_case_insensitive_ranges(text, lower_query)
+        .into_iter()
+        .next()
+}
+
+pub fn find_case_insensitive_ranges(text: &str, lower_query: &str) -> Vec<(usize, usize)> {
+    if lower_query.is_empty() {
+        return Vec::new();
+    }
     let mut lower_text = String::with_capacity(text.len());
-    let mut orig_offsets = Vec::with_capacity(text.len() + 4);
+    let mut offsets = Vec::new();
 
     for (orig_idx, ch) in text.char_indices() {
         let start_len = lower_text.len();
         lower_text.extend(ch.to_lowercase());
         let end_len = lower_text.len();
-        for _ in start_len..end_len {
-            orig_offsets.push(orig_idx);
+        let orig_end = text[orig_idx..]
+            .chars()
+            .next()
+            .map(|c| orig_idx + c.len_utf8())
+            .unwrap_or(text.len());
+        offsets.push((start_len, end_len, orig_idx, orig_end));
+    }
+    let mut result = Vec::new();
+    let mut lower_offset = 0;
+    while let Some(found) = lower_text[lower_offset..].find(lower_query) {
+        let start = lower_offset + found;
+        let end = start + lower_query.len();
+        let first = offsets
+            .iter()
+            .find(|(a, b, _, _)| *a <= start && start < *b);
+        let last = offsets.iter().find(|(a, b, _, _)| *a < end && end <= *b);
+        if let (Some((_, _, original_start, _)), Some((_, _, _, original_end))) = (first, last) {
+            result.push((*original_start, *original_end));
         }
+        lower_offset = end;
     }
-    orig_offsets.push(text.len()); // for the very end
-
-    if let Some(byte_idx) = lower_text.find(lower_query) {
-        let orig_start = orig_offsets[byte_idx];
-        let orig_end = orig_offsets[byte_idx + lower_query.len()];
-        Some((orig_start, orig_end))
-    } else {
-        None
-    }
+    result
 }
 
 fn generate_snippet(doc: &SearchDocument, q: &str) -> Option<String> {
@@ -319,5 +337,19 @@ mod tests {
         assert!(res.is_some());
         let (start, end) = res.unwrap();
         assert_eq!(&text[start..end], "Roadmap");
+    }
+
+    #[test]
+    fn test_repeated_unicode_safe_ranges() {
+        let ranges = find_case_insensitive_ranges("İstanbul 🌍 Roadmap roadmap", "roadmap");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            &"İstanbul 🌍 Roadmap roadmap"[ranges[0].0..ranges[0].1],
+            "Roadmap"
+        );
+        assert_eq!(
+            &"İstanbul 🌍 Roadmap roadmap"[ranges[1].0..ranges[1].1],
+            "roadmap"
+        );
     }
 }

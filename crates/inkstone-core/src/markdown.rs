@@ -11,10 +11,10 @@ pub struct MarkdownIndex {
     pub has_code_block: bool,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MdLink {
     pub target: String,
+    pub label: String,
     pub title: Option<String>,
     pub line: usize,
     pub col: usize,
@@ -106,7 +106,7 @@ pub fn parse_markdown(text: &str) -> MarkdownIndex {
                 continue;
             }
 
-                        if let Some(end) = try_parse_md_link(&chars, pos, &mut md_links, line_idx) {
+            if let Some(end) = try_parse_md_link(&chars, pos, &mut md_links, line_idx) {
                 pos = end;
                 continue;
             }
@@ -388,6 +388,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_standard_markdown_links() {
+        let idx = parse_markdown(
+            "[Label](Target.md) [Up](../Target.md) [Space](<Target With Spaces.md>) [T](Target.md \"Optional title\")",
+        );
+        assert_eq!(idx.md_links.len(), 4);
+        assert_eq!(idx.md_links[0].label, "Label");
+        assert_eq!(idx.md_links[2].target, "Target With Spaces.md");
+        assert_eq!(idx.md_links[3].title.as_deref(), Some("Optional title"));
+    }
+
+    #[test]
+    fn test_standard_links_skip_code_and_images() {
+        let idx = parse_markdown(
+            "`[no](No.md)` ![image](Image.md)\n```\n[no](No.md)\n```\n[yes](Yes.md)",
+        );
+        assert_eq!(idx.md_links.len(), 1);
+        assert_eq!(idx.md_links[0].target, "Yes.md");
+        assert_eq!(idx.md_links[0].line, 4);
+    }
+
+    #[test]
     fn test_index_document_walks_only_markdown_blocks() {
         use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
         use crate::ids::{BlockId, DocId};
@@ -518,30 +539,74 @@ fn try_parse_md_link(
     md_links: &mut Vec<MdLink>,
     line: usize,
 ) -> Option<usize> {
-    if pos + 1 < chars.len() && chars[pos] == '[' && chars[pos + 1] != '[' {
-        if let Some(text_end) = find_closing_brackets(chars, pos + 1) {
-            if text_end < chars.len() && chars[text_end] == '(' {
-                let text: String = chars[pos + 1..text_end - 1].iter().collect();
-                if let Some(url_end) = chars[text_end + 1..].iter().position(|&c| c == ')').map(|i| text_end + 1 + i) {
-                    let url_full: String = chars[text_end + 1..url_end].iter().collect();
-                    let (target, title) = if let Some(space) = url_full.find(' ') {
-                        let t = url_full[..space].to_string();
-                        let title = url_full[space + 1..].trim_matches('"').trim_matches('\'').to_string();
-                        (t, Some(title))
-                    } else {
-                        (url_full, None)
-                    };
-                    
-                    md_links.push(MdLink {
-                        target,
-                        title,
-                        line,
-                        col: pos,
-                    });
-                    return Some(url_end + 1);
-                }
-            }
-        }
+    // Images are not document links, and wikilinks have their own parser.
+    if chars.get(pos) != Some(&'[')
+        || chars.get(pos + 1) == Some(&'[')
+        || pos > 0 && chars[pos - 1] == '!'
+    {
+        return None;
     }
-    None
+    let label_end = chars[pos + 1..]
+        .iter()
+        .position(|c| *c == ']')
+        .map(|offset| pos + 1 + offset)?;
+    if chars.get(label_end + 1) != Some(&'(') {
+        return None;
+    }
+    let destination_start = label_end + 2;
+    let (target, after_destination) = if chars.get(destination_start) == Some(&'<') {
+        let end = chars[destination_start + 1..]
+            .iter()
+            .position(|c| *c == '>')
+            .map(|offset| destination_start + 1 + offset)?;
+        (
+            (chars[destination_start + 1..end].iter().collect::<String>()),
+            end + 1,
+        )
+    } else {
+        let end = chars[destination_start..]
+            .iter()
+            .position(|c| *c == ')' || c.is_whitespace())
+            .map(|offset| destination_start + offset)?;
+        (
+            chars[destination_start..end].iter().collect::<String>(),
+            end,
+        )
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let mut cursor = after_destination;
+    while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+        cursor += 1;
+    }
+    let title = if chars.get(cursor) == Some(&')') {
+        None
+    } else {
+        let quote = *chars.get(cursor)?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let end = chars[cursor + 1..]
+            .iter()
+            .position(|c| *c == quote)
+            .map(|offset| cursor + 1 + offset)?;
+        let title: String = chars[cursor + 1..end].iter().collect();
+        cursor = end + 1;
+        while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+            cursor += 1;
+        }
+        Some(title)
+    };
+    if chars.get(cursor) != Some(&')') {
+        return None;
+    }
+    md_links.push(MdLink {
+        target,
+        label: chars[pos + 1..label_end].iter().collect(),
+        title,
+        line,
+        col: pos,
+    });
+    Some(cursor + 1)
 }

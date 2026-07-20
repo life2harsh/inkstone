@@ -10,12 +10,6 @@ pub enum WikilinkResolution {
 }
 
 #[derive(Debug, Clone)]
-pub struct KnowledgeTag {
-    pub name: String,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResolvedHeading {
     pub text: String,
     pub level: u8,
@@ -37,6 +31,7 @@ pub struct OutgoingLink {
     pub alias: Option<String>,
     pub block_id: BlockId,
     pub is_wikilink: bool,
+    pub context_snippet: String,
 }
 
 #[derive(Debug, Clone)]
@@ -52,12 +47,6 @@ pub struct KnowledgeIndex {
     pub tag_to_paths: BTreeMap<String, BTreeSet<String>>,
     // path -> set of tags (lowercase) contained in that document
     pub path_to_tags: HashMap<String, HashSet<String>>,
-
-    // Target path -> Set of source paths that link to it
-    // Note: The target path here is fully resolved
-
-    // path -> all raw target links (unresolved) extracted from it
-    pub path_to_outlinks: HashMap<String, Vec<OutgoingLink>>,
 
     // Basename (lowercase) -> Set of full paths with that basename
     // Used for wikilink resolution
@@ -88,48 +77,44 @@ impl KnowledgeIndex {
     ) {
         // First remove existing data for this path to handle updates cleanly
         self.remove_document(path);
-        
+
         let mut doc_headings = Vec::new();
         let mut doc_tags = BTreeSet::new();
         let mut doc_outlinks = Vec::new();
-        
+
         let mut heading_counts: HashMap<String, usize> = HashMap::new();
 
         for (block_id, index) in blocks {
             for h in &index.headings {
-                let text_lower = h.text.to_lowercase();
-                let count = heading_counts.entry(text_lower.clone()).or_insert(0);
+                let count = heading_counts.entry(h.text.to_lowercase()).or_insert(0);
                 *count += 1;
-                
-                let anchor = if *count == 1 {
-                    text_lower.replace(' ', "-")
-                } else {
-                    format!("{}-{}", text_lower.replace(' ', "-"), count)
-                };
-                
+
                 doc_headings.push(ResolvedHeading {
                     text: h.text.clone(),
                     level: h.level,
                     block_id: *block_id,
                     line: h.line,
-                    anchor,
+                    anchor: heading_anchor(&h.text, *count),
                 });
             }
-            
+
             for t in &index.tags {
                 let tag_lower = t.tag.to_lowercase();
                 doc_tags.insert(tag_lower.clone());
-                self.tag_to_paths.entry(tag_lower).or_default().insert(path.to_string());
+                self.tag_to_paths
+                    .entry(tag_lower)
+                    .or_default()
+                    .insert(path.to_string());
             }
-            
-            
+
             for m in &index.md_links {
                 if m.target.ends_with(".md") {
                     doc_outlinks.push(OutgoingLink {
                         target_raw: m.target.clone(),
-                        alias: m.title.clone(),
+                        alias: Some(m.label.clone()),
                         block_id: *block_id,
                         is_wikilink: false,
+                        context_snippet: m.label.clone(),
                     });
                 }
             }
@@ -139,24 +124,28 @@ impl KnowledgeIndex {
                     alias: w.alias.clone(),
                     block_id: *block_id,
                     is_wikilink: true,
+                    context_snippet: w.alias.clone().unwrap_or_else(|| w.target.clone()),
                 });
-                
-
             }
-            
-            // Standard relative markdown links ending in .md
-            // Note: We don't have standard links parsed in MarkdownIndex yet, only wikilinks.
-            // The prompt says: "Support at minimum: [[wikilinks]], existing safe relative Markdown links ending in .md"
-            // Let's rely on wikilinks primarily, but we might need to add md link parsing to core if needed.
         }
-        
-        self.path_to_tags.insert(path.to_string(), doc_tags.into_iter().collect());
-        
-        self.path_to_doc.insert(path.to_string(), DocumentKnowledge {
-            headings: doc_headings,
-            tags: self.path_to_tags.get(path).unwrap().iter().cloned().collect(),
-            outgoing_links: doc_outlinks,
-        });
+
+        self.path_to_tags
+            .insert(path.to_string(), doc_tags.into_iter().collect());
+
+        self.path_to_doc.insert(
+            path.to_string(),
+            DocumentKnowledge {
+                headings: doc_headings,
+                tags: self
+                    .path_to_tags
+                    .get(path)
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect(),
+                outgoing_links: doc_outlinks,
+            },
+        );
     }
 
     pub fn remove_document(&mut self, path: &str) {
@@ -171,20 +160,8 @@ impl KnowledgeIndex {
                 }
             }
         }
-        
+
         self.path_to_doc.remove(path);
-        
-        // Backlinks are computed dynamically now.
-
-
-
-        // Wait, backlinks relies on the `backlinks` map which was populated during `index_document` of the source.
-        // If a target doc is deleted, we must remove it from `basename_to_paths` (via remove_path),
-        // which makes `resolve_wikilink` fail.
-        // However, the `backlinks` map stores `target_path -> sources`.
-        // If the target is deleted, should it disappear from `backlinks`?
-        // Let's just rely on `backlinks` but filter when querying if the target exists, or clear it.
-        // We will remove it from `basename_to_paths` in `remove_path`.
     }
 
     pub fn remove_path(&mut self, path: &str) {
@@ -240,6 +217,14 @@ impl KnowledgeIndex {
         WikilinkResolution::Unresolved
     }
 
+    pub fn resolve_markdown_link(&self, source_path: &str, target_raw: &str) -> WikilinkResolution {
+        match crate::markdown_render::resolve_workspace_path(target_raw, source_path) {
+            Some(path) if self.path_exists(&path) => WikilinkResolution::Resolved(path),
+            Some(_) => WikilinkResolution::Unresolved,
+            None => WikilinkResolution::Unresolved,
+        }
+    }
+
     fn path_exists(&self, path: &str) -> bool {
         // The path exists if we've seen its basename in the index
         if let Some(basename) = path.split('/').last() {
@@ -252,55 +237,41 @@ impl KnowledgeIndex {
 
     pub fn get_backlinks(&self, target_path: &str) -> Vec<Backlink> {
         let mut result = Vec::new();
-        let target_basename = target_path.split('/').last().unwrap_or(target_path).to_lowercase();
-        
         for (source_path, doc) in &self.path_to_doc {
-            if source_path == target_path { continue; }
+            if source_path == target_path {
+                continue;
+            }
             for link in &doc.outgoing_links {
                 let mut matches = false;
                 if link.is_wikilink {
                     let resolved = self.resolve_wikilink(source_path, &link.target_raw);
                     if let WikilinkResolution::Resolved(rp) = resolved {
-                        if rp == target_path { matches = true; }
-                    }
-                } else {
-                    // Standard markdown link ending in .md
-                    // In a real local-first workspace, resolve relative to source
-                    let mut is_match = false;
-                    if link.target_raw.starts_with('/') {
-                        let abs = link.target_raw[1..].to_string();
-                        if abs == target_path { is_match = true; }
-                    } else if let Some(slash_idx) = source_path.rfind('/') {
-                        let prefix = &source_path[..slash_idx];
-                        // Simplistic relative resolution
-                        let mut segments: Vec<&str> = prefix.split('/').collect();
-                        for seg in link.target_raw.split('/') {
-                            if seg == ".." {
-                                segments.pop();
-                            } else if seg != "." && !seg.is_empty() {
-                                segments.push(seg);
-                            }
+                        if rp == target_path {
+                            matches = true;
                         }
-                        let abs = segments.join("/");
-                        if abs == target_path { is_match = true; }
-                    } else {
-                        if link.target_raw == target_path { is_match = true; }
                     }
-                    if is_match { matches = true; }
+                } else if let WikilinkResolution::Resolved(path) =
+                    self.resolve_markdown_link(source_path, &link.target_raw)
+                {
+                    matches = path == target_path;
                 }
-                
+
                 if matches {
-                    let source_name = source_path.split('/').last().unwrap_or(source_path).to_string();
+                    let source_name = source_path
+                        .split('/')
+                        .last()
+                        .unwrap_or(source_path)
+                        .to_string();
                     result.push(Backlink {
                         source_path: source_path.clone(),
                         source_name,
-                        context_snippet: None, // Context extraction logic would go here
+                        context_snippet: Some(link.context_snippet.clone()),
                     });
                     break; // one backlink per source
                 }
             }
         }
-        
+
         result.sort_by(|a, b| a.source_name.cmp(&b.source_name));
         result
     }
@@ -314,6 +285,49 @@ impl KnowledgeIndex {
         result.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         result
     }
+}
+
+pub fn heading_anchor(text: &str, occurrence: usize) -> String {
+    let slug = text
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    if occurrence > 1 {
+        format!("{}-{}", slug, occurrence)
+    } else {
+        slug
+    }
+}
+
+pub fn propose_missing_note(source_path: &str, target_raw: &str) -> Option<String> {
+    let target = target_raw.trim();
+    if target.is_empty() || target.starts_with('/') || target.contains("..") {
+        return None;
+    }
+    let target = if target.to_lowercase().ends_with(".md") {
+        target.to_string()
+    } else {
+        format!("{}.md", target)
+    };
+    let candidate = if target.contains('/') {
+        target
+    } else if let Some((folder, _)) = source_path.rsplit_once('/') {
+        format!("{}/{}", folder, target)
+    } else {
+        target
+    };
+    let path = WorkspacePath::new(&candidate).ok()?;
+    let normalized = path.as_str();
+    if normalized.starts_with('.')
+        || normalized.contains("/.")
+        || normalized == ".inkstone"
+        || normalized.starts_with(".inkstone/")
+    {
+        return None;
+    }
+    Some(normalized.to_string())
 }
 
 #[cfg(test)]
@@ -341,7 +355,10 @@ mod tests {
         let mut idx = KnowledgeIndex::new();
         idx.register_path("Projects/Secret/Target.md");
         let res = idx.resolve_wikilink("Notes/Source.md", "Target");
-        assert_eq!(res, WikilinkResolution::Resolved("Projects/Secret/Target.md".into()));
+        assert_eq!(
+            res,
+            WikilinkResolution::Resolved("Projects/Secret/Target.md".into())
+        );
     }
 
     #[test]
@@ -369,11 +386,11 @@ mod tests {
     #[test]
     fn test_index_document_tags_and_backlinks() {
         use inkstone_core::markdown::{HeadingRef, MarkdownIndex, TagRef, WikiLink};
-        
+
         let mut idx = KnowledgeIndex::new();
         idx.register_path("Notes/Source.md");
         idx.register_path("Notes/Target.md");
-        
+
         let block_id = BlockId::new_v4();
         let md_index = MarkdownIndex {
             wikilinks: vec![WikiLink {
@@ -382,43 +399,88 @@ mod tests {
                 line: 1,
                 col: 1,
             }],
-            md_links: vec![], embeds: vec![],
+            md_links: vec![],
+            embeds: vec![],
             tags: vec![
-                TagRef { tag: "Rust".to_string(), line: 2, col: 1 },
-                TagRef { tag: "rust".to_string(), line: 2, col: 10 },
+                TagRef {
+                    tag: "Rust".to_string(),
+                    line: 2,
+                    col: 1,
+                },
+                TagRef {
+                    tag: "rust".to_string(),
+                    line: 2,
+                    col: 10,
+                },
             ],
             headings: vec![
-                HeadingRef { level: 1, text: "Title".to_string(), line: 3 },
-                HeadingRef { level: 2, text: "Title".to_string(), line: 4 },
+                HeadingRef {
+                    level: 1,
+                    text: "Title".to_string(),
+                    line: 3,
+                },
+                HeadingRef {
+                    level: 2,
+                    text: "Title".to_string(),
+                    line: 4,
+                },
             ],
             has_code_block: false,
         };
-        
+
         idx.index_document("Notes/Source.md", &[(block_id, md_index)]);
-        
+
         // Tags
         let doc_tags = &idx.path_to_doc.get("Notes/Source.md").unwrap().tags;
         assert_eq!(doc_tags.len(), 1); // Deduplicated "rust"
         assert_eq!(doc_tags[0], "rust");
-        
+
         let paths_with_rust = idx.tag_to_paths.get("rust").unwrap();
         assert_eq!(paths_with_rust.len(), 1);
         assert!(paths_with_rust.contains("Notes/Source.md"));
-        
+
         // Headings
         let headings = &idx.path_to_doc.get("Notes/Source.md").unwrap().headings;
         assert_eq!(headings.len(), 2);
         assert_eq!(headings[0].anchor, "title");
         assert_eq!(headings[1].anchor, "title-2"); // Duplicate anchor uniqueness
-        
+
         // Backlinks
         let backlinks = idx.get_backlinks("Notes/Target.md");
         assert_eq!(backlinks.len(), 1);
         assert_eq!(backlinks[0].source_path, "Notes/Source.md");
-        
+
         // Remove document (deletion/rename rebuild)
         idx.remove_document("Notes/Source.md");
         assert!(!idx.tag_to_paths.contains_key("rust"));
         assert_eq!(idx.get_backlinks("Notes/Target.md").len(), 0);
+    }
+
+    #[test]
+    fn test_missing_note_proposal_is_safe() {
+        assert_eq!(
+            propose_missing_note("Notes/Source.md", "Target"),
+            Some("Notes/Target.md".into())
+        );
+        assert_eq!(
+            propose_missing_note("Notes/Source.md", "Folder/Target"),
+            Some("Folder/Target.md".into())
+        );
+        assert_eq!(propose_missing_note("Notes/Source.md", "../Escape"), None);
+        assert_eq!(
+            propose_missing_note("Notes/Source.md", ".inkstone/Secret"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_markdown_backlink_has_context() {
+        let mut index = KnowledgeIndex::new();
+        index.register_path("Notes/Source.md");
+        index.register_path("Notes/Target.md");
+        let parsed = inkstone_core::markdown::parse_markdown("[Visible label](Target.md)");
+        index.index_document("Notes/Source.md", &[(BlockId::new_v4(), parsed)]);
+        let links = index.get_backlinks("Notes/Target.md");
+        assert_eq!(links[0].context_snippet.as_deref(), Some("Visible label"));
     }
 }

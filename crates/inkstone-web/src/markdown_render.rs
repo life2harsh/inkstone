@@ -30,7 +30,11 @@ pub fn render_to_html(text: &str, current_path: &str) -> String {
     process_html(&html, current_path, None)
 }
 
-pub fn render_with_knowledge(text: &str, current_path: &str, knowledge: &crate::knowledge::KnowledgeIndex) -> String {
+pub fn render_with_knowledge(
+    text: &str,
+    current_path: &str,
+    knowledge: &crate::knowledge::KnowledgeIndex,
+) -> String {
     let mut options = Options::default();
     options.render.unsafe_ = false;
     options.extension.strikethrough = true;
@@ -176,43 +180,48 @@ fn parent_folder(path: &str) -> Option<String> {
     }
 }
 
-fn process_html(html_input: &str, current_path: &str, knowledge: Option<&crate::knowledge::KnowledgeIndex>) -> String {
+fn process_html(
+    html_input: &str,
+    current_path: &str,
+    knowledge: Option<&crate::knowledge::KnowledgeIndex>,
+) -> String {
     // 1. Process headings for deterministic anchors
-    let mut heading_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let re_headings = Regex::new(r#"(?i)<h([1-6])([^>]*)>(.*?)</h[1-6]>"#).expect("invalid heading regex");
-    let html_headings = re_headings.replace_all(html_input, |caps: &regex::Captures| {
-        let level = &caps[1];
-        let mut attrs = caps[2].to_string();
-        let inner_html = &caps[3];
+    let mut heading_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let re_headings =
+        Regex::new(r#"(?i)<h([1-6])([^>]*)>(.*?)</h[1-6]>"#).expect("invalid heading regex");
+    let html_headings = re_headings
+        .replace_all(html_input, |caps: &regex::Captures| {
+            let level = &caps[1];
+            let mut attrs = caps[2].to_string();
+            let inner_html = &caps[3];
 
-        let text_re = Regex::new(r#"<[^>]+>"#).unwrap();
-        let plain_text = text_re.replace_all(inner_html, "").to_string();
-        let text_lower = plain_text.to_lowercase();
-        
-        let count = heading_counts.entry(text_lower.clone()).or_insert(0);
-        *count += 1;
+            let text_re = Regex::new(r#"<[^>]+>"#).unwrap();
+            let plain_text = text_re.replace_all(inner_html, "").to_string();
+            let count = heading_counts.entry(plain_text.to_lowercase()).or_insert(0);
+            *count += 1;
+            let anchor = crate::knowledge::heading_anchor(&plain_text, *count);
 
-        let anchor = if *count == 1 {
-            text_lower.replace(' ', "-")
-        } else {
-            format!("{}-{}", text_lower.replace(' ', "-"), count)
-        };
+            let id_re = Regex::new(r#"(?i)id\s*=\s*"[^"]*""#).unwrap();
+            attrs = id_re.replace_all(&attrs, "").to_string();
 
-        let id_re = Regex::new(r#"(?i)id\s*=\s*"[^"]*""#).unwrap();
-        attrs = id_re.replace_all(&attrs, "").to_string();
-
-        format!("<h{} id=\"{}\"{}>{}</h{}>", level, anchor, attrs, inner_html, level)
-    }).to_string();
+            format!(
+                "<h{} id=\"{}\"{}>{}</h{}>",
+                level, anchor, attrs, inner_html, level
+            )
+        })
+        .to_string();
 
     // 2. Process links
-    let re_links = Regex::new(r#"(<a[^>]*?href\s*=\s*")([^"]*)(")([^>]*)(>)"#).expect("invalid link regex");
+    let re_links =
+        Regex::new(r#"(<a[^>]*?href\s*=\s*")([^"]*)(")([^>]*)(>)"#).expect("invalid link regex");
     re_links.replace_all(&html_headings, |caps: &regex::Captures| {
         let prefix = &caps[1];
         let href = &caps[2];
         let href_close = &caps[3];
         let suffix_rest = &caps[4];
         let gt = &caps[5];
-        
+
         let is_wikilink = suffix_rest.contains("data-wikilink=\"true\"");
 
         if is_wikilink {
@@ -221,7 +230,7 @@ fn process_html(html_input: &str, current_path: &str, knowledge: Option<&crate::
                 match resolved {
                     crate::knowledge::WikilinkResolution::Resolved(target_path) => {
                         format!("{}#{} class=\"wikilink\" data-workspace-path=\"{}\"{}{}", 
-                            prefix, href_close, target_path, suffix_rest, gt)
+                            prefix, href_close, escape_attr(&target_path), suffix_rest, gt)
                     }
                     crate::knowledge::WikilinkResolution::Ambiguous(_) => {
                         format!("{}#{} class=\"wikilink ambiguous\" title=\"Ambiguous wikilink\"{}{}", 
@@ -229,12 +238,12 @@ fn process_html(html_input: &str, current_path: &str, knowledge: Option<&crate::
                     }
                     crate::knowledge::WikilinkResolution::Unresolved => {
                         format!("{}#{} class=\"wikilink missing\" data-missing-target=\"{}\"{}{}", 
-                            prefix, href_close, href, suffix_rest, gt)
+                            prefix, href_close, escape_attr(href), suffix_rest, gt)
                     }
                 }
             } else {
                 format!("{}#{} class=\"wikilink missing\" data-missing-target=\"{}\"{}{}", 
-                    prefix, href_close, href, suffix_rest, gt)
+                    prefix, href_close, escape_attr(href), suffix_rest, gt)
             }
         } else {
             let kind = classify_link(href);
@@ -243,7 +252,7 @@ fn process_html(html_input: &str, current_path: &str, knowledge: Option<&crate::
                     if let Some(resolved) = resolve_workspace_path(href, current_path) {
                         format!(
                             "{}#{} data-workspace-path=\"{}\"{}{}",
-                            prefix, href_close, resolved, suffix_rest, gt
+                            prefix, href_close, escape_attr(&resolved), suffix_rest, gt
                         )
                     } else {
                         format!("{}{}{}{}{}", prefix, href, href_close, suffix_rest, gt)
@@ -268,6 +277,14 @@ fn process_html(html_input: &str, current_path: &str, knowledge: Option<&crate::
         }
     })
     .to_string()
+}
+
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub fn classify_and_resolve(href: &str, current_path: &str) -> LinkInfo {
@@ -315,6 +332,28 @@ mod tests {
         let html = render_to_html("# Hello\n", "note.md");
         assert!(html.contains("<h1 id=\"hello\">"));
         assert!(html.contains("Hello"));
+    }
+
+    #[test]
+    fn test_duplicate_heading_anchors_use_shared_algorithm() {
+        let html = render_to_html("## Road Map\n## Road Map\n", "note.md");
+        assert!(html.contains("id=\"road-map\""));
+        assert!(html.contains("id=\"road-map-2\""));
+    }
+
+    #[test]
+    fn test_wikilink_render_states_and_alias() {
+        let mut knowledge = crate::knowledge::KnowledgeIndex::new();
+        knowledge.register_path("Notes/Target.md");
+        let resolved = render_with_knowledge("[[Target|Alias]]", "Notes/Source.md", &knowledge);
+        assert!(resolved.contains(">Alias</a>"));
+        assert!(resolved.contains("data-workspace-path=\"Notes/Target.md\""));
+        let missing = render_with_knowledge("[[Missing]]", "Notes/Source.md", &knowledge);
+        assert!(missing.contains("wikilink missing"));
+        knowledge.register_path("A/Dup.md");
+        knowledge.register_path("B/Dup.md");
+        let ambiguous = render_with_knowledge("[[Dup]]", "Notes/Source.md", &knowledge);
+        assert!(ambiguous.contains("wikilink ambiguous"));
     }
 
     #[test]
@@ -382,7 +421,11 @@ mod tests {
 
     #[test]
     fn test_internal_link_exact_anchor() {
-        let html = process_html("<a href=\"Roadmap.md\">Roadmap</a>", "Projects/Inkstone.md", None);
+        let html = process_html(
+            "<a href=\"Roadmap.md\">Roadmap</a>",
+            "Projects/Inkstone.md",
+            None,
+        );
         assert_eq!(
             html,
             "<a href=\"#\" data-workspace-path=\"Projects/Roadmap.md\">Roadmap</a>"
@@ -391,7 +434,11 @@ mod tests {
 
     #[test]
     fn test_external_link_exact_anchor() {
-        let html = process_html("<a href=\"https://example.com\">Example</a>", "note.md", None);
+        let html = process_html(
+            "<a href=\"https://example.com\">Example</a>",
+            "note.md",
+            None,
+        );
         assert_eq!(
             html,
             "<a href=\"https://example.com\" target=\"_blank\" rel=\"noopener noreferrer\">Example</a>"
@@ -415,7 +462,8 @@ mod tests {
         let html = process_html(
             "<a href=\"data:text/html, <script>alert(1, None)</script>\">x</a>",
             "note.md",
-        None);
+            None,
+        );
         assert_eq!(html, "<a href=\"#\">x</a>");
     }
 
@@ -435,7 +483,11 @@ mod tests {
 
     #[test]
     fn test_internal_workspace_path_is_anchor_attribute() {
-        let html = process_html("<a href=\"Roadmap.md\">Roadmap</a>", "Projects/Inkstone.md", None);
+        let html = process_html(
+            "<a href=\"Roadmap.md\">Roadmap</a>",
+            "Projects/Inkstone.md",
+            None,
+        );
         // data-workspace-path must be inside the opening <a> tag before >
         assert!(html.contains("data-workspace-path=\"Projects/Roadmap.md\""));
         // The text content must NOT contain the attribute value
@@ -448,7 +500,11 @@ mod tests {
 
     #[test]
     fn test_external_target_rel_are_anchor_attributes() {
-        let html = process_html("<a href=\"https://example.com\">Example</a>", "note.md", None);
+        let html = process_html(
+            "<a href=\"https://example.com\">Example</a>",
+            "note.md",
+            None,
+        );
         assert!(html.contains("target=\"_blank\""));
         assert!(html.contains("rel=\"noopener noreferrer\""));
         // target and rel must be before closing >
@@ -463,8 +519,10 @@ mod tests {
     #[test]
     fn test_invalid_traversal_no_workspace_path() {
         let html = process_html(
-            "<a href=\"../../../Outside.md\">outside</a>", "Projects/Inkstone.md",
-         None);
+            "<a href=\"../../../Outside.md\">outside</a>",
+            "Projects/Inkstone.md",
+            None,
+        );
         // Must NOT have data-workspace-path — traversal above root was rejected
         assert!(!html.contains("data-workspace-path"));
         // href must remain unchanged (not replaced with workspace path)
@@ -475,7 +533,11 @@ mod tests {
 
     #[test]
     fn test_invalid_workspace_path_no_data_attribute() {
-        let html = process_html("<a href=\"/etc/passwd\">abs</a>", "Projects/Inkstone.md", None);
+        let html = process_html(
+            "<a href=\"/etc/passwd\">abs</a>",
+            "Projects/Inkstone.md",
+            None,
+        );
         // Absolute path rejected by WorkspacePath — no data-workspace-path
         assert!(!html.contains("data-workspace-path"));
         assert!(html.contains("href=\"/etc/passwd\""));
@@ -535,7 +597,11 @@ mod tests {
         assert!(matches!(info.kind, LinkKind::Other));
         assert!(info.resolved_path.is_none());
         // process_links must not emit data-workspace-path
-        let html = process_html("<a href=\"custom-scheme:Note.md\">link</a>", "note.md", None);
+        let html = process_html(
+            "<a href=\"custom-scheme:Note.md\">link</a>",
+            "note.md",
+            None,
+        );
         assert!(!html.contains("data-workspace-path"));
     }
 
@@ -560,7 +626,11 @@ mod tests {
         let info = classify_and_resolve("x:Note.md", "Projects/Current.md");
         assert!(matches!(info.kind, LinkKind::Other));
         assert!(info.resolved_path.is_none());
-        let html = process_html("<a href=\"x:Note.md\">link</a>", "Projects/Current.md", None);
+        let html = process_html(
+            "<a href=\"x:Note.md\">link</a>",
+            "Projects/Current.md",
+            None,
+        );
         assert!(!html.contains("data-workspace-path"));
         assert!(html.contains("href=\"x:Note.md\""));
     }
@@ -679,7 +749,11 @@ mod tests {
     fn test_mixed_case_http_external() {
         let info = classify_and_resolve("Http://Example.Com/Page.md", "note.md");
         assert!(matches!(info.kind, LinkKind::ExternalHttp));
-        let html = process_html("<a href=\"Http://Example.Com/Page.md\">x</a>", "note.md", None);
+        let html = process_html(
+            "<a href=\"Http://Example.Com/Page.md\">x</a>",
+            "note.md",
+            None,
+        );
         assert!(html.contains("target=\"_blank\""));
         assert!(html.contains("rel=\"noopener noreferrer\""));
         assert!(!html.contains("data-workspace-path"));

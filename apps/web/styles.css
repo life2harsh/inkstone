@@ -945,6 +945,11 @@ body {
   color: #c53030;
   text-decoration: underline dashed;
 }
+.link-item.ambiguous, .wikilink.ambiguous { color: #9c5b00; text-decoration: underline dotted; }
+.wikilink { font-weight: 500; }
+.wikilink.missing { color: #c53030; text-decoration: underline dashed; }
+.outline-item.active { color: var(--accent-blue); font-weight: 600; background: rgba(44, 82, 130, 0.08); }
+.backlink-context { color: var(--text-muted); font-size: 11px; white-space: pre-line; margin-top: 2px; }
 
 .tag-item {
   display: flex;
@@ -1016,9 +1021,9 @@ body {
     top: 0;
     right: 0;
     bottom: 0;
-    width: 250px;
+    width: min(280px, 85vw);
     z-index: 100;
-    background: var(--bg-color);
+    background: var(--bg-sidebar);
     box-shadow: -2px 0 5px rgba(0,0,0,0.1);
   }
 }

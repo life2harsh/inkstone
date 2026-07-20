@@ -1,7 +1,16 @@
 #[derive(Clone)]
 pub struct PendingSelection {
     pub path: String,
+    pub doc_id: DocId,
     pub revision: u64,
+}
+
+#[derive(Clone)]
+pub struct MissingNoteRequest {
+    pub raw_target: String,
+    pub proposed_path: String,
+    pub source_path: String,
+    pub resolution: knowledge::WikilinkResolution,
 }
 
 pub mod explorer;
@@ -59,10 +68,11 @@ pub struct DriverInner {
     pub recent_notes: Vec<String>,
     pub knowledge: knowledge::KnowledgeIndex,
     pub knowledge_tab: String,
-pub inspector_open: bool,
+    pub inspector_open: bool,
     pub selection_revision: u64,
     pub pending_selection: Option<PendingSelection>,
     pub recent_notes_revision: u64,
+    pub missing_note: Option<MissingNoteRequest>,
 }
 
 #[derive(Clone)]
@@ -97,10 +107,11 @@ impl Driver {
             recent_notes: Vec::new(),
             knowledge: knowledge::KnowledgeIndex::new(),
             knowledge_tab: "Outline".to_string(),
-inspector_open: false,
+            inspector_open: false,
             selection_revision: 0,
             pending_selection: None,
             recent_notes_revision: 0,
+            missing_note: None,
         })))
     }
 
@@ -109,7 +120,7 @@ inspector_open: false,
         let is_markdown = path_str.to_lowercase().ends_with(".md")
             && !path_str.starts_with('.')
             && !path_str.contains("/.");
-            
+
         let selection_rev = {
             let mut inner = self.0.borrow_mut();
             inner.selection_revision += 1;
@@ -151,6 +162,7 @@ inspector_open: false,
                         let mut inner = this.0.borrow_mut();
                         inner.pending_selection = Some(PendingSelection {
                             path: path_str.clone(),
+                            doc_id: DocId(existing_id),
                             revision: selection_rev,
                         });
                     }
@@ -176,6 +188,7 @@ inspector_open: false,
                         let mut inner = this.0.borrow_mut();
                         inner.pending_selection = Some(PendingSelection {
                             path: path_str.clone(),
+                            doc_id,
                             revision: selection_rev,
                         });
                     }
@@ -420,6 +433,39 @@ inspector_open: false,
         }
     }
 
+    fn request_missing_note(&self, raw_target: &str, source_path: &str) {
+        let (resolution, proposal) = {
+            let inner = self.0.borrow();
+            let resolution = inner.knowledge.resolve_wikilink(source_path, raw_target);
+            (
+                resolution,
+                knowledge::propose_missing_note(source_path, raw_target),
+            )
+        };
+        let proposed_path = match (&resolution, proposal) {
+            (knowledge::WikilinkResolution::Unresolved, Some(path)) => path,
+            (knowledge::WikilinkResolution::Ambiguous(_), _) => {
+                self.0.borrow_mut().link_message =
+                    Some(format!("Ambiguous note link: {}", raw_target));
+                self.render();
+                return;
+            }
+            _ => {
+                self.0.borrow_mut().link_message =
+                    Some(format!("Cannot create note: {}", raw_target));
+                self.render();
+                return;
+            }
+        };
+        self.0.borrow_mut().missing_note = Some(MissingNoteRequest {
+            raw_target: raw_target.to_string(),
+            proposed_path,
+            source_path: source_path.to_string(),
+            resolution,
+        });
+        self.render();
+    }
+
     fn refresh_entries(&self) {
         let ws = match self.0.borrow().workspace_db.clone() {
             Some(w) => w,
@@ -475,7 +521,8 @@ inspector_open: false,
                     }
                     Err(e) => {
                         this.0.borrow_mut().search_indexing = false;
-                        this.0.borrow_mut().storage_error = Some(format!("Search index fail-closed (db open): {:?}", e));
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Search index fail-closed (db open): {:?}", e));
                         this.render();
                         return;
                     }
@@ -492,7 +539,7 @@ inspector_open: false,
                 .collect();
 
             let mut search_docs = Vec::new();
-            
+
             // Rebuild knowledge index completely from scratch
             let mut new_knowledge = knowledge::KnowledgeIndex::new();
             // First pass: register all paths for wikilink resolution
@@ -524,26 +571,35 @@ inspector_open: false,
                             Ok(record) => {
                                 let mut doc = record.confirmed_doc;
                                 for update in record.pending_updates {
-                                    if let Err(e) = inkstone_core::doc_ops::apply_update(&mut doc, update) {
-                                        this.0.borrow_mut().storage_error = Some(format!("Search index fail-closed (apply_update): {:?}", e));
+                                    if let Err(e) =
+                                        inkstone_core::doc_ops::apply_update(&mut doc, update)
+                                    {
+                                        this.0.borrow_mut().storage_error = Some(format!(
+                                            "Search index fail-closed (apply_update): {:?}",
+                                            e
+                                        ));
                                         this.0.borrow_mut().search_indexing = false;
                                         this.render();
                                         return;
                                     }
                                 }
                                 title = doc.title.clone();
-                                md_blocks_for_knowledge = inkstone_core::markdown::index_document_blocks(&doc);
+                                md_blocks_for_knowledge =
+                                    inkstone_core::markdown::index_document_blocks(&doc);
                                 for block in doc.blocks {
-                                    if let inkstone_core::document::BlockContent::Markdown { text } =
-                                        block.content
+                                    if let inkstone_core::document::BlockContent::Markdown {
+                                        text,
+                                    } = block.content
                                     {
                                         blocks.push(text);
                                     }
                                 }
                             }
                             Err(e) => {
-                                this.0.borrow_mut().storage_error =
-                                    Some(format!("Search index fail-closed (deserialize): {:?}", e));
+                                this.0.borrow_mut().storage_error = Some(format!(
+                                    "Search index fail-closed (deserialize): {:?}",
+                                    e
+                                ));
                                 this.0.borrow_mut().search_indexing = false;
                                 this.render();
                                 return;
@@ -551,8 +607,10 @@ inspector_open: false,
                         },
                         Ok(None) => {}
                         Err(e) => {
-                            this.0.borrow_mut().storage_error =
-                                Some(format!("Search index fail-closed (get_document_record): {:?}", e));
+                            this.0.borrow_mut().storage_error = Some(format!(
+                                "Search index fail-closed (get_document_record): {:?}",
+                                e
+                            ));
                             this.0.borrow_mut().search_indexing = false;
                             this.render();
                             return;
@@ -567,7 +625,7 @@ inspector_open: false,
                     title,
                     blocks,
                 });
-                
+
                 new_knowledge.index_document(&path, &md_blocks_for_knowledge);
             }
 
@@ -599,10 +657,13 @@ inspector_open: false,
                 }
                 inner.search_documents[pos].title = effective_doc.title.clone();
                 inner.search_documents[pos].blocks = blocks;
-                
-                let md_blocks_for_knowledge = inkstone_core::markdown::index_document_blocks(&effective_doc);
-                inner.knowledge.index_document(path, &md_blocks_for_knowledge);
-                
+
+                let md_blocks_for_knowledge =
+                    inkstone_core::markdown::index_document_blocks(&effective_doc);
+                inner
+                    .knowledge
+                    .index_document(path, &md_blocks_for_knowledge);
+
                 !inner.search_query.trim().is_empty()
             } else {
                 false
@@ -710,15 +771,16 @@ inspector_open: false,
     fn clean_and_set_recent_notes(&self, mut recents: Vec<String>) {
         let valid_paths: std::collections::HashSet<String> = {
             let inner = self.0.borrow();
-            inner.entries.iter()
+            inner
+                .entries
+                .iter()
                 .filter(|e| e.kind == WorkspaceEntryKind::Markdown)
                 .map(|e| e.path.as_str().to_string())
                 .collect()
         };
-        
-        let old_len = recents.len();
+
         let old_recents = recents.clone();
-        
+
         let mut i = 0;
         let mut seen = std::collections::HashSet::new();
         while i < recents.len() {
@@ -727,20 +789,20 @@ inspector_open: false,
                 && path.to_lowercase().ends_with(".md")
                 && !path.starts_with('.')
                 && !path.contains("/.");
-                
+
             if !is_valid || !seen.insert(path.clone()) {
                 recents.remove(i);
             } else {
                 i += 1;
             }
         }
-        
+
         if recents.len() > 8 {
             recents.truncate(8);
         }
-        
+
         let changed = recents != old_recents;
-        
+
         if changed {
             let ws = self.0.borrow().workspace_db.clone();
             let this = self.clone();
@@ -773,11 +835,11 @@ inspector_open: false,
         }
     }
 
-    fn process_pending_recent(&self) {
+    fn complete_pending_recent(&self, doc_id: DocId) {
         let (path, rev) = {
             let mut inner = self.0.borrow_mut();
             if let Some(pending) = inner.pending_selection.take() {
-                if pending.revision == inner.selection_revision {
+                if pending.revision == inner.selection_revision && pending.doc_id == doc_id {
                     (pending.path, pending.revision)
                 } else {
                     return;
@@ -789,96 +851,32 @@ inspector_open: false,
         self.add_recent_note(&path, rev);
     }
 
-    fn normalize_recent_notes(&self) {
-        let (mut recents, valid_paths) = {
-            let inner = self.0.borrow();
-            let mut valid = std::collections::HashSet::new();
-            for e in &inner.entries {
-                valid.insert(e.path.as_str().to_string());
-            }
-            (inner.recent_notes.clone(), valid)
-        };
-        
-        let old_len = recents.len();
-        let mut i = 0;
-        let mut seen = std::collections::HashSet::new();
-        while i < recents.len() {
-            let path = &recents[i];
-            let is_valid = valid_paths.contains(path)
-                && path.to_lowercase().ends_with(".md")
-                && !path.starts_with('.')
-                && !path.contains("/.");
-                
-            if !is_valid || !seen.insert(path.clone()) {
-                recents.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        
-        if recents.len() > 8 {
-            recents.truncate(8);
-        }
-        
-        let changed = recents.len() != old_len || {
-            let inner = self.0.borrow();
-            recents != inner.recent_notes
-        };
-        
-        if changed {
-            let ws = self.0.borrow().workspace_db.clone();
-            let this = self.clone();
-            let rev = {
-                let mut inner = self.0.borrow_mut();
-                inner.recent_notes_revision += 1;
-                inner.recent_notes_revision
-            };
-            if let Some(ws) = ws {
-                wasm_bindgen_futures::spawn_local(async move {
-                    match ws.save_recent_notes(&recents).await {
-                        Ok(()) => {
-                            let mut inner = this.0.borrow_mut();
-                            if inner.recent_notes_revision == rev {
-                                inner.recent_notes = recents;
-                                drop(inner);
-                                this.render();
-                            }
-                        }
-                        Err(e) => {
-                            this.0.borrow_mut().storage_error =
-                                Some(format!("Failed to normalize recent notes: {:?}", e));
-                            this.render();
-                        }
-                    }
-                });
-            }
-        } else {
-            self.0.borrow_mut().recent_notes = recents;
-        }
-    }
-
     fn add_recent_note(&self, path: &str, revision: u64) {
         let mut inner = self.0.borrow_mut();
         if inner.selection_revision != revision {
             return;
         }
-        
+
         let mut recents = inner.recent_notes.clone();
         recents.retain(|p| p != path);
         recents.insert(0, path.to_string());
         recents.truncate(8);
-        
+
         inner.recent_notes = recents.clone();
-        
+        inner.recent_notes_revision += 1;
+        let recent_revision = inner.recent_notes_revision;
+
         let ws = inner.workspace_db.clone();
         let this = self.clone();
         drop(inner);
-        
+
         if let Some(ws) = ws {
             wasm_bindgen_futures::spawn_local(async move {
                 match ws.save_recent_notes(&recents).await {
                     Ok(()) => {
-                        this.render();
+                        if this.0.borrow().recent_notes_revision == recent_revision {
+                            this.render();
+                        }
                     }
                     Err(e) => {
                         this.0.borrow_mut().storage_error =
@@ -896,15 +894,15 @@ inspector_open: false,
         let rev = {
             let mut inner = self.0.borrow_mut();
             inner.recent_notes_revision += 1;
+            inner.recent_notes.clear();
             inner.recent_notes_revision
         };
         if let Some(ws) = ws {
             wasm_bindgen_futures::spawn_local(async move {
                 match ws.save_recent_notes(&[]).await {
                     Ok(()) => {
-                        let mut inner = this.0.borrow_mut();
+                        let inner = this.0.borrow_mut();
                         if inner.recent_notes_revision == rev {
-                            inner.recent_notes.clear();
                             drop(inner);
                             this.render();
                         }
@@ -970,12 +968,19 @@ inspector_open: false,
             recents.retain(|p| p != path);
             let ws = self.0.borrow().workspace_db.clone();
             let this = self.clone();
+            let rev = {
+                let mut inner = self.0.borrow_mut();
+                inner.recent_notes = recents.clone();
+                inner.recent_notes_revision += 1;
+                inner.recent_notes_revision
+            };
             if let Some(ws) = ws {
                 wasm_bindgen_futures::spawn_local(async move {
                     match ws.save_recent_notes(&recents).await {
                         Ok(()) => {
-                            this.0.borrow_mut().recent_notes = recents;
-                            this.render();
+                            if this.0.borrow().recent_notes_revision == rev {
+                                this.render();
+                            }
                         }
                         Err(e) => {
                             this.0.borrow_mut().storage_error =
@@ -1063,7 +1068,7 @@ inspector_open: false,
                                     confirmed_seq: record.confirmed_seq,
                                     pending_updates: record.pending_updates,
                                 });
-                                this.process_pending_recent();
+                                this.complete_pending_recent(doc_id);
                             }
                             Err(e) => {
                                 let err_str = format!("Parse Error: {:?}", e);
@@ -1082,7 +1087,7 @@ inspector_open: false,
                                 confirmed_seq: 0,
                                 pending_updates: Vec::new(),
                             });
-                            this.process_pending_recent();
+                            this.complete_pending_recent(doc_id);
 
                             let doc_is_empty =
                                 this.0.borrow().client_state.view_doc().blocks.is_empty();
@@ -1366,19 +1371,18 @@ inspector_open: false,
         // Search Input
         let search_container = document.create_element("div").unwrap();
         search_container.set_class_name("search-container");
-        
-        let is_tag_filter_active = inner.tag_filter.is_some();
+
         if let Some(ref tag) = inner.tag_filter {
             let active_tag_div = document.create_element("div").unwrap();
             active_tag_div.set_class_name("active-tag-filter");
-            
+
             let tag_label = document.create_element("span").unwrap();
             tag_label.set_text_content(Some(&format!("#{}", tag)));
-            
+
             let clear_btn = document.create_element("button").unwrap();
             clear_btn.set_class_name("clear-tag-btn");
             clear_btn.set_text_content(Some("×"));
-            
+
             active_tag_div.append_child(&tag_label).unwrap();
             active_tag_div.append_child(&clear_btn).unwrap();
             search_container.append_child(&active_tag_div).unwrap();
@@ -1410,7 +1414,7 @@ inspector_open: false,
         }
         sidebar.append_child(&search_container).unwrap();
 
-        let is_search_active = !inner.search_query.trim().is_empty();
+        let is_search_active = !inner.search_query.trim().is_empty() || inner.tag_filter.is_some();
 
         if !is_search_active && !inner.recent_notes.is_empty() {
             let recent_heading = document.create_element("div").unwrap();
@@ -1468,7 +1472,19 @@ inspector_open: false,
         file_list.set_class_name("file-list");
 
         if is_search_active {
-            if inner.search_results.is_empty() {
+            let tag_paths = inner
+                .tag_filter
+                .as_ref()
+                .and_then(|tag| inner.knowledge.tag_to_paths.get(tag));
+            if inner.search_query.trim().is_empty() && tag_paths.is_some() {
+                for path in tag_paths.unwrap() {
+                    let item_div = document.create_element("div").unwrap();
+                    item_div.set_class_name("search-result-item");
+                    item_div.set_attribute("data-path", path).unwrap();
+                    item_div.set_text_content(Some(path));
+                    file_list.append_child(&item_div).unwrap();
+                }
+            } else if inner.search_results.is_empty() {
                 let empty_results = document.create_element("div").unwrap();
                 empty_results.set_class_name("search-no-results");
                 empty_results.set_text_content(Some("No matching notes"));
@@ -1737,7 +1753,11 @@ inspector_open: false,
                     let toggle_btn = document.create_element("button").unwrap();
                     let toggle_btn: web_sys::HtmlElement = toggle_btn.unchecked_into();
                     toggle_btn.set_class_name("toggle-inspector-btn");
-                    toggle_btn.set_text_content(Some(if inner.inspector_open { "Hide Inspector" } else { "Show Inspector" }));
+                    toggle_btn.set_text_content(Some(if inner.inspector_open {
+                        "Hide Inspector"
+                    } else {
+                        "Show Inspector"
+                    }));
                     mode_bar.append_child(&toggle_btn).unwrap();
                 }
                 editor_container.append_child(&mode_bar).unwrap();
@@ -1754,6 +1774,21 @@ inspector_open: false,
                     dismiss_btn.set_text_content(Some("×"));
                     msg_div.append_child(&dismiss_btn).unwrap();
                     editor_container.append_child(&msg_div).unwrap();
+                }
+                if let Some(request) = &inner.missing_note {
+                    let prompt = document.create_element("div").unwrap();
+                    prompt.set_class_name("link-message missing-note-confirmation");
+                    prompt
+                        .set_text_content(Some(&format!("Note not found: {}", request.raw_target)));
+                    let create = document.create_element("button").unwrap();
+                    create.set_class_name("create-missing-note-btn");
+                    create.set_text_content(Some("Create note"));
+                    let dismiss = document.create_element("button").unwrap();
+                    dismiss.set_class_name("dismiss-missing-note-btn");
+                    dismiss.set_text_content(Some("Dismiss"));
+                    prompt.append_child(&create).unwrap();
+                    prompt.append_child(&dismiss).unwrap();
+                    editor_container.append_child(&prompt).unwrap();
                 }
 
                 if inner.document_mode == DocumentMode::Edit {
@@ -1819,9 +1854,6 @@ inspector_open: false,
                 } else {
                     // ── Preview Mode ─────────────────────────────
                     let mut md = String::new();
-                    if !view_doc.title.is_empty() {
-                        md.push_str(&format!("# {}\n\n", view_doc.title));
-                    }
                     let _block_count = view_doc.blocks.len();
                     for block in &view_doc.blocks {
                         if let inkstone_core::document::BlockContent::Markdown { text } =
@@ -1842,6 +1874,14 @@ inspector_open: false,
                     let preview_div = document.create_element("div").unwrap();
                     preview_div.set_class_name("preview-content");
                     preview_div.set_inner_html(&html);
+                    if !view_doc.title.is_empty() {
+                        let title = document.create_element("h1").unwrap();
+                        title.set_id("document-title");
+                        title.set_text_content(Some(&view_doc.title));
+                        preview_div
+                            .insert_before(&title, preview_div.first_child().as_ref())
+                            .unwrap();
+                    }
                     editor_container.append_child(&preview_div).unwrap();
                 }
 
@@ -1875,10 +1915,10 @@ inspector_open: false,
         } else {
             inspector.set_class_name("inspector");
         }
-        
+
         let tabs_div = document.create_element("div").unwrap();
         tabs_div.set_class_name("inspector-tabs");
-        
+
         for tab_name in &["Outline", "Links", "Tags"] {
             let tab = document.create_element("div").unwrap();
             if &inner.knowledge_tab == tab_name {
@@ -1891,10 +1931,10 @@ inspector_open: false,
             tabs_div.append_child(&tab).unwrap();
         }
         inspector.append_child(&tabs_div).unwrap();
-        
+
         let section = document.create_element("div").unwrap();
         section.set_class_name("inspector-section");
-        
+
         if inner.knowledge_tab == "Outline" {
             if let Some(path) = selected_path {
                 if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
@@ -1902,16 +1942,29 @@ inspector_open: false,
                         let item = document.create_element("div").unwrap();
                         item.set_class_name("outline-item");
                         item.set_text_content(Some(&heading.text));
-                        item.set_attribute("data-heading-line", &heading.line.to_string()).unwrap();
-                        let pad = if heading.level > 0 { (heading.level - 1) * 12 } else { 0 };
-                        item.set_attribute("style", &format!("padding-left: {}px", pad)).unwrap();
+                        item.set_attribute("data-anchor", &heading.anchor).unwrap();
+                        item.set_attribute("data-block-id", &heading.block_id.to_string())
+                            .unwrap();
+                        item.set_attribute("data-heading-line", &heading.line.to_string())
+                            .unwrap();
+                        item.set_attribute("data-heading-level", &heading.level.to_string())
+                            .unwrap();
+                        let pad = if heading.level > 0 {
+                            (heading.level - 1) * 12
+                        } else {
+                            0
+                        };
+                        item.set_attribute("style", &format!("padding-left: {}px", pad))
+                            .unwrap();
                         section.append_child(&item).unwrap();
                     }
                     if knowledge.headings.is_empty() {
                         let empty = document.create_element("div").unwrap();
                         empty.set_class_name("outline-item");
                         empty.set_text_content(Some("No headings"));
-                        empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                        empty
+                            .set_attribute("style", "color: var(--text-muted); cursor: default;")
+                            .unwrap();
                         section.append_child(&empty).unwrap();
                     }
                 }
@@ -1921,22 +1974,39 @@ inspector_open: false,
             let out_header = document.create_element("h4").unwrap();
             out_header.set_text_content(Some("Outgoing Links"));
             section.append_child(&out_header).unwrap();
-            
+
             if let Some(path) = selected_path {
                 if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
                     let mut has_links = false;
                     for outlink in &knowledge.outgoing_links {
                         has_links = true;
                         let item = document.create_element("div").unwrap();
-                        let resolved_path = inner.knowledge.resolve_wikilink(path, &outlink.target_raw);
+                        let resolved_path = if outlink.is_wikilink {
+                            inner.knowledge.resolve_wikilink(path, &outlink.target_raw)
+                        } else {
+                            inner
+                                .knowledge
+                                .resolve_markdown_link(path, &outlink.target_raw)
+                        };
                         if let knowledge::WikilinkResolution::Resolved(resolved) = resolved_path {
                             item.set_class_name("link-item");
-                            item.set_text_content(Some(&outlink.target_raw));
+                            item.set_text_content(Some(
+                                outlink.alias.as_deref().unwrap_or(&outlink.target_raw),
+                            ));
                             item.set_attribute("data-path", &resolved).unwrap();
+                        } else if matches!(
+                            resolved_path,
+                            knowledge::WikilinkResolution::Ambiguous(_)
+                        ) {
+                            item.set_class_name("link-item ambiguous");
+                            item.set_text_content(Some(
+                                outlink.alias.as_deref().unwrap_or(&outlink.target_raw),
+                            ));
                         } else {
                             item.set_class_name("link-item missing");
                             item.set_text_content(Some(&outlink.target_raw));
-                            item.set_attribute("data-missing-target", &outlink.target_raw).unwrap();
+                            item.set_attribute("data-missing-target", &outlink.target_raw)
+                                .unwrap();
                         }
                         section.append_child(&item).unwrap();
                     }
@@ -1944,64 +2014,97 @@ inspector_open: false,
                         let empty = document.create_element("div").unwrap();
                         empty.set_class_name("outline-item");
                         empty.set_text_content(Some("No outgoing links"));
-                        empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                        empty
+                            .set_attribute("style", "color: var(--text-muted); cursor: default;")
+                            .unwrap();
                         section.append_child(&empty).unwrap();
                     }
                 }
             }
-            
+
             // Backlinks
             let back_header = document.create_element("h4").unwrap();
             back_header.set_text_content(Some("Backlinks"));
             section.append_child(&back_header).unwrap();
-            
+
             if let Some(path) = selected_path {
                 let backlinks = inner.knowledge.get_backlinks(path);
                 if backlinks.is_empty() {
                     let empty = document.create_element("div").unwrap();
                     empty.set_class_name("outline-item");
                     empty.set_text_content(Some("No backlinks"));
-                    empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                    empty
+                        .set_attribute("style", "color: var(--text-muted); cursor: default;")
+                        .unwrap();
                     section.append_child(&empty).unwrap();
                 } else {
                     for backlink in backlinks {
                         let item = document.create_element("div").unwrap();
                         item.set_class_name("link-item");
                         item.set_text_content(Some(&backlink.source_name));
-                        item.set_attribute("data-path", &backlink.source_path).unwrap();
+                        item.set_attribute("data-path", &backlink.source_path)
+                            .unwrap();
+                        let detail = document.create_element("div").unwrap();
+                        detail.set_class_name("backlink-context");
+                        detail.set_text_content(Some(&format!(
+                            "{}\n{}",
+                            backlink.source_path,
+                            backlink.context_snippet.unwrap_or_default()
+                        )));
+                        item.append_child(&detail).unwrap();
                         section.append_child(&item).unwrap();
                     }
                 }
             }
         } else if inner.knowledge_tab == "Tags" {
+            let current = selected_path
+                .as_ref()
+                .and_then(|path| inner.knowledge.path_to_tags.get(path));
+            let current_header = document.create_element("h4").unwrap();
+            current_header.set_text_content(Some("Current Note Tags"));
+            section.append_child(&current_header).unwrap();
+            if let Some(tags) = current {
+                for tag in tags {
+                    let item = document.create_element("div").unwrap();
+                    item.set_class_name("tag-item");
+                    item.set_attribute("data-tag", tag).unwrap();
+                    item.set_text_content(Some(&format!("#{}", tag)));
+                    section.append_child(&item).unwrap();
+                }
+            }
+            let workspace_header = document.create_element("h4").unwrap();
+            workspace_header.set_text_content(Some("Workspace Tags"));
+            section.append_child(&workspace_header).unwrap();
             let tags = inner.knowledge.get_all_tags_with_counts();
             if tags.is_empty() {
                 let empty = document.create_element("div").unwrap();
                 empty.set_class_name("outline-item");
                 empty.set_text_content(Some("No tags in workspace"));
-                empty.set_attribute("style", "color: var(--text-muted); cursor: default;").unwrap();
+                empty
+                    .set_attribute("style", "color: var(--text-muted); cursor: default;")
+                    .unwrap();
                 section.append_child(&empty).unwrap();
             } else {
                 for (tag, count) in tags {
                     let item = document.create_element("div").unwrap();
                     item.set_class_name("tag-item");
                     item.set_attribute("data-tag", &tag).unwrap();
-                    
+
                     let name_span = document.create_element("span").unwrap();
                     name_span.set_class_name("tag-name");
                     name_span.set_text_content(Some(&format!("#{}", tag)));
-                    
+
                     let count_span = document.create_element("span").unwrap();
                     count_span.set_class_name("tag-count");
                     count_span.set_text_content(Some(&count.to_string()));
-                    
+
                     item.append_child(&name_span).unwrap();
                     item.append_child(&count_span).unwrap();
                     section.append_child(&item).unwrap();
                 }
             }
         }
-        
+
         inspector.append_child(&section).unwrap();
         app_container.append_child(&inspector).unwrap();
         root.append_child(&app_container).unwrap();
@@ -2059,48 +2162,23 @@ inspector_open: false,
             let _ = el.append_child(&document.create_text_node(text));
             return;
         }
-        let text_lower = text.to_lowercase();
         let query_lower = query.to_lowercase();
         let mut byte_pos: usize = 0;
-        loop {
-            match text_lower[byte_pos..].find(&query_lower) {
-                None => {
-                    // Append the rest
-                    if byte_pos < text.len() {
-                        let _ = el.append_child(&document.create_text_node(&text[byte_pos..]));
-                    }
-                    break;
-                }
-                Some(rel_idx) => {
-                    let abs_idx = byte_pos + rel_idx;
-                    // Text before the match
-                    if abs_idx > byte_pos {
-                        let _ =
-                            el.append_child(&document.create_text_node(&text[byte_pos..abs_idx]));
-                    }
-                    // Find byte length of match in original (may differ from query_lower length for
-                    // some case-folding; use the original string's char boundaries)
-                    // Count chars in query_lower and advance that many chars in original text
-                    let query_char_count = query_lower.chars().count();
-                    let match_end = text[abs_idx..]
-                        .char_indices()
-                        .nth(query_char_count)
-                        .map(|(i, _)| abs_idx + i)
-                        .unwrap_or(text.len());
-                    let matched_slice = &text[abs_idx..match_end];
-                    let mark = match document.create_element("mark") {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    };
-                    mark.set_class_name("search-highlight");
-                    let _ = mark.append_child(&document.create_text_node(matched_slice));
-                    let _ = el.append_child(&mark);
-                    byte_pos = match_end;
-                    if byte_pos >= text.len() {
-                        break;
-                    }
-                }
+        for (start, end) in search::find_case_insensitive_ranges(text, &query_lower) {
+            if start > byte_pos {
+                let _ = el.append_child(&document.create_text_node(&text[byte_pos..start]));
             }
+            let mark = match document.create_element("mark") {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            mark.set_class_name("search-highlight");
+            let _ = mark.append_child(&document.create_text_node(&text[start..end]));
+            let _ = el.append_child(&mark);
+            byte_pos = end;
+        }
+        if byte_pos < text.len() {
+            let _ = el.append_child(&document.create_text_node(&text[byte_pos..]));
         }
     }
 }
@@ -2351,6 +2429,14 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
+        if class == "toggle-inspector-btn" {
+            let mut inner = d_click.0.borrow_mut();
+            inner.inspector_open = !inner.inspector_open;
+            drop(inner);
+            d_click.render();
+            return;
+        }
+
         // ── Preview internal link ─────────────────────────
         let workspace_path = el.get_attribute("data-workspace-path").or_else(|| {
             let element: &web_sys::Element = el.as_ref();
@@ -2363,6 +2449,21 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if let Some(ref target_path) = workspace_path {
             event.prevent_default();
             d_click.navigate_to_link(target_path);
+            return;
+        }
+
+        let missing_target = el.get_attribute("data-missing-target").or_else(|| {
+            let element: &web_sys::Element = el.as_ref();
+            element
+                .closest("[data-missing-target]")
+                .ok()
+                .flatten()
+                .and_then(|p| p.get_attribute("data-missing-target"))
+        });
+        if let Some(target) = missing_target {
+            event.prevent_default();
+            let source = d_click.0.borrow().selected_path.clone().unwrap_or_default();
+            d_click.request_missing_note(&target, &source);
             return;
         }
 
@@ -2388,13 +2489,13 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             d_click.search_clear();
             return;
         }
-        
+
         // ── Inspector Outline Click ────────────────────────
         if class == "outline-item" {
             let inner = d_click.0.borrow();
             let is_preview = inner.document_mode == DocumentMode::Preview;
             drop(inner);
-            
+
             if is_preview {
                 if let Some(anchor) = el.get_attribute("data-anchor") {
                     if let Some(heading_el) = document.get_element_by_id(&anchor) {
@@ -2406,12 +2507,13 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     let selector = format!(".block-textarea[data-block-id=\"{}\"]", block_id);
                     if let Ok(Some(textarea_el)) = document.query_selector(&selector) {
                         textarea_el.scroll_into_view();
-                        if let Ok(textarea) = textarea_el.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                        if let Ok(textarea) = textarea_el.dyn_into::<web_sys::HtmlTextAreaElement>()
+                        {
                             let _ = textarea.focus();
                             if let Some(line_str) = el.get_attribute("data-heading-line") {
                                 if let Ok(line) = line_str.parse::<usize>() {
                                     let text = textarea.value();
-                                    let mut current_line = 1;
+                                    let mut current_line = 0;
                                     let mut offset = 0;
                                     for ch in text.chars() {
                                         if current_line == line {
@@ -2430,6 +2532,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     }
                 }
             }
+            el.set_class_name("outline-item active");
             return;
         }
 
@@ -2440,36 +2543,22 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             }
             return;
         }
-        
-        // ── Inspector Missing Link Click ───────────────────
-        if class == "link-item missing" {
-            if let Some(target) = el.get_attribute("data-missing-target") {
-                let mut inner = d_click.0.borrow_mut();
-                inner.create_folder = None; // Ensure we don't prepend random explorer folder
-                
-                // Construct target with .md extension
-                let target_with_ext = if target.ends_with(".md") {
-                    target
-                } else {
-                    format!("{}.md", target)
-                };
-                
-                // Create sibling of current active document if possible
-                let active_path = inner.selected_path.clone();
-                drop(inner);
-                
-                let missing_file = if let Some(path) = active_path {
-                    if let Some(slash_idx) = path.rfind('/') {
-                        format!("{}/{}", &path[..slash_idx], target_with_ext)
-                    } else {
-                        target_with_ext
-                    }
-                } else {
-                    target_with_ext
-                };
-                
-                d_click.create_file(&missing_file);
+
+        if class == "create-missing-note-btn" {
+            let path = d_click
+                .0
+                .borrow_mut()
+                .missing_note
+                .take()
+                .map(|request| request.proposed_path);
+            if let Some(path) = path {
+                d_click.create_file(&path);
             }
+            return;
+        }
+        if class == "dismiss-missing-note-btn" {
+            d_click.0.borrow_mut().missing_note = None;
+            d_click.render();
             return;
         }
 
@@ -2480,7 +2569,12 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     .and_then(|p| p.get_attribute("data-tag"))
             });
             if let Some(t) = tag {
-                d_click.update_search_query(&format!("#{}", t));
+                let mut inner = d_click.0.borrow_mut();
+                inner.tag_filter = Some(t.to_lowercase());
+                inner.search_query.clear();
+                inner.search_results.clear();
+                drop(inner);
+                d_click.render();
             }
             return;
         }
