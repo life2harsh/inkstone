@@ -7,7 +7,7 @@ pub mod markdown;
 pub mod protocol;
 
 pub use doc_ops::{
-    sequenced_replay, DocumentOp, DocumentUpdate, ReplayOutcome, DOCUMENT_UPDATE_VERSION,
+    DOCUMENT_UPDATE_VERSION, DocumentOp, DocumentUpdate, ReplayOutcome, sequenced_replay,
 };
-pub use document::{new_document, BlockContent, DocumentBlock};
+pub use document::{BlockContent, DocumentBlock, new_document};
 pub use ids::{BlockId, DocId, UpdateId};

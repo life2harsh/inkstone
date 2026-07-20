@@ -685,3 +685,158 @@ body {
     text-align: center;
   }
 }
+
+/* ── Search & Recent Notes Styles ──────────────────── */
+
+.search-container {
+  margin-bottom: 20px;
+}
+
+.search-input {
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background-color: #fff;
+  color: var(--text-main);
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.search-input:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(44, 82, 130, 0.15);
+}
+
+.search-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  padding: 0 4px;
+}
+
+.search-no-results {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 16px 8px;
+  text-align: center;
+}
+
+.search-result-item {
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  background-color: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.search-result-item:hover {
+  background-color: rgba(44, 82, 130, 0.05);
+}
+
+.search-result-item.highlighted {
+  background-color: rgba(44, 82, 130, 0.1);
+  outline: 1px solid rgba(44, 82, 130, 0.2);
+}
+
+.search-result-item.active {
+  background-color: var(--border-color);
+}
+
+.search-result-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 2px;
+}
+
+.search-result-path {
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+  margin-bottom: 4px;
+}
+
+.search-result-snippet {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.search-highlight {
+  background-color: #fef08a; /* Soft yellow highlight */
+  color: #1e293b;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: 500;
+}
+
+/* Recent Notes */
+.recent-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  margin-top: 8px;
+}
+
+.recent-clear-btn {
+  background: none;
+  border: none;
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.recent-clear-btn:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+  color: var(--text-main);
+}
+
+.recent-list {
+  margin-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.recent-item {
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  background-color: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.recent-item:hover {
+  background-color: rgba(44, 82, 130, 0.05);
+}
+
+.recent-item.active {
+  background-color: var(--border-color);
+  font-weight: 500;
+}
+
+.recent-item-name {
+  display: block;
+  font-size: 14px;
+  color: var(--text-main);
+  margin-bottom: 1px;
+}
+
+.recent-item-path {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

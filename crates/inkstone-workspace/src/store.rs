@@ -63,7 +63,7 @@ pub trait WorkspaceStore {
     async fn list_entries(&self) -> Result<Vec<WorkspaceEntry>, WorkspaceStoreError>;
 
     async fn read_file(&self, path: &WorkspacePath)
-        -> Result<Option<Vec<u8>>, WorkspaceStoreError>;
+    -> Result<Option<Vec<u8>>, WorkspaceStoreError>;
 
     async fn write_file(
         &self,

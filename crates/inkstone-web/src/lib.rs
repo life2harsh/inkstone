@@ -1,14 +1,15 @@
 pub mod explorer;
 pub mod indexed_db;
 pub mod markdown_render;
+pub mod search;
 pub mod storage;
 pub mod workspace_db;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 
 use inkstone_client::{ClientEvent, ClientState, Effect, SessionPhase};
 use inkstone_core::doc_ops::DocumentOp;
@@ -42,6 +43,12 @@ pub struct DriverInner {
     pub create_folder: Option<String>,
     pub document_mode: DocumentMode,
     pub link_message: Option<String>,
+    pub search_query: String,
+    pub search_indexing: bool,
+    pub search_documents: Vec<search::SearchDocument>,
+    pub search_results: Vec<search::SearchResult>,
+    pub search_highlighted_index: Option<usize>,
+    pub recent_notes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -67,11 +74,23 @@ impl Driver {
             create_folder: None,
             document_mode: DocumentMode::Edit,
             link_message: None,
+            search_query: String::new(),
+            search_indexing: false,
+            search_documents: Vec::new(),
+            search_results: Vec::new(),
+            search_highlighted_index: None,
+            recent_notes: Vec::new(),
         })))
     }
 
     fn select_entry(&self, path: &str) {
         let path_str = path.to_string();
+        let is_markdown = path_str.to_lowercase().ends_with(".md")
+            && !path_str.starts_with('.')
+            && !path_str.contains("/.");
+        if is_markdown {
+            self.add_recent_note(&path_str);
+        }
         {
             let mut inner = self.0.borrow_mut();
             inner.renaming_path = None;
@@ -267,6 +286,7 @@ impl Driver {
                     return;
                 }
             }
+            this.handle_delete_recent_note(&path_str);
             if is_selected {
                 this.0.borrow_mut().selected_path = None;
             }
@@ -276,6 +296,7 @@ impl Driver {
     }
 
     fn rename_entry(&self, old_path: &str, new_name: &str) {
+        let old_path = old_path.to_string();
         let new_name = new_name.trim().to_string();
         if new_name.is_empty() {
             return;
@@ -290,7 +311,7 @@ impl Driver {
                 return;
             }
         };
-        let old_path_wp = match WorkspacePath::new(old_path) {
+        let old_path_wp = match WorkspacePath::new(&old_path) {
             Ok(p) => p,
             Err(_) => {
                 self.0.borrow_mut().renaming_path = None;
@@ -303,7 +324,7 @@ impl Driver {
             Some(w) => w,
             None => return,
         };
-        let is_selected = self.0.borrow().selected_path.as_deref() == Some(old_path);
+        let is_selected = self.0.borrow().selected_path.as_deref() == Some(&old_path);
         wasm_bindgen_futures::spawn_local(async move {
             match ws.rename_file(&old_path_wp, &new_path).await {
                 Ok(()) => {
@@ -311,6 +332,7 @@ impl Driver {
                         this.0.borrow_mut().selected_path = Some(new_name.clone());
                     }
                     this.0.borrow_mut().renaming_path = None;
+                    this.handle_rename_recent_note(&old_path, &new_name);
                     this.refresh_entries();
                     this.render();
                 }
@@ -371,7 +393,18 @@ impl Driver {
                     entries.sort_by(|a, b| a.path.cmp(&b.path));
                     this.0.borrow_mut().entries = entries;
                     this.0.borrow_mut().workspace_loaded = true;
+
+                    // Clean and load recent notes
+                    let recents = {
+                        let inner = this.0.borrow();
+                        inner.recent_notes.clone()
+                    };
+                    this.clean_and_set_recent_notes(recents);
+
                     this.render();
+
+                    // Re-index search database
+                    this.index_workspace();
                 }
                 Err(e) => {
                     this.0.borrow_mut().storage_error =
@@ -382,16 +415,337 @@ impl Driver {
         });
     }
 
+    fn index_workspace(&self) {
+        let ws = match self.0.borrow().workspace_db.clone() {
+            Some(w) => w,
+            None => return,
+        };
+        let db_opt = self.0.borrow().db.clone();
+
+        let this = self.clone();
+        this.0.borrow_mut().search_indexing = true;
+        this.render();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let db = match db_opt {
+                Some(d) => d,
+                None => match IndexedDb::open("inkstone_local_db", 1).await {
+                    Ok(d) => {
+                        this.0.borrow_mut().db = Some(d.clone());
+                        d
+                    }
+                    Err(_) => {
+                        this.0.borrow_mut().search_indexing = false;
+                        this.render();
+                        return;
+                    }
+                },
+            };
+
+            let markdown_files: Vec<String> = this
+                .0
+                .borrow()
+                .entries
+                .iter()
+                .filter(|e| e.kind == WorkspaceEntryKind::Markdown)
+                .map(|e| e.path.as_str().to_string())
+                .collect();
+
+            let mut search_docs = Vec::new();
+            for path in markdown_files {
+                let file_name = explorer::file_name_only(&path).to_string();
+                let doc_id_opt = match ws.get_doc_id(&path).await {
+                    Ok(Some(uuid)) => Some(DocId(uuid)),
+                    _ => None,
+                };
+
+                let mut title = String::new();
+                let mut blocks = Vec::new();
+
+                if let Some(doc_id) = doc_id_opt {
+                    if let Ok(Some(record_json)) = db.get_document_record(&doc_id.to_string()).await
+                    {
+                        if let Ok(record) = storage::deserialize_record(&record_json) {
+                            let mut doc = record.confirmed_doc;
+                            for update in record.pending_updates {
+                                let _ = inkstone_core::doc_ops::apply_update(&mut doc, update);
+                            }
+                            title = doc.title;
+                            for block in doc.blocks {
+                                if let inkstone_core::document::BlockContent::Markdown { text } =
+                                    block.content
+                                {
+                                    blocks.push(text);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                search_docs.push(search::SearchDocument {
+                    path,
+                    file_name,
+                    doc_id: doc_id_opt,
+                    title,
+                    blocks,
+                });
+            }
+
+            {
+                let mut inner = this.0.borrow_mut();
+                inner.search_documents = search_docs;
+                inner.search_indexing = false;
+            }
+            this.perform_search_and_render();
+        });
+    }
+
+    fn update_search_index_for_active_doc(&self, path: &str) {
+        let updated = {
+            let mut inner = self.0.borrow_mut();
+            if let Some(pos) = inner
+                .search_documents
+                .iter()
+                .position(|doc| doc.path == path)
+            {
+                let effective_doc = inner.client_state.effective_view_doc();
+                let mut blocks = Vec::new();
+                for block in &effective_doc.blocks {
+                    if let inkstone_core::document::BlockContent::Markdown { text } = &block.content
+                    {
+                        blocks.push(text.clone());
+                    }
+                }
+                inner.search_documents[pos].title = effective_doc.title.clone();
+                inner.search_documents[pos].blocks = blocks;
+                !inner.search_query.trim().is_empty()
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.perform_search_and_render();
+        }
+    }
+
+    fn update_search_query(&self, val: &str) {
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.search_query = val.to_string();
+            if val.trim().is_empty() {
+                inner.search_results.clear();
+                inner.search_highlighted_index = None;
+            }
+        }
+        self.perform_search_and_render();
+    }
+
+    fn perform_search_and_render(&self) {
+        // Compute results, update state, then render – all in separate borrow windows
+        let (query, search_docs) = {
+            let inner = self.0.borrow();
+            (inner.search_query.clone(), inner.search_documents.clone())
+        };
+        let results = search::rank_results(&search_docs, &query);
+        {
+            let mut inner = self.0.borrow_mut();
+            let highlighted = if results.is_empty() {
+                None
+            } else {
+                let current = inner.search_highlighted_index.unwrap_or(0);
+                Some(if current >= results.len() { 0 } else { current })
+            };
+            inner.search_results = results;
+            inner.search_highlighted_index = highlighted;
+        }
+        self.render();
+    }
+
+    fn search_move_highlight(&self, delta: isize) {
+        let mut inner = self.0.borrow_mut();
+        let len = inner.search_results.len();
+        if len == 0 {
+            return;
+        }
+        let current = inner.search_highlighted_index.unwrap_or(0) as isize;
+        let mut next = current + delta;
+        if next < 0 {
+            next = (len - 1) as isize;
+        } else if next >= len as isize {
+            next = 0;
+        }
+        inner.search_highlighted_index = Some(next as usize);
+        drop(inner);
+        self.render();
+    }
+
+    fn search_open_highlighted(&self) {
+        let path_opt = {
+            let inner = self.0.borrow();
+            inner
+                .search_highlighted_index
+                .and_then(|idx| inner.search_results.get(idx))
+                .map(|r| r.path.clone())
+        };
+        if let Some(path) = path_opt {
+            self.select_entry(&path);
+            self.search_clear_query_only();
+        }
+    }
+
+    fn search_clear(&self) {
+        let mut inner = self.0.borrow_mut();
+        inner.search_query.clear();
+        inner.search_results.clear();
+        inner.search_highlighted_index = None;
+        drop(inner);
+        self.render();
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(search_el) = document.query_selector(".search-input").unwrap() {
+                    if let Ok(search_input) = search_el.dyn_into::<web_sys::HtmlInputElement>() {
+                        let _ = search_input.blur();
+                    }
+                }
+            }
+        }
+    }
+
+    fn search_clear_query_only(&self) {
+        let mut inner = self.0.borrow_mut();
+        inner.search_query.clear();
+        inner.search_results.clear();
+        inner.search_highlighted_index = None;
+        drop(inner);
+        self.render();
+    }
+
+    fn clean_and_set_recent_notes(&self, mut recents: Vec<String>) {
+        let mut inner = self.0.borrow_mut();
+        let entries = &inner.entries;
+        recents.retain(|path| {
+            let is_valid = entries
+                .iter()
+                .any(|e| e.path.as_str() == path && e.kind == WorkspaceEntryKind::Markdown);
+            is_valid && !path.starts_with('.') && !path.contains("/.")
+        });
+        inner.recent_notes = recents;
+    }
+
+    fn add_recent_note(&self, path: &str) {
+        let mut recents = {
+            let inner = self.0.borrow();
+            inner.recent_notes.clone()
+        };
+        recents.retain(|p| p != path);
+        recents.insert(0, path.to_string());
+        recents.truncate(8);
+
+        let ws = self.0.borrow().workspace_db.clone();
+        let this = self.clone();
+        if let Some(ws) = ws {
+            wasm_bindgen_futures::spawn_local(async move {
+                match ws.save_recent_notes(&recents).await {
+                    Ok(()) => {
+                        this.0.borrow_mut().recent_notes = recents;
+                        this.render();
+                    }
+                    Err(e) => {
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Failed to save recent notes: {:?}", e));
+                        this.render();
+                    }
+                }
+            });
+        }
+    }
+
+    fn clear_recent_notes(&self) {
+        let ws = self.0.borrow().workspace_db.clone();
+        let this = self.clone();
+        if let Some(ws) = ws {
+            wasm_bindgen_futures::spawn_local(async move {
+                match ws.save_recent_notes(&[]).await {
+                    Ok(()) => {
+                        this.0.borrow_mut().recent_notes.clear();
+                        this.render();
+                    }
+                    Err(e) => {
+                        this.0.borrow_mut().storage_error =
+                            Some(format!("Failed to clear recent notes: {:?}", e));
+                        this.render();
+                    }
+                }
+            });
+        }
+    }
+
+    fn handle_rename_recent_note(&self, old_path: &str, new_path: &str) {
+        let mut recents = {
+            let inner = self.0.borrow();
+            inner.recent_notes.clone()
+        };
+        let mut changed = false;
+        for path in recents.iter_mut() {
+            if path == old_path {
+                *path = new_path.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            let ws = self.0.borrow().workspace_db.clone();
+            let this = self.clone();
+            if let Some(ws) = ws {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ws.save_recent_notes(&recents).await {
+                        Ok(()) => {
+                            this.0.borrow_mut().recent_notes = recents;
+                            this.render();
+                        }
+                        Err(e) => {
+                            this.0.borrow_mut().storage_error =
+                                Some(format!("Failed to update recent notes on rename: {:?}", e));
+                            this.render();
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn handle_delete_recent_note(&self, path: &str) {
+        let mut recents = {
+            let inner = self.0.borrow();
+            inner.recent_notes.clone()
+        };
+        if recents.contains(&path.to_string()) {
+            recents.retain(|p| p != path);
+            let ws = self.0.borrow().workspace_db.clone();
+            let this = self.clone();
+            if let Some(ws) = ws {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ws.save_recent_notes(&recents).await {
+                        Ok(()) => {
+                            this.0.borrow_mut().recent_notes = recents;
+                            this.render();
+                        }
+                        Err(e) => {
+                            this.0.borrow_mut().storage_error =
+                                Some(format!("Failed to update recent notes on delete: {:?}", e));
+                            this.render();
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     pub fn dispatch(&self, event: ClientEvent) {
         let effects = {
             let mut inner = self.0.borrow_mut();
             inner.client_state.transition(event)
         };
 
-        // Suppress rerendering if there are in-flight user inputs
-        // Also skip full DOM rebuild when user is actively editing (input/textarea focused).
-        // Without this, render() calls set_inner_html("") which destroys the focused element,
-        // and subsequent keystrokes end up on the wrong target.
         let should_render = {
             let inner = self.0.borrow();
             let state = &inner.client_state;
@@ -407,6 +761,14 @@ impl Driver {
         for effect in effects {
             self.execute_effect(effect);
         }
+
+        let selected_path_opt = {
+            let inner = self.0.borrow();
+            inner.selected_path.clone()
+        };
+        if let Some(path) = selected_path_opt {
+            self.update_search_index_for_active_doc(&path);
+        }
     }
 
     fn has_editable_focus(&self) -> bool {
@@ -414,7 +776,9 @@ impl Driver {
             if let Some(document) = window.document() {
                 if let Some(el) = document.active_element() {
                     let class = el.class_name();
-                    return class == "document-title-input" || class == "block-textarea";
+                    return class == "document-title-input"
+                        || class == "block-textarea"
+                        || class == "search-input";
                 }
             }
         }
@@ -557,6 +921,9 @@ impl Driver {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved to IndexedDB".to_string();
                                     this.dispatch(ClientEvent::LocalUpdatePersisted { update_id });
+                                    if let Some(ref path) = this.0.borrow().selected_path {
+                                        this.update_search_index_for_active_doc(path);
+                                    }
                                 }
                                 Err(e) => {
                                     this.0.borrow_mut().persistence_status =
@@ -639,6 +1006,9 @@ impl Driver {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved confirmation".to_string();
                                     this.dispatch(ClientEvent::ConfirmationPersisted { token });
+                                    if let Some(ref path) = this.0.borrow().selected_path {
+                                        this.update_search_index_for_active_doc(path);
+                                    }
                                 }
                                 Err(e) => {
                                     this.0.borrow_mut().persistence_status =
@@ -689,20 +1059,28 @@ impl Driver {
 
         let active_element = document.active_element();
         let focus_info = active_element.and_then(|el| {
-            if el.class_name() == "document-title-input" {
+            let class = el.class_name();
+            if class == "document-title-input" {
                 let input: web_sys::HtmlInputElement = el.unchecked_into();
                 Some((
                     "title".to_string(),
                     input.selection_start().ok().flatten().unwrap_or(0),
                     input.selection_end().ok().flatten().unwrap_or(0),
                 ))
-            } else if el.class_name() == "block-textarea" {
+            } else if class == "block-textarea" {
                 let textarea: web_sys::HtmlTextAreaElement = el.unchecked_into();
                 let block_id = textarea.get_attribute("data-block-id").unwrap_or_default();
                 Some((
                     format!("block:{}", block_id),
                     textarea.selection_start().ok().flatten().unwrap_or(0),
                     textarea.selection_end().ok().flatten().unwrap_or(0),
+                ))
+            } else if class == "search-input" {
+                let input: web_sys::HtmlInputElement = el.unchecked_into();
+                Some((
+                    "search".to_string(),
+                    input.selection_start().ok().flatten().unwrap_or(0),
+                    input.selection_end().ok().flatten().unwrap_or(0),
                 ))
             } else {
                 None
@@ -730,11 +1108,89 @@ impl Driver {
 
         let sidebar = document.create_element("div").unwrap();
         sidebar.set_class_name("sidebar");
-
         let brand = document.create_element("div").unwrap();
         brand.set_class_name("brand");
         brand.set_text_content(Some("Inkstone"));
         sidebar.append_child(&brand).unwrap();
+
+        // Search Input
+        let search_container = document.create_element("div").unwrap();
+        search_container.set_class_name("search-container");
+
+        let search_input = document.create_element("input").unwrap();
+        let search_input: web_sys::HtmlInputElement = search_input.unchecked_into();
+        search_input.set_type("text");
+        search_input.set_class_name("search-input");
+        search_input.set_placeholder("Search notes...");
+        search_input.set_value(&inner.search_query);
+        search_container.append_child(&search_input).unwrap();
+
+        if inner.search_indexing {
+            let status = document.create_element("div").unwrap();
+            status.set_class_name("search-status");
+            status.set_text_content(Some("Indexing notes..."));
+            search_container.append_child(&status).unwrap();
+        } else if !inner.search_query.trim().is_empty() {
+            let status = document.create_element("div").unwrap();
+            status.set_class_name("search-status");
+            let count = inner.search_results.len();
+            if count == 0 {
+                status.set_text_content(Some("No matching notes"));
+            } else {
+                status.set_text_content(Some(&format!("{} results", count)));
+            }
+            search_container.append_child(&status).unwrap();
+        }
+        sidebar.append_child(&search_container).unwrap();
+
+        let is_search_active = !inner.search_query.trim().is_empty();
+
+        if !is_search_active && !inner.recent_notes.is_empty() {
+            let recent_heading = document.create_element("div").unwrap();
+            recent_heading.set_class_name("sidebar-heading recent-heading");
+
+            let recent_title = document.create_element("span").unwrap();
+            recent_title.set_text_content(Some("Recent"));
+            recent_heading.append_child(&recent_title).unwrap();
+
+            let clear_btn = document.create_element("button").unwrap();
+            clear_btn.set_class_name("recent-clear-btn");
+            clear_btn.set_text_content(Some("Clear"));
+            recent_heading.append_child(&clear_btn).unwrap();
+
+            sidebar.append_child(&recent_heading).unwrap();
+
+            let recent_list = document.create_element("div").unwrap();
+            recent_list.set_class_name("recent-list");
+
+            for path in &inner.recent_notes {
+                let recent_item = document.create_element("div").unwrap();
+                let is_active = selected_path.as_deref() == Some(path);
+                let recent_class = if is_active {
+                    "recent-item active"
+                } else {
+                    "recent-item"
+                };
+                recent_item.set_class_name(recent_class);
+                recent_item.set_attribute("data-path", path).unwrap();
+
+                let file_name = explorer::file_name_only(path).to_string();
+
+                let name_span = document.create_element("span").unwrap();
+                name_span.set_class_name("recent-item-name");
+                name_span.set_text_content(Some(&file_name));
+                recent_item.append_child(&name_span).unwrap();
+
+                let path_span = document.create_element("span").unwrap();
+                path_span.set_class_name("recent-item-path");
+                path_span.set_text_content(Some(path));
+                recent_item.append_child(&path_span).unwrap();
+
+                recent_list.append_child(&recent_item).unwrap();
+            }
+
+            sidebar.append_child(&recent_list).unwrap();
+        }
 
         let sidebar_heading = document.create_element("div").unwrap();
         sidebar_heading.set_class_name("sidebar-heading");
@@ -744,112 +1200,161 @@ impl Driver {
         let file_list = document.create_element("div").unwrap();
         file_list.set_class_name("file-list");
 
-        if inner.show_create {
-            let create_row = document.create_element("div").unwrap();
-            create_row.set_class_name("explorer-create-row");
-            let create_input = document.create_element("input").unwrap();
-            let create_input: web_sys::HtmlInputElement = create_input.unchecked_into();
-            create_input.set_class_name("explorer-create-input");
-            create_input.set_placeholder("filename.md");
-            create_input.set_value(&inner.create_value);
-            create_row.append_child(&create_input).unwrap();
-            file_list.append_child(&create_row).unwrap();
-        } else {
-            let new_btn = document.create_element("button").unwrap();
-            new_btn.set_class_name("explorer-new-btn");
-            new_btn.set_text_content(Some("+ New File"));
-            file_list.append_child(&new_btn).unwrap();
-        }
-
-        let flat_tree = explorer::build_flat_tree(entries, &inner.expanded_folders);
-        for flat_node in &flat_tree {
-            let indent_px = 8 + flat_node.depth * 20;
-            if flat_node.is_folder {
-                let folder_div = document.create_element("div").unwrap();
-                let is_target = inner.create_folder.as_deref() == Some(&flat_node.path);
-                let folder_class = match (flat_node.is_expanded, is_target) {
-                    (true, true) => "explorer-folder expanded active-target",
-                    (true, false) => "explorer-folder expanded",
-                    (false, true) => "explorer-folder active-target",
-                    (false, false) => "explorer-folder",
-                };
-                folder_div.set_class_name(folder_class);
-                folder_div
-                    .set_attribute("data-path", &flat_node.path)
-                    .unwrap();
-                folder_div
-                    .set_attribute("data-depth", &flat_node.depth.to_string())
-                    .unwrap();
-                let toggle = document.create_element("span").unwrap();
-                toggle.set_class_name("explorer-toggle");
-                toggle.set_text_content(Some(if flat_node.is_expanded {
-                    "\u{25bc}"
-                } else {
-                    "\u{25b6}"
-                }));
-                folder_div.append_child(&toggle).unwrap();
-                let name_span = document.create_element("span").unwrap();
-                name_span.set_class_name("folder-name");
-                name_span.set_text_content(Some(&flat_node.name));
-                folder_div.append_child(&name_span).unwrap();
-                folder_div
-                    .set_attribute("style", &format!("padding-left: {}px", indent_px))
-                    .unwrap();
-                file_list.append_child(&folder_div).unwrap();
+        if is_search_active {
+            if inner.search_results.is_empty() {
+                let empty_results = document.create_element("div").unwrap();
+                empty_results.set_class_name("search-no-results");
+                empty_results.set_text_content(Some("No matching notes"));
+                file_list.append_child(&empty_results).unwrap();
             } else {
-                let is_active = selected_path.as_deref() == Some(&flat_node.path);
-                let is_renaming = inner.renaming_path.as_deref() == Some(&flat_node.path);
-                let file_entry = document.create_element("div").unwrap();
-                let entry_class = if is_active {
-                    "file-entry active"
-                } else {
-                    "file-entry"
-                };
-                file_entry.set_class_name(entry_class);
-                file_entry
-                    .set_attribute("data-path", &flat_node.path)
-                    .unwrap();
-                file_entry
-                    .set_attribute("data-depth", &flat_node.depth.to_string())
-                    .unwrap();
-                file_entry
-                    .set_attribute("style", &format!("padding-left: {}px", indent_px))
-                    .unwrap();
+                for (idx, result) in inner.search_results.iter().enumerate() {
+                    let item_div = document.create_element("div").unwrap();
+                    let is_active = selected_path.as_deref() == Some(&result.path);
+                    let is_highlighted = inner.search_highlighted_index == Some(idx);
 
-                if is_renaming {
-                    let rename_input = document.create_element("input").unwrap();
-                    let rename_input: web_sys::HtmlInputElement = rename_input.unchecked_into();
-                    rename_input.set_class_name("rename-input");
-                    rename_input.set_value(&inner.rename_value);
-                    file_entry.append_child(&rename_input).unwrap();
-                } else {
-                    let file_name = document.create_element("span").unwrap();
-                    file_name.set_class_name("file-name");
-                    file_name.set_text_content(Some(&flat_node.name));
-                    file_entry.append_child(&file_name).unwrap();
+                    let mut class_name = "search-result-item".to_string();
+                    if is_active {
+                        class_name.push_str(" active");
+                    }
+                    if is_highlighted {
+                        class_name.push_str(" highlighted");
+                    }
+                    item_div.set_class_name(&class_name);
+                    item_div.set_attribute("data-path", &result.path).unwrap();
+
+                    let name_el = document.create_element("div").unwrap();
+                    name_el.set_class_name("search-result-name");
+                    Driver::highlight_text_into(&name_el, &result.file_name, &inner.search_query);
+                    item_div.append_child(&name_el).unwrap();
+
+                    let path_el = document.create_element("div").unwrap();
+                    path_el.set_class_name("search-result-path");
+                    Driver::highlight_text_into(&path_el, &result.path, &inner.search_query);
+                    item_div.append_child(&path_el).unwrap();
+
+                    if let Some(ref snippet) = result.snippet {
+                        let snippet_el = document.create_element("div").unwrap();
+                        snippet_el.set_class_name("search-result-snippet");
+                        Driver::highlight_text_into(&snippet_el, snippet, &inner.search_query);
+                        item_div.append_child(&snippet_el).unwrap();
+                    } else if !result.title.is_empty() {
+                        let title_el = document.create_element("div").unwrap();
+                        title_el.set_class_name("search-result-snippet");
+                        Driver::highlight_text_into(&title_el, &result.title, &inner.search_query);
+                        item_div.append_child(&title_el).unwrap();
+                    }
+
+                    file_list.append_child(&item_div).unwrap();
                 }
+            }
+        } else {
+            if inner.show_create {
+                let create_row = document.create_element("div").unwrap();
+                create_row.set_class_name("explorer-create-row");
+                let create_input = document.create_element("input").unwrap();
+                let create_input: web_sys::HtmlInputElement = create_input.unchecked_into();
+                create_input.set_class_name("explorer-create-input");
+                create_input.set_placeholder("filename.md");
+                create_input.set_value(&inner.create_value);
+                create_row.append_child(&create_input).unwrap();
+                file_list.append_child(&create_row).unwrap();
+            } else {
+                let new_btn = document.create_element("button").unwrap();
+                new_btn.set_class_name("explorer-new-btn");
+                new_btn.set_text_content(Some("+ New File"));
+                file_list.append_child(&new_btn).unwrap();
+            }
 
-                let file_actions = document.create_element("span").unwrap();
-                file_actions.set_class_name("file-actions");
+            let flat_tree = explorer::build_flat_tree(entries, &inner.expanded_folders);
+            for flat_node in &flat_tree {
+                let indent_px = 8 + flat_node.depth * 20;
+                if flat_node.is_folder {
+                    let folder_div = document.create_element("div").unwrap();
+                    let is_target = inner.create_folder.as_deref() == Some(&flat_node.path);
+                    let folder_class = match (flat_node.is_expanded, is_target) {
+                        (true, true) => "explorer-folder expanded active-target",
+                        (true, false) => "explorer-folder expanded",
+                        (false, true) => "explorer-folder active-target",
+                        (false, false) => "explorer-folder",
+                    };
+                    folder_div.set_class_name(folder_class);
+                    folder_div
+                        .set_attribute("data-path", &flat_node.path)
+                        .unwrap();
+                    folder_div
+                        .set_attribute("data-depth", &flat_node.depth.to_string())
+                        .unwrap();
+                    let toggle = document.create_element("span").unwrap();
+                    toggle.set_class_name("explorer-toggle");
+                    toggle.set_text_content(Some(if flat_node.is_expanded {
+                        "\u{25bc}"
+                    } else {
+                        "\u{25b6}"
+                    }));
+                    folder_div.append_child(&toggle).unwrap();
+                    let name_span = document.create_element("span").unwrap();
+                    name_span.set_class_name("folder-name");
+                    name_span.set_text_content(Some(&flat_node.name));
+                    folder_div.append_child(&name_span).unwrap();
+                    folder_div
+                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                        .unwrap();
+                    file_list.append_child(&folder_div).unwrap();
+                } else {
+                    let is_active = selected_path.as_deref() == Some(&flat_node.path);
+                    let is_renaming = inner.renaming_path.as_deref() == Some(&flat_node.path);
+                    let file_entry = document.create_element("div").unwrap();
+                    let entry_class = if is_active {
+                        "file-entry active"
+                    } else {
+                        "file-entry"
+                    };
+                    file_entry.set_class_name(entry_class);
+                    file_entry
+                        .set_attribute("data-path", &flat_node.path)
+                        .unwrap();
+                    file_entry
+                        .set_attribute("data-depth", &flat_node.depth.to_string())
+                        .unwrap();
+                    file_entry
+                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                        .unwrap();
 
-                let rename_btn = document.create_element("button").unwrap();
-                rename_btn.set_class_name("rename-btn");
-                rename_btn
-                    .set_attribute("data-path", &flat_node.path)
-                    .unwrap();
-                rename_btn.set_text_content(Some("Rename"));
-                file_actions.append_child(&rename_btn).unwrap();
+                    if is_renaming {
+                        let rename_input = document.create_element("input").unwrap();
+                        let rename_input: web_sys::HtmlInputElement = rename_input.unchecked_into();
+                        rename_input.set_class_name("rename-input");
+                        rename_input.set_value(&inner.rename_value);
+                        file_entry.append_child(&rename_input).unwrap();
+                    } else {
+                        let file_name = document.create_element("span").unwrap();
+                        file_name.set_class_name("file-name");
+                        file_name.set_text_content(Some(&flat_node.name));
+                        file_entry.append_child(&file_name).unwrap();
+                    }
 
-                let delete_btn = document.create_element("button").unwrap();
-                delete_btn.set_class_name("delete-btn");
-                delete_btn
-                    .set_attribute("data-path", &flat_node.path)
-                    .unwrap();
-                delete_btn.set_text_content(Some("Delete"));
-                file_actions.append_child(&delete_btn).unwrap();
+                    let file_actions = document.create_element("span").unwrap();
+                    file_actions.set_class_name("file-actions");
 
-                file_entry.append_child(&file_actions).unwrap();
-                file_list.append_child(&file_entry).unwrap();
+                    let rename_btn = document.create_element("button").unwrap();
+                    rename_btn.set_class_name("rename-btn");
+                    rename_btn
+                        .set_attribute("data-path", &flat_node.path)
+                        .unwrap();
+                    rename_btn.set_text_content(Some("Rename"));
+                    file_actions.append_child(&rename_btn).unwrap();
+
+                    let delete_btn = document.create_element("button").unwrap();
+                    delete_btn.set_class_name("delete-btn");
+                    delete_btn
+                        .set_attribute("data-path", &flat_node.path)
+                        .unwrap();
+                    delete_btn.set_text_content(Some("Delete"));
+                    file_actions.append_child(&delete_btn).unwrap();
+
+                    file_entry.append_child(&file_actions).unwrap();
+                    file_list.append_child(&file_entry).unwrap();
+                }
             }
         }
         sidebar.append_child(&file_list).unwrap();
@@ -1101,8 +1606,16 @@ impl Driver {
                 let input: web_sys::HtmlInputElement = el.unchecked_into();
                 let _ = input.focus();
             }
-        } else if editing_allowed {
-            if let Some((target, start, end)) = focus_info {
+        } else if let Some((target, start, end)) = focus_info {
+            if target == "search" {
+                // Restore search input focus and cursor
+                if let Some(el) = document.query_selector(".search-input").unwrap() {
+                    let input: web_sys::HtmlInputElement = el.unchecked_into();
+                    let _ = input.focus();
+                    let _ = input.set_selection_start(Some(start));
+                    let _ = input.set_selection_end(Some(end));
+                }
+            } else if editing_allowed {
                 if target == "title" {
                     if let Some(el) = document.query_selector(".document-title-input").unwrap() {
                         let input: web_sys::HtmlInputElement = el.unchecked_into();
@@ -1118,6 +1631,62 @@ impl Driver {
                         let _ = textarea.focus();
                         let _ = textarea.set_selection_start(Some(start));
                         let _ = textarea.set_selection_end(Some(end));
+                    }
+                }
+            }
+        }
+    }
+
+    // Safe DOM text helper – appends text nodes and <mark> elements; no innerHTML.
+    // Unicode-safe: uses char_indices so byte slicing is always on valid boundaries.
+    fn highlight_text_into(el: &web_sys::Element, text: &str, query: &str) {
+        let document = match web_sys::window().and_then(|w| w.document()) {
+            Some(d) => d,
+            None => return,
+        };
+        if query.is_empty() {
+            let _ = el.append_child(&document.create_text_node(text));
+            return;
+        }
+        let text_lower = text.to_lowercase();
+        let query_lower = query.to_lowercase();
+        let mut byte_pos: usize = 0;
+        loop {
+            match text_lower[byte_pos..].find(&query_lower) {
+                None => {
+                    // Append the rest
+                    if byte_pos < text.len() {
+                        let _ = el.append_child(&document.create_text_node(&text[byte_pos..]));
+                    }
+                    break;
+                }
+                Some(rel_idx) => {
+                    let abs_idx = byte_pos + rel_idx;
+                    // Text before the match
+                    if abs_idx > byte_pos {
+                        let _ =
+                            el.append_child(&document.create_text_node(&text[byte_pos..abs_idx]));
+                    }
+                    // Find byte length of match in original (may differ from query_lower length for
+                    // some case-folding; use the original string's char boundaries)
+                    // Count chars in query_lower and advance that many chars in original text
+                    let query_char_count = query_lower.chars().count();
+                    let match_end = text[abs_idx..]
+                        .char_indices()
+                        .nth(query_char_count)
+                        .map(|(i, _)| abs_idx + i)
+                        .unwrap_or(text.len());
+                    let matched_slice = &text[abs_idx..match_end];
+                    let mark = match document.create_element("mark") {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
+                    mark.set_class_name("search-highlight");
+                    let _ = mark.append_child(&document.create_text_node(matched_slice));
+                    let _ = el.append_child(&mark);
+                    byte_pos = match_end;
+                    if byte_pos >= text.len() {
+                        break;
                     }
                 }
             }
@@ -1150,6 +1719,13 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 if class == "explorer-create-input" {
                     let input: web_sys::HtmlInputElement = el.unchecked_into();
                     d_input.0.borrow_mut().create_value = input.value();
+                    return;
+                }
+
+                // ── Search input ─────────────────────────────────
+                if class == "search-input" {
+                    let input: web_sys::HtmlInputElement = el.unchecked_into();
+                    d_input.update_search_query(&input.value());
                     return;
                 }
 
@@ -1225,6 +1801,43 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         };
 
         if !editing_allowed {
+            return;
+        }
+
+        // ── Search & Recent Clicks ──────────────────────────────
+        if class.contains("search-result-item")
+            || el
+                .parent_element()
+                .map(|p| p.class_name().contains("search-result-item"))
+                .unwrap_or(false)
+        {
+            let path = el.get_attribute("data-path").or_else(|| {
+                el.parent_element()
+                    .and_then(|p| p.get_attribute("data-path"))
+            });
+            if let Some(p) = path {
+                d_click.select_entry(&p);
+                d_click.search_clear_query_only();
+            }
+            return;
+        }
+        if class.contains("recent-item")
+            || el
+                .parent_element()
+                .map(|p| p.class_name().contains("recent-item"))
+                .unwrap_or(false)
+        {
+            let path = el.get_attribute("data-path").or_else(|| {
+                el.parent_element()
+                    .and_then(|p| p.get_attribute("data-path"))
+            });
+            if let Some(p) = path {
+                d_click.select_entry(&p);
+            }
+            return;
+        }
+        if class == "recent-clear-btn" {
+            d_click.clear_recent_notes();
             return;
         }
 
@@ -1393,6 +2006,28 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     let d_keydown = driver.clone();
     let on_keydown = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+        if event.is_composing() {
+            return;
+        }
+        // Global Ctrl+K / Cmd+K check
+        let is_k = event.key() == "k" || event.key() == "K";
+        let is_ctrl_cmd = event.ctrl_key() || event.meta_key();
+        if is_ctrl_cmd && is_k {
+            event.prevent_default();
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    if let Some(search_el) = document.query_selector(".search-input").unwrap() {
+                        if let Ok(search_input) = search_el.dyn_into::<web_sys::HtmlInputElement>()
+                        {
+                            let _ = search_input.focus();
+                            let _ = search_input.select();
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let target = match event.target() {
             Some(t) => t,
             None => return,
@@ -1402,6 +2037,24 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Err(_) => return,
         };
         let class = el.class_name();
+
+        // ── Search input keydown ──────────────────────────────────
+        if class == "search-input" {
+            if event.key() == "ArrowDown" {
+                event.prevent_default();
+                d_keydown.search_move_highlight(1);
+            } else if event.key() == "ArrowUp" {
+                event.prevent_default();
+                d_keydown.search_move_highlight(-1);
+            } else if event.key() == "Enter" {
+                event.prevent_default();
+                d_keydown.search_open_highlighted();
+            } else if event.key() == "Escape" {
+                event.prevent_default();
+                d_keydown.search_clear();
+            }
+            return;
+        }
 
         // ── Create input ──────────────────────────────────────────
         if class == "explorer-create-input" {
@@ -1534,6 +2187,21 @@ pub fn start_app() -> Result<(), JsValue> {
         match WorkspaceDb::open().await {
             Ok(ws) => {
                 d.0.borrow_mut().workspace_db = Some(ws.clone());
+
+                // Load recent notes from DB on startup – fail closed.
+                // Missing = empty (Ok), malformed = storage error.
+                match ws.get_recent_notes().await {
+                    Ok(recents) => {
+                        d.0.borrow_mut().recent_notes = recents;
+                    }
+                    Err(e) => {
+                        d.0.borrow_mut().storage_error =
+                            Some(format!("Failed to load recent notes: {:?}", e));
+                        d.render();
+                        return;
+                    }
+                }
+
                 d.refresh_entries();
             }
             Err(e) => {

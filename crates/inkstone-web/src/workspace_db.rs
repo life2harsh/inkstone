@@ -1,14 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::{IdbDatabase, IdbRequest, IdbTransaction, IdbTransactionMode};
 
 use inkstone_workspace::manifest::{deserialize_manifest_toml, serialize_manifest_toml};
 use inkstone_workspace::{
-    WorkspaceEntry, WorkspaceManifest, WorkspacePath, WorkspaceStore, WorkspaceStoreError,
-    WORKSPACE_MANIFEST_PATH,
+    WORKSPACE_MANIFEST_PATH, WorkspaceEntry, WorkspaceManifest, WorkspacePath, WorkspaceStore,
+    WorkspaceStoreError,
 };
 
 thread_local! {
@@ -501,6 +501,43 @@ impl WorkspaceDb {
 
     pub async fn delete_doc_id(&self, path: &str) -> Result<(), WorkspaceStoreError> {
         self.delete_key("doc_map", path).await
+    }
+
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, WorkspaceStoreError> {
+        self.read_string("doc_map", key).await
+    }
+
+    pub async fn set_metadata(&self, key: &str, value: &str) -> Result<(), WorkspaceStoreError> {
+        self.write_string("doc_map", key, value).await
+    }
+
+    /// Load the recent notes list (up to 8 paths) from the reserved metadata key.
+    /// Returns an empty list if no entry exists.
+    /// Returns a Serialization error if the stored value is malformed JSON.
+    pub async fn get_recent_notes(&self) -> Result<Vec<String>, WorkspaceStoreError> {
+        const KEY: &str = "\x00recent_notes";
+        match self.read_string("doc_map", KEY).await? {
+            None => Ok(Vec::new()),
+            Some(json) => {
+                let list: Vec<String> = serde_json::from_str(&json).map_err(|e| {
+                    WorkspaceStoreError::Serialization(format!(
+                        "recent_notes JSON malformed: {}",
+                        e
+                    ))
+                })?;
+                Ok(list)
+            }
+        }
+    }
+
+    /// Persist the recent notes list. Truncates to 8 entries before saving.
+    pub async fn save_recent_notes(&self, paths: &[String]) -> Result<(), WorkspaceStoreError> {
+        const KEY: &str = "\x00recent_notes";
+        let truncated: Vec<&String> = paths.iter().take(8).collect();
+        let json = serde_json::to_string(&truncated).map_err(|e| {
+            WorkspaceStoreError::Serialization(format!("recent_notes serialize: {}", e))
+        })?;
+        self.write_string("doc_map", KEY, &json).await
     }
 
     pub async fn delete_document_record(

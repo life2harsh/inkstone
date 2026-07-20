@@ -2,10 +2,10 @@ pub mod inbox;
 
 use std::collections::VecDeque;
 
-use inkstone_core::doc_ops::{sequenced_replay, ReplayOutcome};
+use inkstone_core::doc_ops::{ReplayOutcome, sequenced_replay};
 use inkstone_core::document::InkstoneDocument;
 use inkstone_core::ids::{DocId, UpdateId};
-use inkstone_core::{new_document, DocumentUpdate};
+use inkstone_core::{DocumentUpdate, new_document};
 use serde::{Deserialize, Serialize};
 
 use crate::inbox::SequencedInbox;
@@ -1098,8 +1098,8 @@ impl ClientState {
     }
 }
 
-pub use inkstone_core::doc_ops::{apply_update, DOCUMENT_UPDATE_VERSION};
 pub use inkstone_core::DocumentOp;
+pub use inkstone_core::doc_ops::{DOCUMENT_UPDATE_VERSION, apply_update};
 
 #[cfg(test)]
 mod tests;

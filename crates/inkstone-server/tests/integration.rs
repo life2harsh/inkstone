@@ -1,11 +1,11 @@
 mod common;
 
 use common::*;
+use inkstone_core::UpdateId;
 use inkstone_core::protocol::{
     CreateDocRequest, CreateWorkspaceRequest, PostSnapshotRequest, PostUpdateRequest,
     WorkspaceResponse,
 };
-use inkstone_core::UpdateId;
 use serde_json::Value;
 use uuid::Uuid;
 

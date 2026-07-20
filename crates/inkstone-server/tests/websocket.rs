@@ -2,8 +2,8 @@ mod common;
 
 use common::*;
 use futures_util::{SinkExt, StreamExt};
-use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
 use inkstone_core::UpdateId;
+use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;

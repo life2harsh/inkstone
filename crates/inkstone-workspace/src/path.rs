@@ -216,12 +216,16 @@ mod tests {
     #[test]
     fn is_internal() {
         assert!(WorkspacePath::new(".inkstone").unwrap().is_internal());
-        assert!(WorkspacePath::new(".inkstone/workspace.toml")
-            .unwrap()
-            .is_internal());
-        assert!(WorkspacePath::new(".inkstone/config.toml")
-            .unwrap()
-            .is_internal());
+        assert!(
+            WorkspacePath::new(".inkstone/workspace.toml")
+                .unwrap()
+                .is_internal()
+        );
+        assert!(
+            WorkspacePath::new(".inkstone/config.toml")
+                .unwrap()
+                .is_internal()
+        );
         assert!(!WorkspacePath::new("Notes.md").unwrap().is_internal());
         assert!(!WorkspacePath::new("sub/Notes.md").unwrap().is_internal());
     }
@@ -233,20 +237,26 @@ mod tests {
         assert!(WorkspacePath::new("note.mD").unwrap().is_markdown());
         assert!(!WorkspacePath::new("note.txt").unwrap().is_markdown());
         assert!(!WorkspacePath::new("image.png").unwrap().is_markdown());
-        assert!(!WorkspacePath::new(".inkstone/config.md")
-            .unwrap()
-            .is_markdown());
+        assert!(
+            !WorkspacePath::new(".inkstone/config.md")
+                .unwrap()
+                .is_markdown()
+        );
     }
 
     #[test]
     fn is_user_content() {
         assert!(WorkspacePath::new("Notes.md").unwrap().is_user_content());
-        assert!(WorkspacePath::new("images/photo.png")
-            .unwrap()
-            .is_user_content());
-        assert!(!WorkspacePath::new(".inkstone/workspace.toml")
-            .unwrap()
-            .is_user_content());
+        assert!(
+            WorkspacePath::new("images/photo.png")
+                .unwrap()
+                .is_user_content()
+        );
+        assert!(
+            !WorkspacePath::new(".inkstone/workspace.toml")
+                .unwrap()
+                .is_user_content()
+        );
         assert!(!WorkspacePath::new(".inkstone").unwrap().is_user_content());
     }
 

@@ -1,7 +1,7 @@
 use crate::*;
+use inkstone_core::DocumentOp;
 use inkstone_core::document::{BlockContent, DocumentBlock};
 use inkstone_core::ids::BlockId;
-use inkstone_core::DocumentOp;
 
 fn make_doc_id() -> DocId {
     DocId::new_v4()
@@ -1257,27 +1257,33 @@ fn test_reconnect_token_mismatch_ignored() {
         connection_id: conn_id,
     });
     let real_token = state.reconnect_token.unwrap();
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ScheduleReconnect { .. })));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleReconnect { .. }))
+    );
 
     // Wrong token → ignored
     let wrong_effects = state.transition(ClientEvent::ReconnectTimerFired {
         lifecycle: state.lifecycle_id,
         reconnect_token: ReconnectToken(999),
     });
-    assert!(!wrong_effects
-        .iter()
-        .any(|e| matches!(e, Effect::ConnectSocket { .. })));
+    assert!(
+        !wrong_effects
+            .iter()
+            .any(|e| matches!(e, Effect::ConnectSocket { .. }))
+    );
 
     // Correct token → connect
     let correct_effects = state.transition(ClientEvent::ReconnectTimerFired {
         lifecycle: state.lifecycle_id,
         reconnect_token: real_token,
     });
-    assert!(correct_effects
-        .iter()
-        .any(|e| matches!(e, Effect::ConnectSocket { .. })));
+    assert!(
+        correct_effects
+            .iter()
+            .any(|e| matches!(e, Effect::ConnectSocket { .. }))
+    );
     // Token consumed (state.reconnect_token should be None)
     assert_eq!(state.reconnect_token, None);
     assert_eq!(state.phase(), SessionPhase::Offline);
@@ -1287,9 +1293,11 @@ fn test_reconnect_token_mismatch_ignored() {
         lifecycle: state.lifecycle_id,
         reconnect_token: real_token,
     });
-    assert!(!dup_effects
-        .iter()
-        .any(|e| matches!(e, Effect::ConnectSocket { .. })));
+    assert!(
+        !dup_effects
+            .iter()
+            .any(|e| matches!(e, Effect::ConnectSocket { .. }))
+    );
 }
 
 #[test]
@@ -1323,9 +1331,11 @@ fn test_reconnect_timer_fired_wrong_phase_ignored() {
         lifecycle: state.lifecycle_id,
         reconnect_token: token,
     });
-    assert!(!effects
-        .iter()
-        .any(|e| matches!(e, Effect::ConnectSocket { .. })));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::ConnectSocket { .. }))
+    );
 }
 
 // ── Spec 9: connection identity ─────────────────────────────────────────
@@ -1589,9 +1599,11 @@ fn test_close_cancels_reconnect() {
     let effects = state.transition(ClientEvent::Close);
     assert_eq!(state.phase(), SessionPhase::Closed);
     assert!(effects.iter().any(|e| matches!(e, Effect::CancelReconnect)));
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::DisconnectSocket)));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::DisconnectSocket))
+    );
 }
 
 // ── Spec 2: OpenDocument lifecycle reset ─────────────────────────────────

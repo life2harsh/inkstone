@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use crate::manifest::{
-    deserialize_manifest_toml, serialize_manifest_toml, WorkspaceManifest, WORKSPACE_MANIFEST_PATH,
+    WORKSPACE_MANIFEST_PATH, WorkspaceManifest, deserialize_manifest_toml, serialize_manifest_toml,
 };
 use crate::path::WorkspacePath;
 use crate::store::{WorkspaceEntry, WorkspaceStore, WorkspaceStoreError};
@@ -122,8 +122,8 @@ impl WorkspaceStore for MemoryWorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::WorkspaceEntryKind;
     use crate::WorkspaceManifest;
+    use crate::store::WorkspaceEntryKind;
 
     fn test_manifest() -> WorkspaceManifest {
         WorkspaceManifest {

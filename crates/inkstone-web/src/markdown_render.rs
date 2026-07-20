@@ -1,4 +1,4 @@
-use comrak::{markdown_to_html, Options};
+use comrak::{Options, markdown_to_html};
 use inkstone_workspace::WorkspacePath;
 use regex::Regex;
 
@@ -54,8 +54,27 @@ fn has_url_scheme(s: &str) -> bool {
     false
 }
 
+fn percent_decode(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                result.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
 fn classify_link(href: &str) -> LinkKind {
-    let trimmed = href.trim();
+    let decoded = percent_decode(href);
+    let trimmed = decoded.trim();
     if trimmed.is_empty() {
         return LinkKind::FragmentOnly;
     }
@@ -90,12 +109,13 @@ fn classify_link(href: &str) -> LinkKind {
 }
 
 pub fn resolve_workspace_path(href: &str, current_path: &str) -> Option<String> {
+    let decoded = percent_decode(href);
     // Absolute path is never a valid workspace path
-    if href.starts_with('/') {
+    if decoded.starts_with('/') {
         return None;
     }
     let parent = parent_folder(current_path);
-    let segments: Vec<&str> = href.split('/').collect();
+    let segments: Vec<&str> = decoded.split('/').collect();
     let mut path_segments: Vec<&str> = if let Some(ref p) = parent {
         if p.is_empty() {
             Vec::new()

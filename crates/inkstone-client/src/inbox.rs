@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-use inkstone_core::ids::UpdateId;
 use inkstone_core::DocumentUpdate;
+use inkstone_core::ids::UpdateId;
 
 /// Consistency failure: same seq + different update_id or same update_id + different seq.
 #[derive(Debug, Clone)]

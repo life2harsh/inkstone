@@ -1,6 +1,6 @@
 use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use uuid::Uuid;
 
 use crate::error::AppError;
