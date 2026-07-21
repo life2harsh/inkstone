@@ -2730,7 +2730,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     root.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
     on_keydown.forget();
 
-    let d_focusout = driver.clone();
     let on_focusout = Closure::wrap(Box::new(move |event: web_sys::FocusEvent| {
         if RENDERING.with(|rendering| rendering.get()) {
             return;
@@ -2755,13 +2754,8 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 }
             }
         }
-        let needs_render = {
-            let inner = d_focusout.0.borrow();
-            !inner.client_state.has_pending_intent() && inner.client_state.intent_queue_len() == 0
-        };
-        if needs_render {
-            d_focusout.render();
-        }
+        // Input dispatch persists canonical document changes. Rendering here would
+        // replace the clicked control during its mousedown/focusout sequence.
     }) as Box<dyn FnMut(web_sys::FocusEvent)>);
 
     root.add_event_listener_with_callback("focusout", on_focusout.as_ref().unchecked_ref())?;
