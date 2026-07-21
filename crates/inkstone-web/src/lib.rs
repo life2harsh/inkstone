@@ -21,7 +21,7 @@ pub mod search;
 pub mod storage;
 pub mod workspace_db;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -34,6 +34,12 @@ use inkstone_workspace::{WorkspaceEntry, WorkspaceEntryKind, WorkspacePath, Work
 
 use indexed_db::IndexedDb;
 use workspace_db::WorkspaceDb;
+
+thread_local! {
+    // Replacing the DOM blurs active editors. Ignore that synthetic focusout while
+    // render holds the driver borrow; user-initiated focus changes still render.
+    static RENDERING: Cell<bool> = const { Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentMode {
@@ -1015,13 +1021,8 @@ impl Driver {
             self.execute_effect(effect);
         }
 
-        let selected_path_opt = {
-            let inner = self.0.borrow();
-            inner.selected_path.clone()
-        };
-        if let Some(path) = selected_path_opt {
-            self.update_search_index_for_active_doc(&path);
-        }
+        // The persistence completion updates derived search and knowledge indexes.
+        // Doing it synchronously here re-enters the driver from editor DOM events.
     }
 
     fn has_editable_focus(&self) -> bool {
@@ -1176,8 +1177,8 @@ impl Driver {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved to IndexedDB".to_string();
                                     this.dispatch(ClientEvent::LocalUpdatePersisted { update_id });
-                                    if let Some(ref path) = this.0.borrow().selected_path {
-                                        this.update_search_index_for_active_doc(path);
+                                    if let Some(path) = this.0.borrow().selected_path.clone() {
+                                        this.update_search_index_for_active_doc(&path);
                                     }
                                 }
                                 Err(e) => {
@@ -1261,8 +1262,8 @@ impl Driver {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved confirmation".to_string();
                                     this.dispatch(ClientEvent::ConfirmationPersisted { token });
-                                    if let Some(ref path) = this.0.borrow().selected_path {
-                                        this.update_search_index_for_active_doc(path);
+                                    if let Some(path) = this.0.borrow().selected_path.clone() {
+                                        this.update_search_index_for_active_doc(&path);
                                     }
                                 }
                                 Err(e) => {
@@ -1306,6 +1307,7 @@ impl Driver {
     }
 
     fn render(&self) {
+        RENDERING.with(|rendering| rendering.set(true));
         let window = web_sys::window().expect("No global window found");
         let document = window.document().expect("No global document found");
         let root = document
@@ -2149,6 +2151,7 @@ impl Driver {
                 }
             }
         }
+        RENDERING.with(|rendering| rendering.set(false));
     }
 
     // Safe DOM text helper – appends text nodes and <mark> elements; no innerHTML.
@@ -2728,6 +2731,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     let d_focusout = driver.clone();
     let on_focusout = Closure::wrap(Box::new(move |event: web_sys::FocusEvent| {
+        if RENDERING.with(|rendering| rendering.get()) {
+            return;
+        }
         let target = match event.target() {
             Some(t) => t,
             None => return,
