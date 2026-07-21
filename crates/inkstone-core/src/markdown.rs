@@ -16,6 +16,7 @@ pub struct MdLink {
     pub target: String,
     pub label: String,
     pub title: Option<String>,
+    pub context: String,
     pub line: usize,
     pub col: usize,
 }
@@ -24,6 +25,7 @@ pub struct MdLink {
 pub struct WikiLink {
     pub target: String,
     pub alias: Option<String>,
+    pub context: String,
     pub line: usize,
     pub col: usize,
 }
@@ -195,6 +197,7 @@ fn try_parse_wikilink(
                 wikilinks.push(WikiLink {
                     target: content[..pipe].to_string(),
                     alias: Some(content[pipe + 1..].to_string()),
+                    context: chars.iter().collect::<String>().trim().to_string(),
                     line,
                     col: pos,
                 });
@@ -202,6 +205,7 @@ fn try_parse_wikilink(
                 wikilinks.push(WikiLink {
                     target: content,
                     alias: None,
+                    context: chars.iter().collect::<String>().trim().to_string(),
                     line,
                     col: pos,
                 });
@@ -605,6 +609,7 @@ fn try_parse_md_link(
         target,
         label: chars[pos + 1..label_end].iter().collect(),
         title,
+        context: chars.iter().collect::<String>().trim().to_string(),
         line,
         col: pos,
     });

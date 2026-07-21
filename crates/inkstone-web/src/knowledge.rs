@@ -114,7 +114,7 @@ impl KnowledgeIndex {
                         alias: Some(m.label.clone()),
                         block_id: *block_id,
                         is_wikilink: false,
-                        context_snippet: m.label.clone(),
+                        context_snippet: m.context.clone(),
                     });
                 }
             }
@@ -124,7 +124,7 @@ impl KnowledgeIndex {
                     alias: w.alias.clone(),
                     block_id: *block_id,
                     is_wikilink: true,
-                    context_snippet: w.alias.clone().unwrap_or_else(|| w.target.clone()),
+                    context_snippet: w.context.clone(),
                 });
             }
         }
@@ -396,6 +396,7 @@ mod tests {
             wikilinks: vec![WikiLink {
                 target: "Target.md".to_string(),
                 alias: None,
+                context: "See [[Target.md]] for context".to_string(),
                 line: 1,
                 col: 1,
             }],
@@ -481,6 +482,9 @@ mod tests {
         let parsed = inkstone_core::markdown::parse_markdown("[Visible label](Target.md)");
         index.index_document("Notes/Source.md", &[(BlockId::new_v4(), parsed)]);
         let links = index.get_backlinks("Notes/Target.md");
-        assert_eq!(links[0].context_snippet.as_deref(), Some("Visible label"));
+        assert_eq!(
+            links[0].context_snippet.as_deref(),
+            Some("[Visible label](Target.md)")
+        );
     }
 }

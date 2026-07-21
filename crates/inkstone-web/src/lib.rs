@@ -165,6 +165,10 @@ impl Driver {
         wasm_bindgen_futures::spawn_local(async move {
             match ws.get_doc_id(&path_str).await {
                 Ok(Some(existing_id)) => {
+                    let is_current = { this.0.borrow().selection_revision == selection_rev };
+                    if !is_current {
+                        return;
+                    }
                     if is_markdown {
                         let mut inner = this.0.borrow_mut();
                         inner.pending_selection = Some(PendingSelection {
@@ -181,6 +185,7 @@ impl Driver {
                         inner.client_state = ClientState::new(doc_id);
                     }
                     this.dispatch(ClientEvent::OpenDocument { doc_id });
+                    this.render();
                 }
                 Ok(None) => {
                     let new_id = uuid::Uuid::new_v4();
@@ -189,6 +194,10 @@ impl Driver {
                         this.0.borrow_mut().storage_error =
                             Some(format!("Failed to save document mapping: {:?}", e));
                         this.render();
+                        return;
+                    }
+                    let is_current = { this.0.borrow().selection_revision == selection_rev };
+                    if !is_current {
                         return;
                     }
                     if is_markdown {
@@ -206,8 +215,13 @@ impl Driver {
                         inner.client_state = ClientState::new(doc_id);
                     }
                     this.dispatch(ClientEvent::OpenDocument { doc_id });
+                    this.render();
                 }
                 Err(e) => {
+                    let is_current = { this.0.borrow().selection_revision == selection_rev };
+                    if !is_current {
+                        return;
+                    }
                     this.0.borrow_mut().storage_error =
                         Some(format!("Failed to read document mapping: {:?}", e));
                     this.render();
@@ -573,7 +587,8 @@ impl Driver {
                 let mut md_blocks_for_knowledge = Vec::new();
 
                 if let Some(doc_id) = doc_id_opt {
-                    match db.get_document_record(&doc_id.to_string()).await {
+                    let record_result = db.get_document_record(&doc_id.to_string()).await;
+                    match record_result {
                         Ok(Some(record_json)) => match storage::deserialize_record(&record_json) {
                             Ok(record) => {
                                 let mut doc = record.confirmed_doc;
@@ -673,7 +688,31 @@ impl Driver {
 
                 !inner.search_query.trim().is_empty()
             } else {
-                false
+                let effective_doc = inner.client_state.effective_view_doc().clone();
+                let blocks = effective_doc
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match &block.content {
+                        inkstone_core::document::BlockContent::Markdown { text } => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let md_blocks_for_knowledge =
+                    inkstone_core::markdown::index_document_blocks(&effective_doc);
+                inner.search_documents.push(search::SearchDocument {
+                    path: path.to_string(),
+                    file_name: explorer::file_name_only(path),
+                    doc_id: Some(effective_doc.id),
+                    title: effective_doc.title.clone(),
+                    blocks,
+                });
+                inner.knowledge.register_path(path);
+                inner
+                    .knowledge
+                    .index_document(path, &md_blocks_for_knowledge);
+                !inner.search_query.trim().is_empty() || inner.tag_filter.is_some()
             }
         };
         if updated {
@@ -1059,7 +1098,12 @@ impl Driver {
                         }
                     };
 
-                    match db.get_document_record(&doc_id.to_string()).await {
+                    let record_result = db.get_document_record(&doc_id.to_string()).await;
+                    if this.0.borrow().selected_doc_id != doc_id {
+                        return;
+                    }
+
+                    match record_result {
                         Ok(Some(record_json)) => match storage::deserialize_record(&record_json) {
                             Ok(record) => {
                                 this.0.borrow_mut().persistence_status =
@@ -1123,9 +1167,10 @@ impl Driver {
             Effect::PersistLocalUpdate { update_id, update } => {
                 this.0.borrow_mut().persistence_status = "Saving update...".to_string();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let (db, doc_id) = {
+                    let doc_id = update.doc_id;
+                    let db = {
                         let inner = this.0.borrow();
-                        (inner.db.clone(), inner.selected_doc_id)
+                        inner.db.clone()
                     };
 
                     let db = match db {
@@ -1177,9 +1222,19 @@ impl Driver {
                                 Ok(()) => {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved to IndexedDB".to_string();
-                                    this.dispatch(ClientEvent::LocalUpdatePersisted { update_id });
-                                    if let Some(path) = this.0.borrow().selected_path.clone() {
+                                    let current_path = {
+                                        let inner = this.0.borrow();
+                                        (inner.selected_doc_id == doc_id)
+                                            .then(|| inner.selected_path.clone())
+                                            .flatten()
+                                    };
+                                    if let Some(path) = current_path {
+                                        this.dispatch(ClientEvent::LocalUpdatePersisted {
+                                            update_id,
+                                        });
                                         this.update_search_index_for_active_doc(&path);
+                                    } else {
+                                        this.index_workspace();
                                     }
                                 }
                                 Err(e) => {
@@ -1210,9 +1265,10 @@ impl Driver {
             Effect::PersistConfirmation { token, checkpoint } => {
                 this.0.borrow_mut().persistence_status = "Saving confirmation...".to_string();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let (db, doc_id) = {
+                    let doc_id = checkpoint.doc_id;
+                    let db = {
                         let inner = this.0.borrow();
-                        (inner.db.clone(), inner.selected_doc_id)
+                        inner.db.clone()
                     };
 
                     let db = match db {
@@ -1262,9 +1318,17 @@ impl Driver {
                                 Ok(()) => {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved confirmation".to_string();
-                                    this.dispatch(ClientEvent::ConfirmationPersisted { token });
-                                    if let Some(path) = this.0.borrow().selected_path.clone() {
+                                    let current_path = {
+                                        let inner = this.0.borrow();
+                                        (inner.selected_doc_id == doc_id)
+                                            .then(|| inner.selected_path.clone())
+                                            .flatten()
+                                    };
+                                    if let Some(path) = current_path {
+                                        this.dispatch(ClientEvent::ConfirmationPersisted { token });
                                         this.update_search_index_for_active_doc(&path);
+                                    } else {
+                                        this.index_workspace();
                                     }
                                 }
                                 Err(e) => {
@@ -1755,7 +1819,7 @@ impl Driver {
                 {
                     let toggle_btn = document.create_element("button").unwrap();
                     let toggle_btn: web_sys::HtmlElement = toggle_btn.unchecked_into();
-                    toggle_btn.set_class_name("toggle-inspector-btn");
+                    toggle_btn.set_class_name("mode-toggle-btn toggle-inspector-btn");
                     toggle_btn.set_text_content(Some(if inner.inspector_open {
                         "Hide Inspector"
                     } else {
@@ -1933,6 +1997,10 @@ impl Driver {
             tab.set_text_content(Some(tab_name));
             tabs_div.append_child(&tab).unwrap();
         }
+        let inspector_close = document.create_element("button").unwrap();
+        inspector_close.set_class_name("toggle-inspector-btn inspector-close-btn");
+        inspector_close.set_text_content(Some("Hide"));
+        tabs_div.append_child(&inspector_close).unwrap();
         inspector.append_child(&tabs_div).unwrap();
 
         let section = document.create_element("div").unwrap();
@@ -2433,7 +2501,10 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        if class == "toggle-inspector-btn" {
+        if class
+            .split_whitespace()
+            .any(|name| name == "toggle-inspector-btn")
+        {
             let mut inner = d_click.0.borrow_mut();
             inner.inspector_open = !inner.inspector_open;
             drop(inner);
@@ -2541,10 +2612,16 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
 
         // ── Inspector Link Click ───────────────────────────
-        if class == "link-item" {
-            if let Some(path) = el.get_attribute("data-path") {
-                d_click.select_entry(&path);
-            }
+        let inspector_link_path = el.get_attribute("data-path").or_else(|| {
+            let element: &web_sys::Element = el.as_ref();
+            element
+                .closest(".link-item[data-path]")
+                .ok()
+                .flatten()
+                .and_then(|row| row.get_attribute("data-path"))
+        });
+        if let Some(path) = inspector_link_path {
+            d_click.select_entry(&path);
             return;
         }
 

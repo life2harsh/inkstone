@@ -24,7 +24,6 @@ pub fn render_to_html(text: &str, current_path: &str) -> String {
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.tagfilter = true;
-    options.extension.header_ids = Some(String::new());
 
     let html = markdown_to_html(text, &options);
     process_html(&html, current_path, None)
@@ -42,7 +41,6 @@ pub fn render_with_knowledge(
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.tagfilter = true;
-    options.extension.header_ids = Some(String::new());
     options.extension.wikilinks_title_after_pipe = true;
 
     let html = markdown_to_html(text, &options);
