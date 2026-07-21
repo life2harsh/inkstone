@@ -47,6 +47,7 @@ pub enum DocumentMode {
     Preview,
 }
 
+#[derive(Clone)]
 pub struct DriverInner {
     pub client_state: ClientState,
     pub db: Option<IndexedDb>,
@@ -1346,7 +1347,7 @@ impl Driver {
 
         root.set_inner_html("");
 
-        let inner = self.0.borrow();
+        let inner = self.0.borrow().clone();
         let client_state = &inner.client_state;
         let view_doc = client_state.effective_view_doc();
         let phase = client_state.phase();

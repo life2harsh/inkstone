@@ -41,7 +41,7 @@ pub struct Backlink {
     pub context_snippet: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct KnowledgeIndex {
     // tag_name (lowercase) -> Set of WorkspacePaths containing it
     pub tag_to_paths: BTreeMap<String, BTreeSet<String>>,
