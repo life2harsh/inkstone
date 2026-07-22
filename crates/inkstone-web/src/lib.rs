@@ -15,7 +15,9 @@ pub struct MissingNoteRequest {
 
 pub mod explorer;
 pub mod indexed_db;
+pub mod ink_runtime;
 pub mod knowledge;
+pub mod local_graph;
 pub mod markdown_render;
 pub mod search;
 pub mod storage;
@@ -29,6 +31,7 @@ use wasm_bindgen::prelude::*;
 
 use inkstone_client::{ClientEvent, ClientState, Effect, SessionPhase};
 use inkstone_core::doc_ops::DocumentOp;
+use inkstone_core::document::{BlockContent, InkstoneDocument};
 use inkstone_core::ids::{BlockId, DocId, UpdateId};
 use inkstone_workspace::{WorkspaceEntry, WorkspaceEntryKind, WorkspacePath, WorkspaceStore};
 
@@ -80,49 +83,212 @@ pub struct DriverInner {
     pub pending_selection: Option<PendingSelection>,
     pub recent_notes_revision: u64,
     pub missing_note: Option<MissingNoteRequest>,
+    pub ink_tool: String,
+    pub ink_brush_width: f32,
+    pub ink_brush_color: (u8, u8, u8),
+    pub expanded_ink_block: Option<BlockId>,
+    pub sidebar_open: bool,
 }
 
 #[derive(Clone)]
-pub struct Driver(Rc<RefCell<DriverInner>>);
+pub struct Driver(
+    Rc<RefCell<DriverInner>>,
+    Rc<RefCell<ink_runtime::InkRuntimeRegistry>>,
+);
 
 impl Driver {
     pub fn new(doc_id: DocId) -> Self {
-        Driver(Rc::new(RefCell::new(DriverInner {
-            client_state: ClientState::new(doc_id),
-            db: None,
-            workspace_db: None,
-            persistence_status: "Initializing...".to_string(),
-            storage_error: None,
-            selected_doc_id: doc_id,
-            entries: Vec::new(),
-            selected_path: None,
-            workspace_loaded: false,
-            expanded_folders: HashSet::new(),
-            renaming_path: None,
-            rename_value: String::new(),
-            show_create: false,
-            create_value: String::new(),
-            create_folder: None,
-            document_mode: DocumentMode::Edit,
-            link_message: None,
-            tag_filter: None,
-            search_query: String::new(),
-            search_indexing: false,
-            search_documents: Vec::new(),
-            search_results: Vec::new(),
-            search_highlighted_index: None,
-            recent_notes: Vec::new(),
-            knowledge: knowledge::KnowledgeIndex::new(),
-            knowledge_tab: "Outline".to_string(),
-            inspector_open: false,
-            selection_revision: 0,
-            pending_selection: None,
-            recent_notes_revision: 0,
-            missing_note: None,
-        })))
+        Driver(
+            Rc::new(RefCell::new(DriverInner {
+                client_state: ClientState::new(doc_id),
+                db: None,
+                workspace_db: None,
+                persistence_status: "Initializing...".to_string(),
+                storage_error: None,
+                selected_doc_id: doc_id,
+                entries: Vec::new(),
+                selected_path: None,
+                workspace_loaded: false,
+                expanded_folders: HashSet::new(),
+                renaming_path: None,
+                rename_value: String::new(),
+                show_create: false,
+                create_value: String::new(),
+                create_folder: None,
+                document_mode: DocumentMode::Edit,
+                link_message: None,
+                tag_filter: None,
+                search_query: String::new(),
+                search_indexing: false,
+                search_documents: Vec::new(),
+                search_results: Vec::new(),
+                search_highlighted_index: None,
+                recent_notes: Vec::new(),
+                knowledge: knowledge::KnowledgeIndex::new(),
+                knowledge_tab: "Outline".to_string(),
+                inspector_open: false,
+                selection_revision: 0,
+                pending_selection: None,
+                recent_notes_revision: 0,
+                missing_note: None,
+                ink_tool: "pen".to_string(),
+                ink_brush_width: 3.0,
+                ink_brush_color: (31, 41, 55),
+                expanded_ink_block: None,
+                sidebar_open: false,
+            })),
+            Rc::new(RefCell::new(ink_runtime::InkRuntimeRegistry::default())),
+        )
+    }
+
+    fn set_ink_save_state(&self, block_id: BlockId, text: &str, state: &str) {
+        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+            return;
+        };
+        let selector = format!(".ink-save-state[data-block-id=\"{}\"]", block_id);
+        if let Ok(Some(element)) = document.query_selector(&selector) {
+            element.set_text_content(Some(text));
+            let _ = element.set_attribute("data-state", state);
+        }
+    }
+
+    fn report_ink_error(&self, context: &str, error: JsValue) {
+        let message = format!("{}: {:?}", context, error);
+        self.0.borrow_mut().persistence_status = message.clone();
+        web_sys::console::error_1(&JsValue::from_str(&message));
+    }
+
+    fn dispatch_ink_snapshot(&self, snapshot: ink_runtime::InkSnapshot) {
+        let is_current = {
+            let inner = self.0.borrow();
+            inner.selected_doc_id == snapshot.doc_id
+                && matches!(
+                    inner
+                        .client_state
+                        .effective_view_doc()
+                        .get_block(snapshot.block_id)
+                        .map(|block| &block.content),
+                    Some(BlockContent::Ink { .. })
+                )
+        };
+        if !is_current {
+            return;
+        }
+
+        self.set_ink_save_state(snapshot.block_id, "Saving drawing...", "saving");
+        self.dispatch(ClientEvent::LocalIntent {
+            op: DocumentOp::ReplaceBlockContent {
+                block_id: snapshot.block_id,
+                content: BlockContent::Ink {
+                    stonepen_json: snapshot.stonepen_json,
+                },
+            },
+            update_id: UpdateId::new_v4(),
+            applied_at_ms: js_sys::Date::now() as i64,
+        });
+        self.set_ink_save_state(snapshot.block_id, "Saved locally", "saved");
+    }
+
+    fn save_ink_block(&self, block_id: BlockId) {
+        let result = { self.1.borrow_mut().export_changed(block_id) };
+        match result {
+            Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
+            Ok(None) => self.set_ink_save_state(block_id, "Saved locally", "saved"),
+            Err(error) => self.report_ink_error("Failed to export Ink block", error),
+        }
+    }
+
+    fn save_all_ink_blocks(&self) {
+        let result = { self.1.borrow_mut().export_all_changed() };
+        match result {
+            Ok(snapshots) => {
+                for snapshot in snapshots {
+                    self.dispatch_ink_snapshot(snapshot);
+                }
+            }
+            Err(error) => self.report_ink_error("Failed to export Ink blocks", error),
+        }
+    }
+
+    fn undo_ink_block(&self, block_id: BlockId) {
+        let result = { self.1.borrow_mut().undo(block_id) };
+        match result {
+            Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
+            Ok(None) => {}
+            Err(error) => self.report_ink_error("Failed to undo Ink block", error),
+        }
+    }
+
+    fn redo_ink_block(&self, block_id: BlockId) {
+        let result = { self.1.borrow_mut().redo(block_id) };
+        match result {
+            Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
+            Ok(None) => {}
+            Err(error) => self.report_ink_error("Failed to redo Ink block", error),
+        }
+    }
+
+    fn flush_ink_runtimes(&self) {
+        let result = { self.1.borrow_mut().destroy_all() };
+        match result {
+            Ok(snapshots) => {
+                for snapshot in snapshots {
+                    self.dispatch_ink_snapshot(snapshot);
+                }
+            }
+            Err(error) => self.report_ink_error("Failed to flush Ink blocks", error),
+        }
+    }
+
+    fn flush_ink_before_transition(&self) {
+        let was_rendering = RENDERING.with(|rendering| {
+            let was_rendering = rendering.get();
+            rendering.set(true);
+            was_rendering
+        });
+        self.flush_ink_runtimes();
+        RENDERING.with(|rendering| rendering.set(was_rendering));
+    }
+
+    fn mount_ink_blocks(
+        &self,
+        document: &InkstoneDocument,
+        tool: &str,
+        brush_width: f32,
+        brush_color: (u8, u8, u8),
+    ) {
+        let Some(dom_document) = web_sys::window().and_then(|window| window.document()) else {
+            return;
+        };
+
+        for block in &document.blocks {
+            let BlockContent::Ink { stonepen_json } = &block.content else {
+                continue;
+            };
+            let canvas_id = format!("ink-canvas-{}", block.id);
+            if dom_document.get_element_by_id(&canvas_id).is_none() {
+                continue;
+            }
+
+            let result = self.1.borrow_mut().mount(
+                document.id,
+                block.id,
+                &canvas_id,
+                stonepen_json,
+                tool,
+                brush_width,
+                brush_color,
+            );
+            match result {
+                Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
+                Ok(None) => self.set_ink_save_state(block.id, "Saved locally", "saved"),
+                Err(error) => self.report_ink_error("Failed to mount Ink block", error),
+            }
+        }
     }
 
     fn select_entry(&self, path: &str) {
+        self.flush_ink_before_transition();
         let path_str = path.to_string();
         let is_markdown = path_str.to_lowercase().ends_with(".md")
             && !path_str.starts_with('.')
@@ -134,6 +300,8 @@ impl Driver {
             inner.renaming_path = None;
             inner.show_create = false;
             inner.create_folder = None;
+            inner.sidebar_open = false;
+            inner.inspector_open = false;
             let ancestors = markdown_render::ancestor_folders(&path_str);
             for folder in &ancestors {
                 inner.expanded_folders.insert(folder.clone());
@@ -327,6 +495,9 @@ impl Driver {
             None => return,
         };
         let is_selected = self.0.borrow().selected_path.as_deref() == Some(&path_str);
+        if is_selected {
+            self.flush_ink_before_transition();
+        }
         wasm_bindgen_futures::spawn_local(async move {
             let doc_id = match ws.get_doc_id(&path_str).await {
                 Ok(id) => id,
@@ -1045,7 +1216,8 @@ impl Driver {
             inner.client_state.transition(event)
         };
 
-        let should_render = {
+        let is_rendering = RENDERING.with(|rendering| rendering.get());
+        let should_render = !is_rendering && {
             let inner = self.0.borrow();
             let state = &inner.client_state;
             !state.has_pending_intent()
@@ -1070,9 +1242,15 @@ impl Driver {
             if let Some(document) = window.document() {
                 if let Some(el) = document.active_element() {
                     let class = el.class_name();
-                    return class == "document-title-input"
-                        || class == "block-textarea"
-                        || class == "search-input";
+                    if class == "document-title-input"
+                        || el.class_list().contains("block-textarea")
+                        || class == "search-input"
+                        || el.id().starts_with("ink-canvas-")
+                    {
+                        return true;
+                    }
+                    let element: &web_sys::Element = el.as_ref();
+                    return element.closest(".ink-block").ok().flatten().is_some();
                 }
             }
         }
@@ -1373,6 +1551,7 @@ impl Driver {
 
     fn render(&self) {
         RENDERING.with(|rendering| rendering.set(true));
+        self.flush_ink_runtimes();
         let window = web_sys::window().expect("No global window found");
         let document = window.document().expect("No global document found");
         let root = document
@@ -1389,7 +1568,7 @@ impl Driver {
                     input.selection_start().ok().flatten().unwrap_or(0),
                     input.selection_end().ok().flatten().unwrap_or(0),
                 ))
-            } else if class == "block-textarea" {
+            } else if el.class_list().contains("block-textarea") {
                 let textarea: web_sys::HtmlTextAreaElement = el.unchecked_into();
                 let block_id = textarea.get_attribute("data-block-id").unwrap_or_default();
                 Some((
@@ -1426,7 +1605,11 @@ impl Driver {
             && phase != SessionPhase::Error;
 
         let app_container = document.create_element("div").unwrap();
-        app_container.set_class_name("app-container");
+        app_container.set_class_name(if inner.sidebar_open {
+            "app-container sidebar-open"
+        } else {
+            "app-container"
+        });
 
         let sidebar = document.create_element("div").unwrap();
         sidebar.set_class_name("sidebar");
@@ -1434,6 +1617,10 @@ impl Driver {
         brand.set_class_name("brand");
         brand.set_text_content(Some("Inkstone"));
         sidebar.append_child(&brand).unwrap();
+        let workspace_name = document.create_element("div").unwrap();
+        workspace_name.set_class_name("workspace-name");
+        workspace_name.set_text_content(Some("Local knowledge workspace"));
+        sidebar.append_child(&workspace_name).unwrap();
 
         // Search Input
         let search_container = document.create_element("div").unwrap();
@@ -1728,18 +1915,61 @@ impl Driver {
         let main_content = document.create_element("div").unwrap();
         main_content.set_class_name("main-content");
 
+        let topbar = document.create_element("header").unwrap();
+        topbar.set_class_name("workspace-topbar");
+        let nav_toggle = document.create_element("button").unwrap();
+        nav_toggle.set_class_name("sidebar-toggle-btn");
+        nav_toggle.set_text_content(Some("Workspace"));
+        nav_toggle
+            .set_attribute("aria-label", "Toggle workspace navigation")
+            .unwrap();
+        topbar.append_child(&nav_toggle).unwrap();
+        let breadcrumb = document.create_element("div").unwrap();
+        breadcrumb.set_class_name("breadcrumb");
+        breadcrumb.set_text_content(Some(selected_path.as_deref().unwrap_or("Workspace")));
+        topbar.append_child(&breadcrumb).unwrap();
+        let topbar_actions = document.create_element("div").unwrap();
+        topbar_actions.set_class_name("topbar-actions");
+        let quick_search = document.create_element("button").unwrap();
+        quick_search.set_class_name("topbar-search-btn");
+        quick_search.set_text_content(Some("Search pages"));
+        topbar_actions.append_child(&quick_search).unwrap();
+        let save_status = document.create_element("span").unwrap();
+        save_status.set_class_name("topbar-save-status");
+        save_status.set_text_content(Some(persistence_status));
+        topbar_actions.append_child(&save_status).unwrap();
+        if selected_path.is_some() {
+            let mode_bar = document.create_element("div").unwrap();
+            mode_bar.set_class_name("mode-bar");
+            let edit_btn = document.create_element("button").unwrap();
+            edit_btn.set_class_name("mode-toggle-btn");
+            edit_btn.set_text_content(Some("Edit"));
+            if inner.document_mode == DocumentMode::Edit {
+                edit_btn.set_attribute("data-active", "true").unwrap();
+            }
+            mode_bar.append_child(&edit_btn).unwrap();
+            let preview_btn = document.create_element("button").unwrap();
+            preview_btn.set_class_name("mode-toggle-btn");
+            preview_btn.set_attribute("data-mode", "preview").unwrap();
+            preview_btn.set_text_content(Some("Preview"));
+            if inner.document_mode == DocumentMode::Preview {
+                preview_btn.set_attribute("data-active", "true").unwrap();
+            }
+            mode_bar.append_child(&preview_btn).unwrap();
+            let inspector_toggle = document.create_element("button").unwrap();
+            inspector_toggle.set_class_name("mode-toggle-btn toggle-inspector-btn");
+            inspector_toggle.set_text_content(Some("Inspector"));
+            mode_bar.append_child(&inspector_toggle).unwrap();
+            topbar_actions.append_child(&mode_bar).unwrap();
+        }
+        topbar.append_child(&topbar_actions).unwrap();
+        main_content.append_child(&topbar).unwrap();
+
         if selected_path.is_none() && storage_error.is_none() {
             let empty_state = document.create_element("div").unwrap();
             empty_state.set_class_name("empty-state");
             empty_state.set_text_content(Some("Select a file or create a new one."));
             main_content.append_child(&empty_state).unwrap();
-        }
-
-        if let Some(path) = selected_path {
-            let breadcrumb = document.create_element("div").unwrap();
-            breadcrumb.set_class_name("breadcrumb");
-            breadcrumb.set_text_content(Some(path));
-            main_content.append_child(&breadcrumb).unwrap();
         }
 
         if let Some(err) = storage_error {
@@ -1792,43 +2022,6 @@ impl Driver {
                 let editor_container = document.create_element("div").unwrap();
                 editor_container.set_class_name("editor-container");
 
-                // ── Mode Toggle ──────────────────────────────────
-                let mode_bar = document.create_element("div").unwrap();
-                mode_bar.set_class_name("mode-bar");
-                {
-                    let edit_btn = document.create_element("button").unwrap();
-                    let edit_btn: web_sys::HtmlElement = edit_btn.unchecked_into();
-                    edit_btn.set_class_name("mode-toggle-btn");
-                    edit_btn.set_text_content(Some("Edit"));
-                    if inner.document_mode == DocumentMode::Edit {
-                        let _ = edit_btn.set_attribute("data-active", "true");
-                    }
-                    mode_bar.append_child(&edit_btn).unwrap();
-                }
-                {
-                    let prev_btn = document.create_element("button").unwrap();
-                    let prev_btn: web_sys::HtmlElement = prev_btn.unchecked_into();
-                    prev_btn.set_class_name("mode-toggle-btn");
-                    prev_btn.set_text_content(Some("Preview"));
-                    prev_btn.set_attribute("data-mode", "preview").unwrap();
-                    if inner.document_mode == DocumentMode::Preview {
-                        let _ = prev_btn.set_attribute("data-active", "true");
-                    }
-                    mode_bar.append_child(&prev_btn).unwrap();
-                }
-                {
-                    let toggle_btn = document.create_element("button").unwrap();
-                    let toggle_btn: web_sys::HtmlElement = toggle_btn.unchecked_into();
-                    toggle_btn.set_class_name("mode-toggle-btn toggle-inspector-btn");
-                    toggle_btn.set_text_content(Some(if inner.inspector_open {
-                        "Hide Inspector"
-                    } else {
-                        "Show Inspector"
-                    }));
-                    mode_bar.append_child(&toggle_btn).unwrap();
-                }
-                editor_container.append_child(&mode_bar).unwrap();
-
                 // ── Link message (non-fatal) ────────────────────
                 if let Some(ref msg) = inner.link_message {
                     let msg_div = document.create_element("div").unwrap();
@@ -1858,54 +2051,335 @@ impl Driver {
                     editor_container.append_child(&prompt).unwrap();
                 }
 
+                let document_header = document.create_element("section").unwrap();
+                document_header.set_class_name("document-header-card");
                 if inner.document_mode == DocumentMode::Edit {
-                    // ── Edit Mode ────────────────────────────────
                     let title_input = document.create_element("input").unwrap();
                     let title_input: web_sys::HtmlInputElement = title_input.unchecked_into();
                     title_input.set_type("text");
                     title_input.set_class_name("document-title-input");
-                    title_input.set_placeholder("Document Title");
+                    title_input.set_placeholder("Untitled note");
                     title_input.set_value(&view_doc.title);
-                    editor_container.append_child(&title_input).unwrap();
+                    document_header.append_child(&title_input).unwrap();
+                } else {
+                    let title = document.create_element("h1").unwrap();
+                    title.set_id("document-title");
+                    title.set_class_name("document-title");
+                    title.set_text_content(Some(if view_doc.title.is_empty() {
+                        "Untitled note"
+                    } else {
+                        &view_doc.title
+                    }));
+                    document_header.append_child(&title).unwrap();
+                }
 
+                let metadata = document.create_element("div").unwrap();
+                metadata.set_class_name("document-metadata");
+                let created_at = view_doc
+                    .blocks
+                    .iter()
+                    .map(|block| block.created_at_ms)
+                    .min();
+                let updated_at = view_doc
+                    .blocks
+                    .iter()
+                    .map(|block| block.updated_at_ms)
+                    .max();
+                for (label, value) in [
+                    (
+                        "Created",
+                        created_at
+                            .map(Driver::format_timestamp)
+                            .unwrap_or_else(|| "New note".to_string()),
+                    ),
+                    (
+                        "Updated",
+                        updated_at
+                            .map(Driver::format_timestamp)
+                            .unwrap_or_else(|| "No edits yet".to_string()),
+                    ),
+                    ("Blocks", view_doc.blocks.len().to_string()),
+                ] {
+                    let item = document.create_element("div").unwrap();
+                    item.set_class_name("metadata-item");
+                    let key = document.create_element("span").unwrap();
+                    key.set_class_name("metadata-label");
+                    key.set_text_content(Some(label));
+                    let text = document.create_element("span").unwrap();
+                    text.set_class_name("metadata-value");
+                    text.set_text_content(Some(&value));
+                    item.append_child(&key).unwrap();
+                    item.append_child(&text).unwrap();
+                    metadata.append_child(&item).unwrap();
+                }
+                let tags_item = document.create_element("div").unwrap();
+                tags_item.set_class_name("metadata-item metadata-tags");
+                let tags_label = document.create_element("span").unwrap();
+                tags_label.set_class_name("metadata-label");
+                tags_label.set_text_content(Some("Tags"));
+                tags_item.append_child(&tags_label).unwrap();
+                let mut current_tags: Vec<String> = selected_path
+                    .as_ref()
+                    .and_then(|path| inner.knowledge.path_to_tags.get(path))
+                    .map(|tags| tags.iter().cloned().collect())
+                    .unwrap_or_default();
+                current_tags.sort();
+                if current_tags.is_empty() {
+                    let empty = document.create_element("span").unwrap();
+                    empty.set_class_name("metadata-value metadata-empty");
+                    empty.set_text_content(Some("No parsed tags"));
+                    tags_item.append_child(&empty).unwrap();
+                } else {
+                    for tag in current_tags {
+                        let chip = document.create_element("button").unwrap();
+                        chip.set_class_name("metadata-tag");
+                        chip.set_attribute("data-tag", &tag).unwrap();
+                        chip.set_text_content(Some(&format!("#{}", tag)));
+                        tags_item.append_child(&chip).unwrap();
+                    }
+                }
+                metadata.append_child(&tags_item).unwrap();
+                document_header.append_child(&metadata).unwrap();
+                editor_container.append_child(&document_header).unwrap();
+
+                if inner.document_mode == DocumentMode::Edit {
                     let block_list = document.create_element("div").unwrap();
                     block_list.set_class_name("block-list");
 
-                    for block in &view_doc.blocks {
+                    for (block_index, block) in view_doc.blocks.iter().enumerate() {
                         let block_id = block.id;
-                        let block_wrapper = document.create_element("div").unwrap();
-                        block_wrapper.set_class_name("block-wrapper");
-
-                        let block_label = document.create_element("div").unwrap();
-                        block_label.set_class_name("block-label");
-                        block_label.set_text_content(Some("MARKDOWN"));
-                        block_wrapper.append_child(&block_label).unwrap();
-
-                        let textarea = document.create_element("textarea").unwrap();
-                        let textarea: web_sys::HtmlTextAreaElement = textarea.unchecked_into();
-                        textarea.set_class_name("block-textarea");
-                        textarea.set_placeholder("Write markdown here...");
-                        textarea
+                        let (kind, label) = match &block.content {
+                            BlockContent::Markdown { .. } => ("markdown", "MARKDOWN"),
+                            BlockContent::Math { .. } => ("math", "MATH"),
+                            BlockContent::Ink { .. } => ("ink", "INK"),
+                            BlockContent::Divider => ("divider", "DIVIDER"),
+                        };
+                        let block_wrapper = document.create_element("article").unwrap();
+                        let expanded = inner.expanded_ink_block == Some(block_id);
+                        let wrapper_class = if expanded {
+                            format!("block-wrapper block-{} expanded", kind)
+                        } else {
+                            format!("block-wrapper block-{}", kind)
+                        };
+                        block_wrapper.set_class_name(&wrapper_class);
+                        block_wrapper
                             .set_attribute("data-block-id", &block_id.to_string())
                             .unwrap();
+                        block_wrapper
+                            .set_attribute("data-block-type", kind)
+                            .unwrap();
 
-                        if let inkstone_core::document::BlockContent::Markdown { text } =
-                            &block.content
-                        {
-                            textarea.set_value(text);
+                        let block_header = document.create_element("header").unwrap();
+                        block_header.set_class_name("block-header");
+                        let block_label = document.create_element("span").unwrap();
+                        block_label.set_class_name("block-label");
+                        block_label.set_text_content(Some(label));
+                        block_header.append_child(&block_label).unwrap();
+                        let block_actions = document.create_element("div").unwrap();
+                        block_actions.set_class_name("block-actions");
+                        for (action, text, disabled) in [
+                            ("move-up", "Up", block_index == 0),
+                            (
+                                "move-down",
+                                "Down",
+                                block_index + 1 == view_doc.blocks.len(),
+                            ),
+                            ("delete", "Delete", false),
+                        ] {
+                            let button = document.create_element("button").unwrap();
+                            button.set_class_name("block-action-btn");
+                            button.set_attribute("data-block-action", action).unwrap();
+                            button
+                                .set_attribute("data-block-id", &block_id.to_string())
+                                .unwrap();
+                            button.set_text_content(Some(text));
+                            if disabled {
+                                button.set_attribute("disabled", "").unwrap();
+                            }
+                            block_actions.append_child(&button).unwrap();
                         }
+                        block_header.append_child(&block_actions).unwrap();
+                        block_wrapper.append_child(&block_header).unwrap();
 
-                        block_wrapper.append_child(&textarea).unwrap();
+                        match &block.content {
+                            BlockContent::Markdown { text } => {
+                                let textarea = document.create_element("textarea").unwrap();
+                                let textarea: web_sys::HtmlTextAreaElement =
+                                    textarea.unchecked_into();
+                                textarea.set_class_name("block-textarea markdown-source-input");
+                                textarea.set_placeholder("Write Markdown...");
+                                textarea
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                textarea
+                                    .set_attribute("data-block-kind", "markdown")
+                                    .unwrap();
+                                textarea.set_value(text);
+                                block_wrapper.append_child(&textarea).unwrap();
+                            }
+                            BlockContent::Math { source } => {
+                                let textarea = document.create_element("textarea").unwrap();
+                                let textarea: web_sys::HtmlTextAreaElement =
+                                    textarea.unchecked_into();
+                                textarea.set_class_name("block-textarea math-source-input");
+                                textarea.set_placeholder("Enter TeX or mathematical source...");
+                                textarea
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                textarea.set_attribute("data-block-kind", "math").unwrap();
+                                textarea.set_value(source);
+                                block_wrapper.append_child(&textarea).unwrap();
+                                let source_preview = document.create_element("div").unwrap();
+                                source_preview.set_class_name("math-source-preview");
+                                source_preview.set_text_content(Some(if source.is_empty() {
+                                    "Mathematical source preview"
+                                } else {
+                                    source
+                                }));
+                                block_wrapper.append_child(&source_preview).unwrap();
+                            }
+                            BlockContent::Ink { .. } => {
+                                let ink_block = document.create_element("div").unwrap();
+                                ink_block.set_class_name("ink-block");
+                                ink_block
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                let toolbar = document.create_element("div").unwrap();
+                                toolbar.set_class_name("ink-toolbar");
+                                for (tool, text) in [
+                                    ("pen", "Pen"),
+                                    ("eraser", "Eraser"),
+                                    ("lasso", "Lasso"),
+                                    ("select", "Select"),
+                                ] {
+                                    let button = document.create_element("button").unwrap();
+                                    button.set_class_name(if inner.ink_tool == tool {
+                                        "ink-tool-btn active"
+                                    } else {
+                                        "ink-tool-btn"
+                                    });
+                                    button.set_attribute("data-ink-action", "tool").unwrap();
+                                    button.set_attribute("data-tool", tool).unwrap();
+                                    button
+                                        .set_attribute("data-block-id", &block_id.to_string())
+                                        .unwrap();
+                                    button.set_text_content(Some(text));
+                                    toolbar.append_child(&button).unwrap();
+                                }
+                                for (action, text) in [("undo", "Undo"), ("redo", "Redo")] {
+                                    let button = document.create_element("button").unwrap();
+                                    button.set_class_name("ink-action-btn");
+                                    button.set_attribute("data-ink-action", action).unwrap();
+                                    button
+                                        .set_attribute("data-block-id", &block_id.to_string())
+                                        .unwrap();
+                                    button.set_text_content(Some(text));
+                                    toolbar.append_child(&button).unwrap();
+                                }
+                                let width = document.create_element("input").unwrap();
+                                let width: web_sys::HtmlInputElement = width.unchecked_into();
+                                width.set_type("range");
+                                width.set_class_name("ink-width-input");
+                                width.set_min("1");
+                                width.set_max("24");
+                                width.set_step("1");
+                                width.set_value(&inner.ink_brush_width.to_string());
+                                width.set_attribute("aria-label", "Brush width").unwrap();
+                                width.set_attribute("data-ink-action", "width").unwrap();
+                                width
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                toolbar.append_child(&width).unwrap();
+                                for (name, rgb) in [
+                                    ("Ink", "31,41,55"),
+                                    ("Blue", "37,99,235"),
+                                    ("Red", "190,52,52"),
+                                ] {
+                                    let color = document.create_element("button").unwrap();
+                                    color.set_class_name("ink-color-btn");
+                                    color.set_attribute("data-ink-action", "color").unwrap();
+                                    color.set_attribute("data-color", rgb).unwrap();
+                                    color
+                                        .set_attribute("data-block-id", &block_id.to_string())
+                                        .unwrap();
+                                    color.set_attribute("aria-label", name).unwrap();
+                                    color.set_attribute("title", name).unwrap();
+                                    toolbar.append_child(&color).unwrap();
+                                }
+                                let expand = document.create_element("button").unwrap();
+                                expand.set_class_name("ink-action-btn ink-expand-btn");
+                                expand.set_attribute("data-ink-action", "expand").unwrap();
+                                expand
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                expand.set_text_content(Some(if expanded {
+                                    "Collapse"
+                                } else {
+                                    "Expand"
+                                }));
+                                toolbar.append_child(&expand).unwrap();
+                                let save_state = document.create_element("span").unwrap();
+                                save_state.set_class_name("ink-save-state");
+                                save_state
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                save_state.set_attribute("data-state", "saved").unwrap();
+                                save_state.set_text_content(Some("Saved locally"));
+                                toolbar.append_child(&save_state).unwrap();
+                                ink_block.append_child(&toolbar).unwrap();
+                                let canvas_host = document.create_element("div").unwrap();
+                                canvas_host.set_class_name("ink-canvas-host");
+                                let canvas = document.create_element("canvas").unwrap();
+                                canvas.set_id(&format!("ink-canvas-{}", block_id));
+                                canvas.set_attribute("tabindex", "0").unwrap();
+                                canvas
+                                    .set_attribute("data-block-id", &block_id.to_string())
+                                    .unwrap();
+                                canvas
+                                    .set_attribute("aria-label", "Stonepen drawing canvas")
+                                    .unwrap();
+                                canvas_host.append_child(&canvas).unwrap();
+                                ink_block.append_child(&canvas_host).unwrap();
+                                block_wrapper.append_child(&ink_block).unwrap();
+                            }
+                            BlockContent::Divider => {
+                                let divider = document.create_element("hr").unwrap();
+                                divider.set_class_name("document-divider");
+                                block_wrapper.append_child(&divider).unwrap();
+                            }
+                        }
                         block_list.append_child(&block_wrapper).unwrap();
                     }
 
+                    if view_doc.blocks.is_empty() {
+                        let empty = document.create_element("div").unwrap();
+                        empty.set_class_name("document-empty-state");
+                        empty.set_text_content(Some(
+                            "Start with a Markdown, Math, Ink, or Divider block.",
+                        ));
+                        block_list.append_child(&empty).unwrap();
+                    }
                     editor_container.append_child(&block_list).unwrap();
 
-                    let add_btn = document.create_element("button").unwrap();
-                    let add_btn: web_sys::HtmlElement = add_btn.unchecked_into();
-                    add_btn.set_class_name("add-block-btn");
-                    add_btn.set_text_content(Some("+ Add Markdown Block"));
-                    editor_container.append_child(&add_btn).unwrap();
+                    let insert = document.create_element("div").unwrap();
+                    insert.set_class_name("block-insert-control");
+                    let insert_label = document.create_element("span").unwrap();
+                    insert_label.set_class_name("block-insert-label");
+                    insert_label.set_text_content(Some("Add block"));
+                    insert.append_child(&insert_label).unwrap();
+                    for (kind, text) in [
+                        ("markdown", "Markdown"),
+                        ("math", "Math"),
+                        ("ink", "Ink"),
+                        ("divider", "Divider"),
+                    ] {
+                        let button = document.create_element("button").unwrap();
+                        button.set_class_name("add-block-btn");
+                        button.set_attribute("data-block-type", kind).unwrap();
+                        button.set_text_content(Some(text));
+                        insert.append_child(&button).unwrap();
+                    }
+                    editor_container.append_child(&insert).unwrap();
 
                     if !client_state.errors().is_empty() {
                         let error_list = document.create_element("div").unwrap();
@@ -1919,35 +2393,72 @@ impl Driver {
                         editor_container.append_child(&error_list).unwrap();
                     }
                 } else {
-                    // ── Preview Mode ─────────────────────────────
-                    let mut md = String::new();
-                    let _block_count = view_doc.blocks.len();
+                    let preview_div = document.create_element("div").unwrap();
+                    preview_div.set_class_name("preview-content document-mode-preview");
+                    let mut heading_counts = std::collections::HashMap::new();
                     for block in &view_doc.blocks {
-                        if let inkstone_core::document::BlockContent::Markdown { text } =
-                            &block.content
-                        {
-                            if !text.is_empty() {
-                                md.push_str(text);
-                                md.push('\n');
-                                md.push('\n');
+                        let preview_block = document.create_element("section").unwrap();
+                        preview_block.set_class_name("preview-block");
+                        preview_block
+                            .set_attribute("data-block-id", &block.id.to_string())
+                            .unwrap();
+                        match &block.content {
+                            BlockContent::Markdown { text } => {
+                                preview_block.set_class_name("preview-block preview-markdown");
+                                let html = markdown_render::render_with_knowledge_and_counts(
+                                    text,
+                                    selected_path.as_deref().unwrap_or(""),
+                                    &inner.knowledge,
+                                    &mut heading_counts,
+                                );
+                                preview_block.set_inner_html(&html);
+                            }
+                            BlockContent::Math { source } => {
+                                preview_block.set_class_name("preview-block preview-math");
+                                let label = document.create_element("span").unwrap();
+                                label.set_class_name("preview-block-label");
+                                label.set_text_content(Some("MATH"));
+                                let math = document.create_element("pre").unwrap();
+                                math.set_class_name("math-rendered-source");
+                                math.set_text_content(Some(if source.is_empty() {
+                                    "No mathematical source"
+                                } else {
+                                    source
+                                }));
+                                preview_block.append_child(&label).unwrap();
+                                preview_block.append_child(&math).unwrap();
+                            }
+                            BlockContent::Ink { .. } => {
+                                preview_block.set_class_name("preview-block preview-ink");
+                                let label = document.create_element("span").unwrap();
+                                label.set_class_name("preview-block-label");
+                                label.set_text_content(Some("INK"));
+                                preview_block.append_child(&label).unwrap();
+                                let ink_block = document.create_element("div").unwrap();
+                                ink_block.set_class_name("ink-block ink-preview");
+                                ink_block
+                                    .set_attribute("data-block-id", &block.id.to_string())
+                                    .unwrap();
+                                let canvas_host = document.create_element("div").unwrap();
+                                canvas_host.set_class_name("ink-canvas-host");
+                                let canvas = document.create_element("canvas").unwrap();
+                                canvas.set_id(&format!("ink-canvas-{}", block.id));
+                                canvas.set_attribute("tabindex", "-1").unwrap();
+                                canvas
+                                    .set_attribute("data-block-id", &block.id.to_string())
+                                    .unwrap();
+                                canvas_host.append_child(&canvas).unwrap();
+                                ink_block.append_child(&canvas_host).unwrap();
+                                preview_block.append_child(&ink_block).unwrap();
+                            }
+                            BlockContent::Divider => {
+                                preview_block.set_class_name("preview-block preview-divider");
+                                let divider = document.create_element("hr").unwrap();
+                                divider.set_class_name("document-divider");
+                                preview_block.append_child(&divider).unwrap();
                             }
                         }
-                    }
-                    let html = markdown_render::render_with_knowledge(
-                        &md,
-                        selected_path.as_deref().unwrap_or(""),
-                        &inner.knowledge,
-                    );
-                    let preview_div = document.create_element("div").unwrap();
-                    preview_div.set_class_name("preview-content");
-                    preview_div.set_inner_html(&html);
-                    if !view_doc.title.is_empty() {
-                        let title = document.create_element("h1").unwrap();
-                        title.set_id("document-title");
-                        title.set_text_content(Some(&view_doc.title));
-                        preview_div
-                            .insert_before(&title, preview_div.first_child().as_ref())
-                            .unwrap();
+                        preview_div.append_child(&preview_block).unwrap();
                     }
                     editor_container.append_child(&preview_div).unwrap();
                 }
@@ -1986,8 +2497,8 @@ impl Driver {
         let tabs_div = document.create_element("div").unwrap();
         tabs_div.set_class_name("inspector-tabs");
 
-        for tab_name in &["Outline", "Links", "Tags"] {
-            let tab = document.create_element("div").unwrap();
+        for tab_name in &["Backlinks", "Outline", "Tags", "Graph"] {
+            let tab = document.create_element("button").unwrap();
             if &inner.knowledge_tab == tab_name {
                 tab.set_class_name("inspector-tab active");
             } else {
@@ -2005,6 +2516,9 @@ impl Driver {
 
         let section = document.create_element("div").unwrap();
         section.set_class_name("inspector-section");
+        section
+            .set_attribute("data-section", &inner.knowledge_tab.to_lowercase())
+            .unwrap();
 
         if inner.knowledge_tab == "Outline" {
             if let Some(path) = selected_path {
@@ -2040,7 +2554,7 @@ impl Driver {
                     }
                 }
             }
-        } else if inner.knowledge_tab == "Links" {
+        } else if inner.knowledge_tab == "Backlinks" {
             // Outgoing Links
             let out_header = document.create_element("h4").unwrap();
             out_header.set_text_content(Some("Outgoing Links"));
@@ -2135,6 +2649,8 @@ impl Driver {
             current_header.set_text_content(Some("Current Note Tags"));
             section.append_child(&current_header).unwrap();
             if let Some(tags) = current {
+                let mut tags: Vec<&String> = tags.iter().collect();
+                tags.sort();
                 for tag in tags {
                     let item = document.create_element("div").unwrap();
                     item.set_class_name("tag-item");
@@ -2174,11 +2690,136 @@ impl Driver {
                     section.append_child(&item).unwrap();
                 }
             }
+        } else if inner.knowledge_tab == "Graph" {
+            let graph = selected_path
+                .as_ref()
+                .map(|path| local_graph::build_local_graph(&inner.knowledge, path))
+                .unwrap_or_default();
+            let graph_header = document.create_element("div").unwrap();
+            graph_header.set_class_name("graph-header");
+            graph_header.set_text_content(Some("Active note neighborhood"));
+            section.append_child(&graph_header).unwrap();
+            if graph.nodes.len() <= 1 {
+                let empty = document.create_element("div").unwrap();
+                empty.set_class_name("graph-empty-state");
+                empty.set_text_content(Some("No linked notes yet. Add a link or backlink."));
+                section.append_child(&empty).unwrap();
+            }
+
+            let svg_ns = Some("http://www.w3.org/2000/svg");
+            let graph_wrap = document.create_element("div").unwrap();
+            graph_wrap.set_class_name("local-graph-wrap");
+            let svg = document.create_element_ns(svg_ns, "svg").unwrap();
+            svg.set_attribute("class", "local-graph").unwrap();
+            svg.set_attribute("viewBox", "0 0 300 264").unwrap();
+            svg.set_attribute("role", "img").unwrap();
+            svg.set_attribute("aria-label", "Linked note graph")
+                .unwrap();
+            for edge in &graph.edges {
+                let Some(source) = graph.nodes.iter().find(|node| node.path == edge.source) else {
+                    continue;
+                };
+                let Some(target) = graph.nodes.iter().find(|node| node.path == edge.target) else {
+                    continue;
+                };
+                let line = document.create_element_ns(svg_ns, "line").unwrap();
+                line.set_attribute("class", "local-graph-edge").unwrap();
+                line.set_attribute("x1", &source.x.to_string()).unwrap();
+                line.set_attribute("y1", &source.y.to_string()).unwrap();
+                line.set_attribute("x2", &target.x.to_string()).unwrap();
+                line.set_attribute("y2", &target.y.to_string()).unwrap();
+                line.set_attribute("data-source", &edge.source).unwrap();
+                line.set_attribute("data-target", &edge.target).unwrap();
+                svg.append_child(&line).unwrap();
+            }
+            for node in &graph.nodes {
+                let group = document.create_element_ns(svg_ns, "g").unwrap();
+                let kind = match node.kind {
+                    local_graph::GraphNodeKind::Active => "active",
+                    local_graph::GraphNodeKind::Outgoing => "outgoing",
+                    local_graph::GraphNodeKind::Backlink => "backlink",
+                    local_graph::GraphNodeKind::Connected => "connected",
+                };
+                group
+                    .set_attribute("class", &format!("local-graph-node {}", kind))
+                    .unwrap();
+                group.set_attribute("data-path", &node.path).unwrap();
+                group.set_attribute("data-graph-path", &node.path).unwrap();
+                let circle = document.create_element_ns(svg_ns, "circle").unwrap();
+                circle.set_attribute("cx", &node.x.to_string()).unwrap();
+                circle.set_attribute("cy", &node.y.to_string()).unwrap();
+                circle.set_attribute("data-graph-path", &node.path).unwrap();
+                circle
+                    .set_attribute(
+                        "r",
+                        if node.kind == local_graph::GraphNodeKind::Active {
+                            "27"
+                        } else {
+                            "13"
+                        },
+                    )
+                    .unwrap();
+                group.append_child(&circle).unwrap();
+                let text = document.create_element_ns(svg_ns, "text").unwrap();
+                text.set_attribute("x", &node.x.to_string()).unwrap();
+                text.set_attribute("y", &(node.y + 30.0).to_string())
+                    .unwrap();
+                text.set_attribute("text-anchor", "middle").unwrap();
+                let label: String = node.label.chars().take(18).collect();
+                text.set_text_content(Some(&label));
+                group.append_child(&text).unwrap();
+                svg.append_child(&group).unwrap();
+            }
+            graph_wrap.append_child(&svg).unwrap();
+            for node in &graph.nodes {
+                let hit_target = document.create_element("button").unwrap();
+                hit_target.set_class_name("graph-node-hit");
+                hit_target
+                    .set_attribute("data-graph-path", &node.path)
+                    .unwrap();
+                hit_target.set_attribute("data-path", &node.path).unwrap();
+                hit_target
+                    .set_attribute("aria-label", &format!("Open {}", node.label))
+                    .unwrap();
+                let size = if node.kind == local_graph::GraphNodeKind::Active {
+                    58
+                } else {
+                    32
+                };
+                hit_target
+                    .set_attribute(
+                        "style",
+                        &format!(
+                            "left:{}%;top:{}%;width:{}px;height:{}px",
+                            node.x / 3.0,
+                            node.y / 2.64,
+                            size,
+                            size
+                        ),
+                    )
+                    .unwrap();
+                graph_wrap.append_child(&hit_target).unwrap();
+            }
+            section.append_child(&graph_wrap).unwrap();
         }
 
         inspector.append_child(&section).unwrap();
         app_container.append_child(&inspector).unwrap();
+        if inner.sidebar_open || inner.inspector_open {
+            let backdrop = document.create_element("button").unwrap();
+            backdrop.set_class_name("drawer-backdrop");
+            backdrop
+                .set_attribute("aria-label", "Close panels")
+                .unwrap();
+            app_container.append_child(&backdrop).unwrap();
+        }
         root.append_child(&app_container).unwrap();
+        self.mount_ink_blocks(
+            view_doc,
+            &inner.ink_tool,
+            inner.ink_brush_width,
+            inner.ink_brush_color,
+        );
 
         // Focus rename input if in rename mode
         if inner.renaming_path.is_some() {
@@ -2221,6 +2862,12 @@ impl Driver {
             }
         }
         RENDERING.with(|rendering| rendering.set(false));
+    }
+
+    fn format_timestamp(timestamp_ms: i64) -> String {
+        let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+        let iso = String::from(date.to_iso_string());
+        iso.chars().take(16).collect::<String>().replace('T', " ")
     }
 
     // Safe DOM text helper – appends text nodes and <mark> elements; no innerHTML.
@@ -2290,6 +2937,21 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     return;
                 }
 
+                if class == "ink-width-input" {
+                    let input: web_sys::HtmlInputElement = el.unchecked_into();
+                    let Some(block_id) = input
+                        .get_attribute("data-block-id")
+                        .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                        .map(BlockId)
+                    else {
+                        return;
+                    };
+                    let width = input.value_as_number() as f32;
+                    d_input.0.borrow_mut().ink_brush_width = width;
+                    d_input.1.borrow_mut().set_brush_width(block_id, width);
+                    return;
+                }
+
                 let editing_allowed = {
                     let inner = d_input.0.borrow();
                     let state = &inner.client_state;
@@ -2315,22 +2977,25 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                         update_id,
                         applied_at_ms,
                     });
-                } else if class == "block-textarea" {
+                } else if el.class_list().contains("block-textarea") {
                     let textarea: web_sys::HtmlTextAreaElement = el.unchecked_into();
                     let text = textarea.value();
+                    let block_kind = textarea
+                        .get_attribute("data-block-kind")
+                        .unwrap_or_else(|| "markdown".to_string());
                     if let Some(block_id_str) = textarea.get_attribute("data-block-id") {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&block_id_str) {
                             let block_id = BlockId(uuid);
                             let update_id = UpdateId::new_v4();
                             let applied_at_ms = js_sys::Date::now() as i64;
 
+                            let content = if block_kind == "math" {
+                                BlockContent::Math { source: text }
+                            } else {
+                                BlockContent::Markdown { text }
+                            };
                             d_input.dispatch(ClientEvent::LocalIntent {
-                                op: DocumentOp::ReplaceBlockContent {
-                                    block_id,
-                                    content: inkstone_core::document::BlockContent::Markdown {
-                                        text,
-                                    },
-                                },
+                                op: DocumentOp::ReplaceBlockContent { block_id, content },
                                 update_id,
                                 applied_at_ms,
                             });
@@ -2345,16 +3010,18 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     on_input.forget();
 
     let d_click = driver.clone();
+    let click_document = document.clone();
+    let visibility_document = document.clone();
     let on_click = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
         let target = match event.target() {
             Some(t) => t,
             None => return,
         };
-        let el = match target.dyn_into::<web_sys::HtmlElement>() {
+        let el = match target.dyn_into::<web_sys::Element>() {
             Ok(e) => e,
             Err(_) => return,
         };
-        let class = el.class_name();
+        let class = el.get_attribute("class").unwrap_or_default();
         let editing_allowed = {
             let inner = d_click.0.borrow();
             let has_err = inner.storage_error.is_some();
@@ -2362,6 +3029,44 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         };
 
         if !editing_allowed {
+            return;
+        }
+
+        if let Some(path) = el.get_attribute("data-graph-path") {
+            d_click.select_entry(&path);
+            return;
+        }
+
+        if class == "sidebar-toggle-btn" {
+            let mut inner = d_click.0.borrow_mut();
+            inner.sidebar_open = !inner.sidebar_open;
+            drop(inner);
+            d_click.render();
+            return;
+        }
+        if class == "drawer-backdrop" {
+            let mut inner = d_click.0.borrow_mut();
+            inner.sidebar_open = false;
+            inner.inspector_open = false;
+            drop(inner);
+            d_click.render();
+            return;
+        }
+        if class == "topbar-search-btn" {
+            let mobile = web_sys::window()
+                .and_then(|window| window.inner_width().ok())
+                .and_then(|width| width.as_f64())
+                .is_some_and(|width| width <= 760.0);
+            if mobile {
+                d_click.0.borrow_mut().sidebar_open = true;
+                d_click.render();
+            }
+            if let Ok(Some(search)) = click_document.query_selector(".search-input") {
+                if let Ok(input) = search.dyn_into::<web_sys::HtmlInputElement>() {
+                    let _ = input.focus();
+                    let _ = input.select();
+                }
+            }
             return;
         }
 
@@ -2485,6 +3190,129 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
+        if let Ok(Some(action_element)) = el.closest("[data-block-action]") {
+            let Some(block_id) = action_element
+                .get_attribute("data-block-id")
+                .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                .map(BlockId)
+            else {
+                return;
+            };
+            let action = action_element
+                .get_attribute("data-block-action")
+                .unwrap_or_default();
+            let block_position = {
+                let inner = d_click.0.borrow();
+                let document = inner.client_state.effective_view_doc();
+                document
+                    .block_index(block_id)
+                    .map(|index| (index, document.blocks.len()))
+            };
+            let Some((index, block_count)) = block_position else {
+                return;
+            };
+
+            d_click.flush_ink_before_transition();
+            let op = match action.as_str() {
+                "delete" => Some(DocumentOp::DeleteBlock { block_id }),
+                "move-up" if index > 0 => Some(DocumentOp::MoveBlock {
+                    block_id,
+                    new_idx: index - 1,
+                }),
+                "move-down" if index + 1 < block_count => Some(DocumentOp::MoveBlock {
+                    block_id,
+                    new_idx: index + 1,
+                }),
+                _ => None,
+            };
+            if let Some(op) = op {
+                d_click.dispatch(ClientEvent::LocalIntent {
+                    op,
+                    update_id: UpdateId::new_v4(),
+                    applied_at_ms: js_sys::Date::now() as i64,
+                });
+                d_click.render();
+            }
+            return;
+        }
+
+        if let Ok(Some(action_element)) = el.closest("[data-ink-action]") {
+            let Some(block_id) = action_element
+                .get_attribute("data-block-id")
+                .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                .map(BlockId)
+            else {
+                return;
+            };
+            let action = action_element
+                .get_attribute("data-ink-action")
+                .unwrap_or_default();
+            match action.as_str() {
+                "tool" => {
+                    let tool = action_element
+                        .get_attribute("data-tool")
+                        .unwrap_or_else(|| "pen".to_string());
+                    let (width, color) = {
+                        let mut inner = d_click.0.borrow_mut();
+                        inner.ink_tool = tool.clone();
+                        (inner.ink_brush_width, inner.ink_brush_color)
+                    };
+                    {
+                        let mut runtimes = d_click.1.borrow_mut();
+                        runtimes.set_tool(block_id, &tool);
+                        runtimes.set_brush_width(block_id, width);
+                        runtimes.set_brush_color(block_id, color);
+                    }
+                    let active_selector =
+                        format!(".ink-tool-btn.active[data-block-id=\"{}\"]", block_id);
+                    if let Ok(Some(active)) = click_document.query_selector(&active_selector) {
+                        active.set_class_name("ink-tool-btn");
+                    }
+                    action_element.set_class_name("ink-tool-btn active");
+                }
+                "color" => {
+                    let color = action_element
+                        .get_attribute("data-color")
+                        .and_then(|value| {
+                            let mut channels = value
+                                .split(',')
+                                .filter_map(|channel| channel.parse::<u8>().ok());
+                            Some((channels.next()?, channels.next()?, channels.next()?))
+                        });
+                    if let Some(color) = color {
+                        d_click.0.borrow_mut().ink_brush_color = color;
+                        d_click.1.borrow_mut().set_brush_color(block_id, color);
+                    }
+                }
+                "undo" => d_click.undo_ink_block(block_id),
+                "redo" => d_click.redo_ink_block(block_id),
+                "expand" => {
+                    let expanded = {
+                        let mut inner = d_click.0.borrow_mut();
+                        if inner.expanded_ink_block == Some(block_id) {
+                            inner.expanded_ink_block = None;
+                            false
+                        } else {
+                            inner.expanded_ink_block = Some(block_id);
+                            true
+                        }
+                    };
+                    if let Ok(Some(wrapper)) = action_element.closest(".block-wrapper") {
+                        if expanded {
+                            let _ = wrapper.class_list().add_1("expanded");
+                            action_element.set_text_content(Some("Collapse"));
+                        } else {
+                            let _ = wrapper.class_list().remove_1("expanded");
+                            action_element.set_text_content(Some("Expand"));
+                        }
+                    }
+                    d_click.1.borrow_mut().resize(block_id);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // ── Mode toggle ────────────────────────────────────
         if class == "mode-toggle-btn" {
             let is_preview = el.get_attribute("data-mode").as_deref() == Some("preview");
@@ -2514,9 +3342,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
         // ── Preview internal link ─────────────────────────
         let workspace_path = el.get_attribute("data-workspace-path").or_else(|| {
-            let element: &web_sys::Element = el.as_ref();
-            element
-                .closest("[data-workspace-path]")
+            el.closest("[data-workspace-path]")
                 .ok()
                 .flatten()
                 .and_then(|p| p.get_attribute("data-workspace-path"))
@@ -2528,9 +3354,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
 
         let missing_target = el.get_attribute("data-missing-target").or_else(|| {
-            let element: &web_sys::Element = el.as_ref();
-            element
-                .closest("[data-missing-target]")
+            el.closest("[data-missing-target]")
                 .ok()
                 .flatten()
                 .and_then(|p| p.get_attribute("data-missing-target"))
@@ -2580,7 +3404,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             } else {
                 if let Some(block_id) = el.get_attribute("data-block-id") {
                     let selector = format!(".block-textarea[data-block-id=\"{}\"]", block_id);
-                    if let Ok(Some(textarea_el)) = document.query_selector(&selector) {
+                    if let Ok(Some(textarea_el)) = click_document.query_selector(&selector) {
                         textarea_el.scroll_into_view();
                         if let Ok(textarea) = textarea_el.dyn_into::<web_sys::HtmlTextAreaElement>()
                         {
@@ -2613,9 +3437,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
         // ── Inspector Link Click ───────────────────────────
         let inspector_link_path = el.get_attribute("data-path").or_else(|| {
-            let element: &web_sys::Element = el.as_ref();
-            element
-                .closest(".link-item[data-path]")
+            el.closest(".link-item[data-path]")
                 .ok()
                 .flatten()
                 .and_then(|row| row.get_attribute("data-path"))
@@ -2644,7 +3466,11 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
 
         // ── Inspector Tag Click ────────────────────────────
-        if class == "tag-item" || class == "tag-name" || class == "tag-count" {
+        if class == "tag-item"
+            || class == "tag-name"
+            || class == "tag-count"
+            || class == "metadata-tag"
+        {
             let tag = el.get_attribute("data-tag").or_else(|| {
                 el.parent_element()
                     .and_then(|p| p.get_attribute("data-tag"))
@@ -2660,7 +3486,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Existing: add block button ────────────────────────────
+        // ── Block insertion ───────────────────────────────────────
         let editor_editing_allowed = {
             let inner = d_click.0.borrow();
             let state = &inner.client_state;
@@ -2678,15 +3504,35 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             let update_id = UpdateId::new_v4();
             let applied_at_ms = js_sys::Date::now() as i64;
             let block_id = BlockId::new_v4();
-
-            let block = inkstone_core::document::DocumentBlock::new(
-                block_id,
-                inkstone_core::document::BlockContent::Markdown {
-                    text: "".to_string(),
+            let block_type = el
+                .get_attribute("data-block-type")
+                .unwrap_or_else(|| "markdown".to_string());
+            let content = match block_type.as_str() {
+                "math" => BlockContent::Math {
+                    source: String::new(),
                 },
-            );
+                "ink" => BlockContent::Ink {
+                    stonepen_json: String::new(),
+                },
+                "divider" => BlockContent::Divider,
+                _ => BlockContent::Markdown {
+                    text: String::new(),
+                },
+            };
+            let block = inkstone_core::document::DocumentBlock {
+                id: block_id,
+                created_at_ms: applied_at_ms,
+                updated_at_ms: applied_at_ms,
+                content,
+            };
 
-            let insert_idx = d_click.0.borrow().client_state.view_doc().blocks.len();
+            let insert_idx = d_click
+                .0
+                .borrow()
+                .client_state
+                .effective_view_doc()
+                .blocks
+                .len();
 
             d_click.dispatch(ClientEvent::LocalIntent {
                 op: DocumentOp::InsertBlock {
@@ -2696,11 +3542,73 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 update_id,
                 applied_at_ms,
             });
+            d_click.render();
+            return;
         }
     }) as Box<dyn FnMut(web_sys::MouseEvent)>);
 
     root.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;
     on_click.forget();
+
+    let d_pointerup = driver.clone();
+    let on_pointerup = Closure::wrap(Box::new(move |event: web_sys::PointerEvent| {
+        let Some(target) = event.target() else {
+            return;
+        };
+        let Ok(element) = target.dyn_into::<web_sys::Element>() else {
+            return;
+        };
+        if !element.id().starts_with("ink-canvas-") {
+            return;
+        }
+        if let Some(block_id) = element
+            .get_attribute("data-block-id")
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(BlockId)
+        {
+            d_pointerup.save_ink_block(block_id);
+        }
+    }) as Box<dyn FnMut(web_sys::PointerEvent)>);
+    root.add_event_listener_with_callback("pointerup", on_pointerup.as_ref().unchecked_ref())?;
+    on_pointerup.forget();
+
+    let d_pointercancel = driver.clone();
+    let on_pointercancel = Closure::wrap(Box::new(move |event: web_sys::PointerEvent| {
+        let Some(target) = event.target() else {
+            return;
+        };
+        let Ok(element) = target.dyn_into::<web_sys::Element>() else {
+            return;
+        };
+        if !element.id().starts_with("ink-canvas-") {
+            return;
+        }
+        if let Some(block_id) = element
+            .get_attribute("data-block-id")
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(BlockId)
+        {
+            d_pointercancel.save_ink_block(block_id);
+        }
+    }) as Box<dyn FnMut(web_sys::PointerEvent)>);
+    root.add_event_listener_with_callback(
+        "pointercancel",
+        on_pointercancel.as_ref().unchecked_ref(),
+    )?;
+    on_pointercancel.forget();
+
+    let d_visibility = driver.clone();
+    let visibility_target = visibility_document.clone();
+    let on_visibility = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if visibility_document.hidden() {
+            d_visibility.save_all_ink_blocks();
+        }
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    visibility_target.add_event_listener_with_callback(
+        "visibilitychange",
+        on_visibility.as_ref().unchecked_ref(),
+    )?;
+    on_visibility.forget();
 
     let d_keydown = driver.clone();
     let on_keydown = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
@@ -2712,6 +3620,14 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         let is_ctrl_cmd = event.ctrl_key() || event.meta_key();
         if is_ctrl_cmd && is_k {
             event.prevent_default();
+            let mobile = web_sys::window()
+                .and_then(|window| window.inner_width().ok())
+                .and_then(|width| width.as_f64())
+                .is_some_and(|width| width <= 760.0);
+            if mobile {
+                d_keydown.0.borrow_mut().sidebar_open = true;
+                d_keydown.render();
+            }
             if let Some(window) = web_sys::window() {
                 if let Some(document) = window.document() {
                     if let Some(search_el) = document.query_selector(".search-input").unwrap() {
@@ -2820,13 +3736,15 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Err(_) => return,
         };
         let class = el.class_name();
-        if class != "document-title-input" && class != "block-textarea" {
+        if class != "document-title-input" && !el.class_list().contains("block-textarea") {
             return;
         }
         if let Some(related) = event.related_target() {
             if let Ok(rel_el) = related.dyn_into::<web_sys::HtmlElement>() {
                 let rel_class = rel_el.class_name();
-                if rel_class == "document-title-input" || rel_class == "block-textarea" {
+                if rel_class == "document-title-input"
+                    || rel_el.class_list().contains("block-textarea")
+                {
                     return;
                 }
             }

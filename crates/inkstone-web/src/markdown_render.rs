@@ -1,6 +1,7 @@
 use comrak::{Options, markdown_to_html};
 use inkstone_workspace::WorkspacePath;
 use regex::Regex;
+use std::collections::HashMap;
 
 pub struct LinkInfo {
     pub kind: LinkKind,
@@ -45,6 +46,25 @@ pub fn render_with_knowledge(
 
     let html = markdown_to_html(text, &options);
     process_html(&html, current_path, Some(knowledge))
+}
+
+pub fn render_with_knowledge_and_counts(
+    text: &str,
+    current_path: &str,
+    knowledge: &crate::knowledge::KnowledgeIndex,
+    heading_counts: &mut HashMap<String, usize>,
+) -> String {
+    let mut options = Options::default();
+    options.render.unsafe_ = false;
+    options.extension.strikethrough = true;
+    options.extension.table = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.tagfilter = true;
+    options.extension.wikilinks_title_after_pipe = true;
+
+    let html = markdown_to_html(text, &options);
+    process_html_with_counts(&html, current_path, Some(knowledge), heading_counts)
 }
 
 fn has_url_scheme(s: &str) -> bool {
@@ -183,9 +203,17 @@ fn process_html(
     current_path: &str,
     knowledge: Option<&crate::knowledge::KnowledgeIndex>,
 ) -> String {
+    let mut heading_counts = HashMap::new();
+    process_html_with_counts(html_input, current_path, knowledge, &mut heading_counts)
+}
+
+fn process_html_with_counts(
+    html_input: &str,
+    current_path: &str,
+    knowledge: Option<&crate::knowledge::KnowledgeIndex>,
+    heading_counts: &mut HashMap<String, usize>,
+) -> String {
     // 1. Process headings for deterministic anchors
-    let mut heading_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
     let re_headings =
         Regex::new(r#"(?i)<h([1-6])([^>]*)>(.*?)</h[1-6]>"#).expect("invalid heading regex");
     let html_headings = re_headings
