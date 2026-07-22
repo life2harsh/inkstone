@@ -519,6 +519,91 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_all_block_types_preserves_order() {
+        let (mut doc, doc_id) = make_doc();
+        let contents = vec![
+            markdown("markdown"),
+            BlockContent::Math {
+                source: "x+y".into(),
+            },
+            BlockContent::Ink {
+                stonepen_json: "opaque".into(),
+            },
+            BlockContent::Divider,
+        ];
+        for (idx, content) in contents.into_iter().enumerate() {
+            apply_update(
+                &mut doc,
+                upd(
+                    doc_id,
+                    1_000 + idx as i64,
+                    DocumentOp::InsertBlock {
+                        idx,
+                        block: DocumentBlock::new(BlockId::new_v4(), content),
+                    },
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            doc.blocks[0].content,
+            BlockContent::Markdown { .. }
+        ));
+        assert!(matches!(doc.blocks[1].content, BlockContent::Math { .. }));
+        assert!(matches!(doc.blocks[2].content, BlockContent::Ink { .. }));
+        assert!(matches!(doc.blocks[3].content, BlockContent::Divider));
+    }
+
+    #[test]
+    fn test_replace_math_source() {
+        let (mut doc, doc_id) = make_doc();
+        let block =
+            DocumentBlock::new(BlockId::new_v4(), BlockContent::Math { source: "x".into() });
+        let block_id = block.id;
+        doc.blocks.push(block);
+        apply_update(
+            &mut doc,
+            upd(
+                doc_id,
+                2_000,
+                DocumentOp::ReplaceBlockContent {
+                    block_id,
+                    content: BlockContent::Math {
+                        source: "x^2 + y^2".into(),
+                    },
+                },
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &doc.blocks[0].content,
+            BlockContent::Math { source } if source == "x^2 + y^2"
+        ));
+        assert_eq!(doc.blocks[0].updated_at_ms, 2_000);
+    }
+
+    #[test]
+    fn test_replace_missing_block_is_rejected() {
+        let (mut doc, doc_id) = make_doc();
+        let missing = BlockId::new_v4();
+        let error = apply_update(
+            &mut doc,
+            upd(
+                doc_id,
+                2_000,
+                DocumentOp::ReplaceBlockContent {
+                    block_id: missing,
+                    content: BlockContent::Divider,
+                },
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(error, ApplyError::BlockNotFound(missing));
+    }
+
+    #[test]
     fn test_wrong_document_id_rejected() {
         let (mut doc, _) = make_doc();
         let err = apply_update(

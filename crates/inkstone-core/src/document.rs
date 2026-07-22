@@ -202,6 +202,61 @@ mod tests {
     }
 
     #[test]
+    fn test_math_and_divider_content_roundtrip() {
+        let contents = [
+            BlockContent::Math {
+                source: r"P(A|B) = P(B|A)P(A)/P(B)".into(),
+            },
+            BlockContent::Divider,
+        ];
+        for content in contents {
+            let json = serde_json::to_string(&content).unwrap();
+            let back: BlockContent = serde_json::from_str(&json).unwrap();
+            match back {
+                BlockContent::Math { source } => assert!(source.starts_with("P(A|B)")),
+                BlockContent::Divider => {}
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mixed_block_roundtrip_preserves_order_and_types() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks = vec![
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Markdown {
+                    text: "first".into(),
+                },
+            ),
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Math {
+                    source: "x^2".into(),
+                },
+            ),
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Ink {
+                    stonepen_json: "opaque".into(),
+                },
+            ),
+            DocumentBlock::new(BlockId::new_v4(), BlockContent::Divider),
+        ];
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: InkstoneDocument = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.blocks[0].content,
+            BlockContent::Markdown { .. }
+        ));
+        assert!(matches!(back.blocks[1].content, BlockContent::Math { .. }));
+        assert!(matches!(back.blocks[2].content, BlockContent::Ink { .. }));
+        assert!(matches!(back.blocks[3].content, BlockContent::Divider));
+    }
+
+    #[test]
     fn test_document_serde_roundtrip() {
         let mut doc = InkstoneDocument::new(DocId::new_v4());
         doc.title = "Test".into();

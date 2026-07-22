@@ -45,7 +45,8 @@ pub fn deserialize_record(json: &str) -> Result<LocalDocumentRecord, serde_json:
 mod tests {
     use super::*;
     use inkstone_core::doc_ops::DocumentOp;
-    use inkstone_core::ids::UpdateId;
+    use inkstone_core::document::{BlockContent, DocumentBlock};
+    use inkstone_core::ids::{BlockId, UpdateId};
 
     fn create_dummy_update(doc_id: DocId, update_id: UpdateId) -> DocumentUpdate {
         DocumentUpdate {
@@ -215,5 +216,41 @@ mod tests {
         let corrupt_json = "{invalid json}";
         let res = deserialize_record(corrupt_json);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_mixed_blocks_survive_record_serialization() {
+        let doc_id = DocId::new_v4();
+        let mut record = new_record(doc_id);
+        record.confirmed_doc.blocks = vec![
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Math {
+                    source: "x^2".into(),
+                },
+            ),
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Ink {
+                    stonepen_json: "opaque-stonepen-json".into(),
+                },
+            ),
+            DocumentBlock::new(BlockId::new_v4(), BlockContent::Divider),
+        ];
+
+        let json = serde_json::to_string(&record).unwrap();
+        let hydrated = deserialize_record(&json).unwrap();
+        assert!(matches!(
+            hydrated.confirmed_doc.blocks[0].content,
+            BlockContent::Math { .. }
+        ));
+        assert!(matches!(
+            hydrated.confirmed_doc.blocks[1].content,
+            BlockContent::Ink { .. }
+        ));
+        assert!(matches!(
+            hydrated.confirmed_doc.blocks[2].content,
+            BlockContent::Divider
+        ));
     }
 }
