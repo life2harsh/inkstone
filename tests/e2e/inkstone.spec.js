@@ -17,7 +17,24 @@ async function resetWorkspace(page) {
     })));
   });
   await page.reload();
-  await expect(page.locator('.explorer-new-btn')).toBeVisible();
+  await expect(page.locator('.explorer-new-btn')).toBeAttached();
+}
+
+async function ensureWorkspaceOpen(page) {
+  const toggle = page.locator('.sidebar-toggle-btn');
+  if (await toggle.isVisible() && !/sidebar-open/.test(await page.locator('.app-container').getAttribute('class'))) {
+    await toggle.click();
+    await expect(page.locator('.app-container')).toHaveClass(/sidebar-open/);
+  }
+}
+
+async function ensureInspectorOpen(page) {
+  const inspector = page.locator('.inspector');
+  const toggle = page.locator('.mode-bar .toggle-inspector-btn');
+  if (await toggle.isVisible() && !/open/.test(await inspector.getAttribute('class'))) {
+    await page.locator('.mode-bar .toggle-inspector-btn').click();
+    await expect(inspector).toHaveClass(/open/);
+  }
 }
 
 async function persisted(page, needle) {
@@ -37,7 +54,46 @@ async function persisted(page, needle) {
   }, needle);
 }
 
+async function latestBlockContent(page, type) {
+  return page.evaluate(async blockType => {
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('inkstone_local_db', 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const values = await new Promise((resolve, reject) => {
+      const request = database.transaction('documents').objectStore('documents').getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    database.close();
+
+    let latest = null;
+    for (const value of values) {
+      const record = JSON.parse(String(value));
+      for (const block of record.confirmed_doc.blocks) {
+        if (block.content.type === blockType) latest = block.content;
+      }
+      for (const update of record.pending_updates) {
+        if (update.op.type === 'insert_block' && update.op.block.content.type === blockType) {
+          latest = update.op.block.content;
+        }
+        if (update.op.type === 'replace_block_content' && update.op.content.type === blockType) {
+          latest = update.op.content;
+        }
+      }
+    }
+    return latest;
+  }, type);
+}
+
+async function addBlock(page, type) {
+  await page.locator(`.add-block-btn[data-block-type="${type}"]`).click();
+  await expect(page.locator(`.block-wrapper[data-block-type="${type}"]`).last()).toBeVisible();
+}
+
 async function createNote(page, path, title, markdown) {
+  await ensureWorkspaceOpen(page);
   await page.locator('.explorer-new-btn').click();
   await page.locator('.explorer-create-input').fill(path);
   await page.locator('.explorer-create-input').press('Enter');
@@ -50,6 +106,7 @@ async function createNote(page, path, title, markdown) {
 }
 
 async function openNote(page, path, title) {
+  await ensureWorkspaceOpen(page);
   await page.locator(`.file-entry[data-path="${path}"]`).click();
   await expect(page.locator('.breadcrumb')).toHaveText(path);
   await expect(page.locator('.document-title-input')).toHaveValue(title);
@@ -105,7 +162,7 @@ test('focused title switches to Preview and Edit preserves content', async ({ pa
   await page.locator('.document-title-input').fill('Latest title');
   await persisted(page, 'Latest title');
   await page.getByRole('button', { name: 'Preview', exact: true }).click();
-  await expect(page.locator('.preview-content')).toContainText('Latest title');
+  await expect(page.locator('.document-title')).toContainText('Latest title');
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   await expect(page.locator('.document-title-input')).toHaveValue('Latest title');
   await expect(page.locator('.block-textarea')).toHaveValue('# Body');
@@ -114,10 +171,12 @@ test('focused title switches to Preview and Edit preserves content', async ({ pa
 test('search and recent results navigate to the selected note', async ({ page }) => {
   await createNote(page, 'A.md', 'Alpha', '# Searchable phrase');
   await createNote(page, 'B.md', 'Beta', '# Other');
+  await ensureWorkspaceOpen(page);
   await page.locator('.search-input').fill('Searchable phrase');
   await expect(page.locator('.search-result-item[data-path="A.md"]')).toBeVisible();
   await page.locator('.search-result-item[data-path="A.md"]').click();
   await expect(page.locator('.breadcrumb')).toHaveText('A.md');
+  await ensureWorkspaceOpen(page);
   await page.locator('.recent-item[data-path="B.md"]').click();
   await expect(page.locator('.breadcrumb')).toHaveText('B.md');
 });
@@ -135,6 +194,7 @@ test('recent notes are newest-first without duplicates', async ({ page }) => {
 test('deletion survives reload', async ({ page }) => {
   await createNote(page, 'Keep.md', 'Keep', '# Keep');
   await createNote(page, 'Delete.md', 'Delete', '# Delete');
+  await ensureWorkspaceOpen(page);
   page.once('dialog', dialog => dialog.accept());
   await page.locator('.file-entry[data-path="Delete.md"]').hover();
   await page.locator('.file-entry[data-path="Delete.md"] .delete-btn').click();
@@ -167,6 +227,98 @@ test('workspace fits the configured viewport', async ({ page }, testInfo) => {
   } else {
     await expect(page.locator('.inspector')).toBeVisible();
   }
+
+  await page.setViewportSize({ width: 900, height: 800 });
+  await page.getByRole('button', { name: 'Search pages' }).click();
+  await expect(page.locator('.search-input')).toBeFocused();
+  await expect(page.locator('.sidebar')).toBeVisible();
+  await expect(page.locator('.drawer-backdrop')).toHaveCount(0);
+
+  await page.setViewportSize({ width: 420, height: 800 });
+  await page.keyboard.press('Control+K');
+  await expect(page.locator('.app-container')).toHaveClass(/sidebar-open/);
+  await expect(page.locator('.search-input')).toBeFocused();
+});
+
+test('creates and reloads Markdown, Math, Ink, and Divider blocks', async ({ page }) => {
+  await createNote(page, 'Mixed.md', 'Mixed notebook', '# Markdown block');
+  await addBlock(page, 'markdown');
+  await page.locator('.markdown-source-input').last().fill('Second Markdown block');
+  await persisted(page, 'Second Markdown block');
+  await addBlock(page, 'math');
+  await page.locator('.math-source-input').fill('P(A|B) = P(B|A)P(A) / P(B)');
+  await persisted(page, 'P(A|B)');
+  await addBlock(page, 'ink');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json.length ?? 0).toBeGreaterThan(100);
+  await addBlock(page, 'divider');
+
+  await expect(page.locator('.block-wrapper[data-block-type="markdown"]')).toHaveCount(2);
+  await expect(page.locator('.block-wrapper[data-block-type="math"]')).toHaveCount(1);
+  await expect(page.locator('.block-wrapper[data-block-type="ink"]')).toHaveCount(1);
+  await expect(page.locator('.block-wrapper[data-block-type="divider"]')).toHaveCount(1);
+
+  await page.reload();
+  await openNote(page, 'Mixed.md', 'Mixed notebook');
+  await expect(page.locator('.math-source-input')).toHaveValue('P(A|B) = P(B|A)P(A) / P(B)');
+  await expect(page.locator('.ink-canvas-host canvas')).toBeVisible();
+  await expect(page.locator('.document-divider')).toBeVisible();
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  const previewBlocks = page.locator('.preview-block');
+  await expect(previewBlocks).toHaveCount(5);
+  await expect(previewBlocks.nth(0)).toHaveClass(/preview-markdown/);
+  await expect(previewBlocks.nth(1)).toHaveClass(/preview-markdown/);
+  await expect(previewBlocks.nth(2)).toHaveClass(/preview-math/);
+  await expect(previewBlocks.nth(3)).toHaveClass(/preview-ink/);
+  await expect(previewBlocks.nth(4)).toHaveClass(/preview-divider/);
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+});
+
+test('Stonepen drawing, tools, undo, redo, navigation, and reload are durable', async ({ page }) => {
+  await createNote(page, 'Ink.md', 'Ink notebook', '# Drawing proof');
+  await addBlock(page, 'ink');
+  const canvas = page.locator('.ink-canvas-host canvas');
+  await expect(canvas).toBeVisible();
+  await expect.poll(async () => {
+    const box = await canvas.boundingBox();
+    return box ? Math.min(box.width, box.height) : 0;
+  }).toBeGreaterThan(200);
+
+  await expect.poll(async () => latestBlockContent(page, 'ink')).not.toBeNull();
+  const initialJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  const initialPixels = await canvas.evaluate(element => element.toDataURL());
+  const box = await canvas.boundingBox();
+  await page.mouse.move(box.x + 60, box.y + 95);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 120, box.y + 125, { steps: 6 });
+  await page.mouse.move(box.x + 205, box.y + 80, { steps: 8 });
+  await page.mouse.up();
+
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).not.toBe(initialJson);
+  const drawnJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await expect.poll(async () => canvas.evaluate(element => element.toDataURL())).not.toBe(initialPixels);
+
+  const inkBlock = page.locator('.block-wrapper[data-block-type="ink"]');
+  await inkBlock.getByRole('button', { name: 'Eraser', exact: true }).click();
+  await expect(inkBlock.getByRole('button', { name: 'Eraser', exact: true })).toHaveClass(/active/);
+  await inkBlock.getByRole('button', { name: 'Select', exact: true }).click();
+  await expect(inkBlock.getByRole('button', { name: 'Select', exact: true })).toHaveClass(/active/);
+  await inkBlock.getByRole('button', { name: 'Pen', exact: true }).click();
+  await inkBlock.locator('.ink-width-input').fill('8');
+  await inkBlock.getByRole('button', { name: 'Blue', exact: true }).click();
+
+  await inkBlock.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).not.toBe(drawnJson);
+  await inkBlock.getByRole('button', { name: 'Redo', exact: true }).click();
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).toBe(drawnJson);
+
+  await createNote(page, 'Other.md', 'Other note', '# Other');
+  await openNote(page, 'Ink.md', 'Ink notebook');
+  await expect(page.locator('.ink-canvas-host canvas')).toBeVisible();
+  await page.reload();
+  await openNote(page, 'Ink.md', 'Ink notebook');
+  await expect(page.locator('.ink-canvas-host canvas')).toBeVisible();
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).toBe(drawnJson);
+  await expect.poll(async () => page.locator('.ink-canvas-host canvas').evaluate(element => element.toDataURL())).not.toBe(initialPixels);
 });
 
 test('knowledge navigation resolves outlines, links, backlinks, and tags', async ({ page }) => {
@@ -188,14 +340,17 @@ test('knowledge navigation resolves outlines, links, backlinks, and tags', async
   await expect(page.locator('.wikilink')).toHaveText('Readable Alias');
   await page.locator('.wikilink').click();
   await expect(page.locator('.breadcrumb')).toHaveText('Projects/Target.md');
+  await ensureWorkspaceOpen(page);
   await page.locator('.recent-item[data-path="Home.md"]').click();
-  if (!await page.locator('.inspector-tab[data-tab="Links"]').isVisible()) {
-    await page.locator('.mode-bar .toggle-inspector-btn').click();
-  }
-  await page.locator('.inspector-tab[data-tab="Links"]').click();
+  await ensureInspectorOpen(page);
+  await page.locator('.inspector-tab[data-tab="Backlinks"]').click();
   await expect(page.locator('.inspector-section')).toContainText('Notes label');
   await expect(page.locator('.inspector-section')).toContainText('Home context');
   await page.locator('.inspector-tab[data-tab="Tags"]').click();
   await expect(page.locator('.inspector-section')).toContainText('Current Note Tags');
   await expect(page.locator('.tag-item[data-tag="rust"]').last()).toContainText('2');
+  await page.locator('.inspector-tab[data-tab="Graph"]').click();
+  await expect(page.locator('.local-graph-node[data-path="Projects/Target.md"]')).toBeVisible();
+  await page.locator('.graph-node-hit[data-path="Projects/Target.md"]').click();
+  await expect(page.locator('.breadcrumb')).toHaveText('Projects/Target.md');
 });
