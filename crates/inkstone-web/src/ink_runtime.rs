@@ -32,6 +32,7 @@ impl InkRuntimeRegistry {
         tool: &str,
         brush_width: f32,
         brush_color: (u8, u8, u8),
+        read_only: bool,
     ) -> Result<Option<InkSnapshot>, JsValue> {
         if let Some(mut mounted) = self.handles.remove(&block_id) {
             mounted.handle.destroy();
@@ -41,13 +42,16 @@ impl InkRuntimeRegistry {
         if !stored_json.is_empty() {
             handle.load_json(stored_json)?;
         }
-        handle.set_tool(tool);
-        handle.set_brush_width(brush_width);
-        handle.set_brush_color(brush_color.0, brush_color.1, brush_color.2);
+        handle.set_read_only(read_only);
+        if !read_only {
+            handle.set_tool(tool);
+            handle.set_brush_width(brush_width);
+            handle.set_brush_color(brush_color.0, brush_color.1, brush_color.2);
+        }
         handle.resize();
 
         let exported = handle.export_json()?;
-        let initial_snapshot = stored_json.is_empty().then(|| InkSnapshot {
+        let initial_snapshot = (!read_only && stored_json.is_empty()).then(|| InkSnapshot {
             doc_id,
             block_id,
             stonepen_json: exported.clone(),
