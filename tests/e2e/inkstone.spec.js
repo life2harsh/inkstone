@@ -105,6 +105,32 @@ async function createNote(page, path, title, markdown) {
   await persisted(page, markdown.split('\n').at(-1));
 }
 
+async function drawInkStroke(page, canvas = page.locator('.block-wrapper[data-block-type="ink"] canvas')) {
+  await expect(canvas).toBeVisible();
+  await canvas.scrollIntoViewIfNeeded();
+  const box = await canvas.boundingBox();
+  await page.mouse.move(box.x + 55, box.y + 85);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 125, box.y + 118, { steps: 6 });
+  await page.mouse.move(box.x + 210, box.y + 72, { steps: 8 });
+  await page.mouse.up();
+}
+
+async function preparePreviewNotebook(page) {
+  await createNote(
+    page,
+    'Research/Bayes Rule Derivation.md',
+    'Bayes Rule Derivation',
+    '# Posterior update\n\nBayes rule connects a [prior reference](https://example.com/prior) to observed evidence. #bayes #probability\n\n## Components\n\n- Prior probability\n- Likelihood function\n- Normalizing evidence\n\n> Update beliefs only after accounting for the marginal likelihood.\n\n| Quantity | Meaning |\n| --- | --- |\n| Prior | Initial belief |\n| Posterior | Updated belief |\n\nUse `P(A|B)` for the posterior.'
+  );
+  await addBlock(page, 'math');
+  await page.locator('.math-source-input').fill('P(A|B) = \\frac{P(B|A)P(A)}{P(B)}');
+  await persisted(page, '\\frac');
+  await addBlock(page, 'ink');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json.length ?? 0).toBeGreaterThan(100);
+  await addBlock(page, 'divider');
+}
+
 async function openNote(page, path, title) {
   await ensureWorkspaceOpen(page);
   await page.locator(`.file-entry[data-path="${path}"]`).click();
@@ -271,6 +297,123 @@ test('creates and reloads Markdown, Math, Ink, and Divider blocks', async ({ pag
   await expect(previewBlocks.nth(3)).toHaveClass(/preview-ink/);
   await expect(previewBlocks.nth(4)).toHaveClass(/preview-divider/);
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
+});
+
+test('Preview is a semantic reading page without authoring controls', async ({ page }) => {
+  await preparePreviewNotebook(page);
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+
+  for (const selector of [
+    '.document-title-input',
+    '.block-textarea',
+    '.math-source-input',
+    '.block-insert-control',
+    '.block-action-btn',
+    '.ink-tool-btn',
+    '.ink-width-input',
+    '.ink-color-btn'
+  ]) {
+    await expect(page.locator(selector), `${selector} is absent in Preview`).toHaveCount(0);
+  }
+
+  await expect(page.getByRole('heading', { name: 'Bayes Rule Derivation', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Posterior update', exact: true })).toBeVisible();
+  await expect(page.locator('.preview-markdown ul li')).toHaveCount(3);
+  await expect(page.getByRole('link', { name: 'prior reference' })).toHaveAttribute('href', 'https://example.com/prior');
+  await expect(page.locator('.preview-markdown table')).toBeVisible();
+  await expect(page.locator('.preview-markdown blockquote')).toBeVisible();
+  await expect(page.locator('.preview-content')).not.toContainText('# Posterior update');
+  await expect(page.locator('.preview-content')).not.toContainText('- Prior probability');
+  await expect(page.locator('.preview-math .math-display math')).toBeVisible();
+  await expect(page.locator('.preview-math mfrac')).toBeVisible();
+  await expect(page.locator('.preview-divider .document-divider')).toBeVisible();
+  await expect(page.locator('.preview-ink canvas[role="img"]')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Expand Ink drawing' })).toBeVisible();
+});
+
+test('Preview Ink is read-only and returns to editable Ink without loss', async ({ page }) => {
+  await preparePreviewNotebook(page);
+  const editCanvas = page.locator('.block-wrapper[data-block-type="ink"] canvas');
+  const emptyPixels = await editCanvas.evaluate(canvas => canvas.toDataURL());
+  const initialJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await drawInkStroke(page, editCanvas);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).not.toBe(initialJson);
+  const drawnJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await expect.poll(async () => editCanvas.evaluate(canvas => canvas.toDataURL())).not.toBe(emptyPixels);
+
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  const previewCanvas = page.locator('.preview-ink canvas');
+  await expect(previewCanvas).toBeVisible();
+  const beforeInputPixels = await previewCanvas.evaluate(canvas => canvas.toDataURL());
+  await previewCanvas.evaluate(canvas => {
+    const rect = canvas.getBoundingClientRect();
+    const init = {
+      bubbles: true,
+      pointerId: 41,
+      pointerType: 'mouse',
+      buttons: 1,
+      clientX: rect.left + 95,
+      clientY: rect.top + 95
+    };
+    canvas.dispatchEvent(new PointerEvent('pointerdown', init));
+    canvas.dispatchEvent(new PointerEvent('pointerup', { ...init, buttons: 0 }));
+  });
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).toBe(drawnJson);
+  expect(await previewCanvas.evaluate(canvas => canvas.toDataURL())).toBe(beforeInputPixels);
+
+  await previewCanvas.evaluate(canvas => {
+    canvas.tabIndex = 0;
+    canvas.focus();
+  });
+  await page.keyboard.press('Control+Z');
+  await page.keyboard.press('Delete');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).toBe(drawnJson);
+  expect(await previewCanvas.evaluate(canvas => canvas.toDataURL())).toBe(beforeInputPixels);
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(page.locator('.document-title-input')).toHaveValue('Bayes Rule Derivation');
+  await expect(page.locator('.math-source-input')).toHaveValue('P(A|B) = \\frac{P(B|A)P(A)}{P(B)}');
+  await expect(page.locator('.ink-tool-btn')).toHaveCount(4);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).toBe(drawnJson);
+  const returnedCanvas = page.locator('.block-wrapper[data-block-type="ink"] canvas');
+  await drawInkStroke(page, returnedCanvas);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).not.toBe(drawnJson);
+});
+
+test('Preview Ink expands and collapses read-only without changing JSON', async ({ page }) => {
+  await preparePreviewNotebook(page);
+  const initialJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await drawInkStroke(page);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json).not.toBe(initialJson);
+  const drawnJson = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+
+  const ink = page.locator('.preview-ink');
+  const mainContent = page.locator('.main-content');
+  const expandButton = page.getByRole('button', { name: 'Expand Ink drawing' });
+  await expandButton.scrollIntoViewIfNeeded();
+  const scrollPosition = await mainContent.evaluate(element => element.scrollTop);
+  await expandButton.click();
+  await expect(ink).toHaveClass(/expanded/);
+  await expect(mainContent).toHaveClass(/ink-expanded/);
+  await expect(page.locator('.preview-ink canvas')).toBeVisible();
+  await expect(page.locator('.ink-tool-btn')).toHaveCount(0);
+  await expect(page.locator('.ink-toolbar')).toHaveCount(0);
+  const expandedBox = await ink.boundingBox();
+  expect(expandedBox.width).toBeGreaterThan(380);
+  expect(expandedBox.height).toBeGreaterThan(650);
+  await page.getByRole('button', { name: 'Collapse Ink drawing' }).click();
+  await expect(ink).not.toHaveClass(/expanded/);
+  await expect(mainContent).not.toHaveClass(/ink-expanded/);
+  expect(await mainContent.evaluate(element => element.scrollTop)).toBe(scrollPosition);
+
+  await page.getByRole('button', { name: 'Expand Ink drawing' }).click();
+  await expect(ink).toHaveClass(/expanded/);
+  await page.keyboard.press('Escape');
+  await expect(ink).not.toHaveClass(/expanded/);
+  await expect(mainContent).not.toHaveClass(/ink-expanded/);
+  expect(await mainContent.evaluate(element => element.scrollTop)).toBe(scrollPosition);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).toBe(drawnJson);
 });
 
 test('Stonepen drawing, tools, undo, redo, navigation, and reload are durable', async ({ page }) => {
