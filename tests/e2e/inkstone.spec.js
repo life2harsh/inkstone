@@ -131,8 +131,109 @@ async function preparePreviewNotebook(page) {
   await addBlock(page, 'divider');
 }
 
+async function prepareResearchWorkspace(page) {
+  const primaryMarkdown = `# Posterior inference
+
+Bayes' rule is the bookkeeping identity behind probabilistic learning. It combines a prior model with observed evidence and makes every assumption available for inspection. #probability #bayes #derivation
+
+The derivation starts from the symmetry of the joint distribution. See this [conditional probability reference](https://en.wikipedia.org/wiki/Conditional_probability) and [[Conjugate Priors|closed-form conjugate updates]] for the surrounding theory.
+
+## Derivation
+
+1. Write the joint probability in both conditional directions.
+2. Equate the two factorizations.
+3. Divide by the evidence term.
+
+The resulting terms have distinct roles:
+
+- **Prior**: belief before the observation
+- **Likelihood**: compatibility of data and hypothesis
+- **Evidence**: the normalizing probability of the data
+
+> The denominator is not optional: it ensures the posterior integrates to one.
+
+| Quantity | Interpretation | Notebook |
+| --- | --- | --- |
+| \`P(H)\` | Prior belief | [[Conjugate Priors|Conjugate Priors]] |
+| \`P(D\\|H)\` | Likelihood | [[Thompson Sampling|Sequential decisions]] |
+| \`P(D)\` | Marginal evidence | [Marginal likelihood](Marginal Likelihood.md) |
+
+## Marginalization
+
+For a discrete hypothesis space, compute the evidence by summing over all candidate hypotheses. In implementation notes, \`log_evidence\` is preferable when products become numerically small.
+
+This identity also motivates [[Variational Inference|variational approximations]]. The related [[Teaching/Bayesian Statistics|teaching note]] presents the same argument geometrically.`;
+
+  await createNote(
+    page,
+    'Research/Bayes Rule Derivation.md',
+    'Bayes’ Rule Derivation',
+    primaryMarkdown
+  );
+  await addBlock(page, 'math');
+  await page.locator('.math-source-input').fill('P(H|D) = \\frac{P(D|H)P(H)}{P(D)}');
+  await persisted(page, '\\frac');
+  await addBlock(page, 'math');
+  await page.locator('.math-source-input').last().fill('P(D) = \\sum_{h=1}^{n} P(D|h)P(h)');
+  await persisted(page, '\\sum');
+  await addBlock(page, 'ink');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink'))?.stonepen_json.length ?? 0).toBeGreaterThan(100);
+  const inkCanvas = page.locator('.block-wrapper[data-block-type="ink"] canvas');
+  const initialInk = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await inkCanvas.scrollIntoViewIfNeeded();
+  const box = await inkCanvas.boundingBox();
+  await page.mouse.move(box.x + 55, box.y + 85);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 125, box.y + 118, { steps: 6 });
+  await page.mouse.move(box.x + 210, box.y + 72, { steps: 8 });
+  await page.mouse.up();
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).not.toBe(initialInk);
+  await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
+  await page.mouse.move(box.x + 95, box.y + 165);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 155, box.y + 130, { steps: 5 });
+  await page.mouse.move(box.x + 230, box.y + 172, { steps: 7 });
+  await page.mouse.up();
+  for (const [startX, startY, endX, endY] of [
+    [45, 145, 250, 145],
+    [270, 132, 330, 132],
+    [270, 154, 330, 154]
+  ]) {
+    await page.mouse.move(box.x + startX, box.y + startY);
+    await page.mouse.down();
+    await page.mouse.move(box.x + endX, box.y + endY, { steps: 8 });
+    await page.mouse.up();
+  }
+  await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
+  await addBlock(page, 'divider');
+
+  const linkedNotes = [
+    ['Research/Probability Axioms.md', 'Probability Axioms', '# Probability axioms\n\nThe normalization axiom supports [[Bayes Rule Derivation|the Bayes derivation]]. #probability #foundations'],
+    ['Research/Conjugate Priors.md', 'Conjugate Priors', '# Conjugate priors\n\nClosed-form updates are a direct application of [[Bayes Rule Derivation|Bayes’ rule]]. #bayes #probability'],
+    ['Research/Thompson Sampling.md', 'Thompson Sampling', '# Thompson sampling\n\nPosterior sampling repeatedly applies [[Bayes Rule Derivation|the posterior update]]. #bayes #decisions'],
+    ['Research/Marginal Likelihood.md', 'Marginal Likelihood', '# Marginal likelihood\n\nModel evidence is the denominator in [[Bayes Rule Derivation|Bayes’ rule]]. #probability #derivation'],
+    ['Research/Variational Inference.md', 'Variational Inference', '# Variational inference\n\nApproximate inference begins where [[Bayes Rule Derivation|exact marginalization]] becomes expensive. #bayes #approximation'],
+    ['Teaching/Bayesian Statistics.md', 'Bayesian Statistics', '# Bayesian statistics\n\nLecture 2 revisits [[Research/Bayes Rule Derivation|the complete derivation]] and [[Research/Probability Axioms|probability foundations]]. #bayes #teaching'],
+    ['Projects/Experiment Notes.md', 'Experiment Notes', '# Experiment notes\n\nThe analysis plan follows [[Research/Bayes Rule Derivation|the posterior workflow]] and checks [[Research/Marginal Likelihood|model evidence]]. #probability #experiments']
+  ];
+  for (const [path, title, markdown] of linkedNotes) {
+    await createNote(page, path, title, markdown);
+  }
+  await page.reload();
+  await openNote(page, 'Research/Bayes Rule Derivation.md', 'Bayes’ Rule Derivation');
+  await expect(page.locator('.search-status')).toBeHidden();
+}
+
 async function openNote(page, path, title) {
   await ensureWorkspaceOpen(page);
+  const segments = path.split('/');
+  for (let index = 1; index < segments.length; index += 1) {
+    const folderPath = segments.slice(0, index).join('/');
+    const folder = page.locator(`.explorer-folder[data-path="${folderPath}"]`);
+    if (await folder.isVisible() && !/expanded/.test(await folder.getAttribute('class'))) {
+      await folder.click();
+    }
+  }
   await page.locator(`.file-entry[data-path="${path}"]`).click();
   await expect(page.locator('.breadcrumb')).toHaveText(path);
   await expect(page.locator('.document-title-input')).toHaveValue(title);
@@ -496,4 +597,97 @@ test('knowledge navigation resolves outlines, links, backlinks, and tags', async
   await expect(page.locator('.local-graph-node[data-path="Projects/Target.md"]')).toBeVisible();
   await page.locator('.graph-node-hit[data-path="Projects/Target.md"]').click();
   await expect(page.locator('.breadcrumb')).toHaveText('Projects/Target.md');
+});
+
+test('populated research notebook is durable and composed', async ({ page }, testInfo) => {
+  test.setTimeout(90_000);
+  await prepareResearchWorkspace(page);
+  const isMobile = testInfo.project.name === 'chromium-mobile';
+  await page.setViewportSize(isMobile ? { width: 420, height: 800 } : { width: 1440, height: 900 });
+
+  await ensureWorkspaceOpen(page);
+  await page.locator('.explorer-folder[data-path="Teaching"]').click();
+  await expect(page.locator('.file-entry[data-path="Research/Probability Axioms.md"]')).toBeAttached();
+  await expect(page.locator('.file-entry[data-path="Teaching/Bayesian Statistics.md"]')).toBeAttached();
+  await expect(page.locator('.document-title-input')).toHaveValue('Bayes’ Rule Derivation');
+  await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
+  const storedInk = (await latestBlockContent(page, 'ink')).stonepen_json;
+
+  if (isMobile) {
+    await ensureWorkspaceOpen(page);
+    await expect(page.locator('.sidebar')).toBeVisible();
+    await page.locator('.file-entry[data-path="Research/Bayes Rule Derivation.md"]').click();
+    await expect(page.locator('.app-container')).not.toHaveClass(/sidebar-open/);
+    const markdownEditor = page.locator('.markdown-source-input');
+    await markdownEditor.fill(`${await markdownEditor.inputValue()}\n\nMobile review confirms the derivation remains editable.`);
+    await persisted(page, 'Mobile review confirms');
+    await drawInkStroke(page);
+    await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
+  } else {
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/edit-desktop.png', fullPage: true });
+  }
+
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Bayes’ Rule Derivation', exact: true })).toBeVisible();
+  await expect(page.locator('.metadata-label').filter({ hasText: 'Created' })).toBeVisible();
+  await expect(page.locator('.metadata-label').filter({ hasText: 'Updated' })).toBeVisible();
+  await expect(page.locator('.metadata-tag')).toHaveCount(3);
+  await expect(page.getByRole('heading', { name: 'Posterior inference', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Derivation', exact: true })).toBeVisible();
+  await expect(page.locator('.preview-markdown ol li')).toHaveCount(3);
+  await expect(page.locator('.preview-markdown ul li')).toHaveCount(3);
+  await expect(page.locator('.preview-markdown blockquote')).toBeVisible();
+  await expect(page.locator('.preview-markdown table')).toBeVisible();
+  await expect(page.locator('.preview-math')).toHaveCount(2);
+  await expect(page.locator('.preview-math mfrac')).toHaveCount(1);
+  await expect(page.locator('.preview-math msubsup')).toBeVisible();
+  await expect(page.locator('.preview-ink canvas[role="img"]')).toBeVisible();
+  await expect(page.locator('.ink-toolbar')).toHaveCount(0);
+  await expect(page.locator('.ink-save-state')).toHaveCount(0);
+
+  if (isMobile) {
+    await ensureInspectorOpen(page);
+  }
+  await page.locator('.inspector-tab[data-tab="Backlinks"]').click();
+  await expect(page.locator('.inspector-section[data-section="backlinks"] .backlink-context')).toHaveCount(7);
+  await expect(page.locator('.inspector-section')).toContainText('Research/Conjugate Priors.md');
+  if (!isMobile) {
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-backlinks.png', fullPage: true });
+  }
+
+  await page.locator('.inspector-tab[data-tab="Graph"]').click();
+  await expect(page.locator('.local-graph-node')).toHaveCount(8);
+  await expect(page.locator('.local-graph-node.active')).toContainText('Bayes Rule Deriva');
+  if (!isMobile) {
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-graph.png', fullPage: true });
+  }
+  await page.locator('.graph-node-hit[data-path="Research/Conjugate Priors.md"]').click();
+  await expect(page.locator('.breadcrumb')).toHaveText('Research/Conjugate Priors.md');
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await openNote(page, 'Research/Bayes Rule Derivation.md', 'Bayes’ Rule Derivation');
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+
+  const expand = page.getByRole('button', { name: 'Expand Ink drawing' });
+  await expand.scrollIntoViewIfNeeded();
+  await expand.click();
+  await expect(page.locator('.preview-ink')).toHaveClass(/expanded/);
+  await expect(page.locator('.ink-tool-btn')).toHaveCount(0);
+  if (!isMobile) {
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-ink-expanded.png' });
+  }
+  await page.getByRole('button', { name: 'Collapse Ink drawing' }).click();
+  await expect(page.locator('.preview-ink')).not.toHaveClass(/expanded/);
+
+  if (isMobile) {
+    await page.locator('.main-content').evaluate(element => { element.scrollTop = 0; });
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-mobile.png', fullPage: true });
+  } else {
+    await page.locator('.main-content').evaluate(element => { element.scrollTop = 0; });
+    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-desktop.png', fullPage: true });
+  }
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(page.locator('.markdown-source-input')).toHaveValue(/Posterior inference/);
+  await expect(page.locator('.math-source-input')).toHaveCount(2);
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).not.toBe('');
+  if (!isMobile) expect((await latestBlockContent(page, 'ink')).stonepen_json).toBe(storedInk);
 });
