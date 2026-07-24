@@ -17,7 +17,9 @@
   --radius-md: 10px;
   --radius-lg: 14px;
   --shadow-subtle: 0 1px 3px rgba(0, 0, 0, 0.05);
+  --shadow-card: 0 8px 24px rgba(45, 39, 31, 0.055);
   --shadow-panel: 0 12px 32px rgba(30, 41, 59, 0.12);
+  --surface-muted: #eeece8;
   --focus-ring: 0 0 0 3px rgba(44, 82, 130, 0.18);
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-serif: Georgia, Cambria, "Times New Roman", Times, serif;
@@ -1320,6 +1322,15 @@ body {
   color: var(--warning);
 }
 
+.ink-save-state[data-state="changed"] {
+  color: var(--text-muted);
+}
+
+.ink-save-state[data-state="failed"] {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .ink-canvas-host {
   position: relative;
   width: 100%;
@@ -2215,11 +2226,14 @@ body {
 }
 
 .recent-list {
-  margin-bottom: 24px;
+  max-height: 218px;
+  margin-bottom: 16px;
   display: flex;
   position: relative;
   flex-direction: column;
   gap: 4px;
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 
 .recent-item {
@@ -2587,5 +2601,21 @@ body {
     width: min(350px, 92vw);
     max-width: none;
     padding: 16px;
+  }
+
+  .ink-toolbar {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
+  .ink-tool-btn,
+  .ink-action-btn {
+    min-height: 38px;
+  }
+
+  .ink-color-btn {
+    width: 30px;
+    height: 30px;
+    flex-basis: 30px;
   }
 }
