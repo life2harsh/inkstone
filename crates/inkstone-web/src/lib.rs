@@ -25,7 +25,7 @@ pub mod storage;
 pub mod workspace_db;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -49,6 +49,137 @@ thread_local! {
 pub enum DocumentMode {
     Edit,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InkSavePhase {
+    Changed,
+    Saving,
+    Saved,
+    Failed,
+}
+
+impl InkSavePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "Drawing changed",
+            Self::Saving => "Saving...",
+            Self::Saved => "Saved locally",
+            Self::Failed => "Save failed",
+        }
+    }
+
+    fn state(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Saving => "saving",
+            Self::Saved => "saved",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InkSaveState {
+    phase: InkSavePhase,
+    generation: u64,
+    update_id: Option<UpdateId>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InkSaveTracker {
+    states: HashMap<(DocId, BlockId), InkSaveState>,
+}
+
+impl InkSaveTracker {
+    fn changed(&mut self, doc_id: DocId, block_id: BlockId) -> InkSavePhase {
+        let state = self
+            .states
+            .entry((doc_id, block_id))
+            .or_insert(InkSaveState {
+                phase: InkSavePhase::Saved,
+                generation: 0,
+                update_id: None,
+            });
+        state.generation += 1;
+        state.phase = InkSavePhase::Changed;
+        state.update_id = None;
+        state.phase
+    }
+
+    fn queued(&mut self, doc_id: DocId, block_id: BlockId, update_id: UpdateId) {
+        let state = self
+            .states
+            .entry((doc_id, block_id))
+            .or_insert(InkSaveState {
+                phase: InkSavePhase::Changed,
+                generation: 1,
+                update_id: None,
+            });
+        if state.phase != InkSavePhase::Changed {
+            state.generation += 1;
+            state.phase = InkSavePhase::Changed;
+        }
+        state.update_id = Some(update_id);
+    }
+
+    fn saving(
+        &mut self,
+        doc_id: DocId,
+        block_id: BlockId,
+        update_id: UpdateId,
+    ) -> Option<InkSavePhase> {
+        let state = self
+            .states
+            .entry((doc_id, block_id))
+            .or_insert(InkSaveState {
+                phase: InkSavePhase::Changed,
+                generation: 1,
+                update_id: Some(update_id),
+            });
+        if state.update_id != Some(update_id) {
+            return None;
+        }
+        state.phase = InkSavePhase::Saving;
+        Some(state.phase)
+    }
+
+    fn finish(
+        &mut self,
+        doc_id: DocId,
+        block_id: BlockId,
+        update_id: UpdateId,
+        phase: InkSavePhase,
+    ) -> Option<InkSavePhase> {
+        let state = self.states.get_mut(&(doc_id, block_id))?;
+        if state.update_id != Some(update_id) {
+            return None;
+        }
+        state.phase = phase;
+        state.update_id = None;
+        Some(state.phase)
+    }
+
+    fn phase(&self, doc_id: DocId, block_id: BlockId) -> InkSavePhase {
+        self.states
+            .get(&(doc_id, block_id))
+            .map(|state| state.phase)
+            .unwrap_or(InkSavePhase::Saved)
+    }
+
+    fn failed(&mut self, doc_id: DocId, block_id: BlockId) -> InkSavePhase {
+        let state = self
+            .states
+            .entry((doc_id, block_id))
+            .or_insert(InkSaveState {
+                phase: InkSavePhase::Failed,
+                generation: 1,
+                update_id: None,
+            });
+        state.phase = InkSavePhase::Failed;
+        state.update_id = None;
+        state.phase
+    }
 }
 
 #[derive(Clone)]
@@ -89,6 +220,7 @@ pub struct DriverInner {
     pub ink_brush_color: (u8, u8, u8),
     pub expanded_ink_block: Option<BlockId>,
     pub sidebar_open: bool,
+    ink_save_tracker: InkSaveTracker,
 }
 
 #[derive(Clone)]
@@ -137,6 +269,7 @@ impl Driver {
                 ink_brush_color: (31, 41, 55),
                 expanded_ink_block: None,
                 sidebar_open: false,
+                ink_save_tracker: InkSaveTracker::default(),
             })),
             Rc::new(RefCell::new(ink_runtime::InkRuntimeRegistry::default())),
         )
@@ -150,6 +283,52 @@ impl Driver {
         if let Ok(Some(element)) = document.query_selector(&selector) {
             element.set_text_content(Some(text));
             let _ = element.set_attribute("data-state", state);
+        }
+    }
+
+    fn update_ink_save_phase(&self, block_id: BlockId, phase: InkSavePhase) {
+        self.set_ink_save_state(block_id, phase.label(), phase.state());
+    }
+
+    fn mark_ink_changed(&self, block_id: BlockId) {
+        let phase = {
+            let mut inner = self.0.borrow_mut();
+            if inner.document_mode != DocumentMode::Edit {
+                return;
+            }
+            let doc_id = inner.selected_doc_id;
+            inner.ink_save_tracker.changed(doc_id, block_id)
+        };
+        self.update_ink_save_phase(block_id, phase);
+    }
+
+    fn mark_ink_failed(&self, block_id: BlockId) {
+        let phase = {
+            let mut inner = self.0.borrow_mut();
+            let doc_id = inner.selected_doc_id;
+            inner.ink_save_tracker.failed(doc_id, block_id)
+        };
+        self.update_ink_save_phase(block_id, phase);
+    }
+
+    fn finish_ink_update(
+        &self,
+        doc_id: DocId,
+        block_id: Option<BlockId>,
+        update_id: UpdateId,
+        phase: InkSavePhase,
+    ) {
+        let Some(block_id) = block_id else {
+            return;
+        };
+        let visible_phase = {
+            self.0
+                .borrow_mut()
+                .ink_save_tracker
+                .finish(doc_id, block_id, update_id, phase)
+        };
+        if let Some(visible_phase) = visible_phase {
+            self.update_ink_save_phase(block_id, visible_phase);
         }
     }
 
@@ -176,7 +355,11 @@ impl Driver {
             return;
         }
 
-        self.set_ink_save_state(snapshot.block_id, "Saving drawing...", "saving");
+        let update_id = UpdateId::new_v4();
+        self.0
+            .borrow_mut()
+            .ink_save_tracker
+            .queued(snapshot.doc_id, snapshot.block_id, update_id);
         self.dispatch(ClientEvent::LocalIntent {
             op: DocumentOp::ReplaceBlockContent {
                 block_id: snapshot.block_id,
@@ -184,18 +367,20 @@ impl Driver {
                     stonepen_json: snapshot.stonepen_json,
                 },
             },
-            update_id: UpdateId::new_v4(),
+            update_id,
             applied_at_ms: js_sys::Date::now() as i64,
         });
-        self.set_ink_save_state(snapshot.block_id, "Saved locally", "saved");
     }
 
     fn save_ink_block(&self, block_id: BlockId) {
         let result = { self.1.borrow_mut().export_changed(block_id) };
         match result {
             Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
-            Ok(None) => self.set_ink_save_state(block_id, "Saved locally", "saved"),
-            Err(error) => self.report_ink_error("Failed to export Ink block", error),
+            Ok(None) => {}
+            Err(error) => {
+                self.mark_ink_failed(block_id);
+                self.report_ink_error("Failed to export Ink block", error);
+            }
         }
     }
 
@@ -216,7 +401,10 @@ impl Driver {
         match result {
             Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
             Ok(None) => {}
-            Err(error) => self.report_ink_error("Failed to undo Ink block", error),
+            Err(error) => {
+                self.mark_ink_failed(block_id);
+                self.report_ink_error("Failed to undo Ink block", error);
+            }
         }
     }
 
@@ -225,7 +413,10 @@ impl Driver {
         match result {
             Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
             Ok(None) => {}
-            Err(error) => self.report_ink_error("Failed to redo Ink block", error),
+            Err(error) => {
+                self.mark_ink_failed(block_id);
+                self.report_ink_error("Failed to redo Ink block", error);
+            }
         }
     }
 
@@ -298,9 +489,6 @@ impl Driver {
             );
             match result {
                 Ok(Some(snapshot)) => self.dispatch_ink_snapshot(snapshot),
-                Ok(None) if !read_only => {
-                    self.set_ink_save_state(block.id, "Saved locally", "saved")
-                }
                 Ok(None) => {}
                 Err(error) => self.report_ink_error("Failed to mount Ink block", error),
             }
@@ -1364,8 +1552,30 @@ impl Driver {
             }
             Effect::PersistLocalUpdate { update_id, update } => {
                 this.0.borrow_mut().persistence_status = "Saving update...".to_string();
+                let doc_id = update.doc_id;
+                let ink_block_id = match &update.op {
+                    DocumentOp::ReplaceBlockContent {
+                        block_id,
+                        content: BlockContent::Ink { .. },
+                    } => Some(*block_id),
+                    DocumentOp::InsertBlock { block, .. }
+                        if matches!(&block.content, BlockContent::Ink { .. }) =>
+                    {
+                        Some(block.id)
+                    }
+                    _ => None,
+                };
+                if let Some(block_id) = ink_block_id {
+                    let phase = this
+                        .0
+                        .borrow_mut()
+                        .ink_save_tracker
+                        .saving(doc_id, block_id, update_id);
+                    if let Some(phase) = phase {
+                        this.update_ink_save_phase(block_id, phase);
+                    }
+                }
                 wasm_bindgen_futures::spawn_local(async move {
-                    let doc_id = update.doc_id;
                     let db = {
                         let inner = this.0.borrow();
                         inner.db.clone()
@@ -1378,6 +1588,12 @@ impl Driver {
                                 Some("IndexedDB handle unavailable for update".to_string());
                             this.0.borrow_mut().persistence_status =
                                 "Storage error: IndexedDB handle unavailable".to_string();
+                            this.finish_ink_update(
+                                doc_id,
+                                ink_block_id,
+                                update_id,
+                                InkSavePhase::Failed,
+                            );
                             this.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
                             this.render();
                             return;
@@ -1394,6 +1610,12 @@ impl Driver {
                                     "Parse error on persisted update record: {:?}",
                                     e
                                 ));
+                                this.finish_ink_update(
+                                    doc_id,
+                                    ink_block_id,
+                                    update_id,
+                                    InkSavePhase::Failed,
+                                );
                                 this.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
                                 this.render();
                                 return;
@@ -1405,6 +1627,12 @@ impl Driver {
                                 format!("Error: read failed: {:?}", e);
                             this.0.borrow_mut().storage_error =
                                 Some(format!("IndexedDB read error during update: {:?}", e));
+                            this.finish_ink_update(
+                                doc_id,
+                                ink_block_id,
+                                update_id,
+                                InkSavePhase::Failed,
+                            );
                             this.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
                             this.render();
                             return;
@@ -1420,6 +1648,13 @@ impl Driver {
                                 Ok(()) => {
                                     this.0.borrow_mut().persistence_status =
                                         "Saved to IndexedDB".to_string();
+                                    this.finish_ink_update(
+                                        doc_id,
+                                        ink_block_id,
+                                        update_id,
+                                        InkSavePhase::Saved,
+                                    );
+                                    this.dispatch(ClientEvent::LocalUpdatePersisted { update_id });
                                     let current_path = {
                                         let inner = this.0.borrow();
                                         (inner.selected_doc_id == doc_id)
@@ -1427,9 +1662,6 @@ impl Driver {
                                             .flatten()
                                     };
                                     if let Some(path) = current_path {
-                                        this.dispatch(ClientEvent::LocalUpdatePersisted {
-                                            update_id,
-                                        });
                                         this.update_search_index_for_active_doc(&path);
                                     } else {
                                         this.index_workspace();
@@ -1442,6 +1674,12 @@ impl Driver {
                                         "IndexedDB write error during update: {:?}",
                                         e
                                     ));
+                                    this.finish_ink_update(
+                                        doc_id,
+                                        ink_block_id,
+                                        update_id,
+                                        InkSavePhase::Failed,
+                                    );
                                     this.dispatch(ClientEvent::LocalPersistenceFailed {
                                         update_id,
                                     });
@@ -1454,6 +1692,12 @@ impl Driver {
                                 "Failed to serialize update record".to_string();
                             this.0.borrow_mut().storage_error =
                                 Some(format!("Record serialization error during update: {:?}", e));
+                            this.finish_ink_update(
+                                doc_id,
+                                ink_block_id,
+                                update_id,
+                                InkSavePhase::Failed,
+                            );
                             this.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
                             this.render();
                         }
@@ -2403,8 +2647,12 @@ impl Driver {
                                 save_state
                                     .set_attribute("data-block-id", &block_id.to_string())
                                     .unwrap();
-                                save_state.set_attribute("data-state", "saved").unwrap();
-                                save_state.set_text_content(Some("Saved locally"));
+                                let save_phase =
+                                    inner.ink_save_tracker.phase(view_doc.id, block_id);
+                                save_state
+                                    .set_attribute("data-state", save_phase.state())
+                                    .unwrap();
+                                save_state.set_text_content(Some(save_phase.label()));
                                 toolbar.append_child(&save_state).unwrap();
                                 ink_block.append_child(&toolbar).unwrap();
                                 let canvas_host = document.create_element("div").unwrap();
@@ -3688,6 +3936,32 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     root.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;
     on_click.forget();
 
+    let d_pointerdown = driver.clone();
+    let on_pointerdown = Closure::wrap(Box::new(move |event: web_sys::PointerEvent| {
+        let Some(target) = event.target() else {
+            return;
+        };
+        let Ok(element) = target.dyn_into::<web_sys::Element>() else {
+            return;
+        };
+        if !element.id().starts_with("ink-canvas-") {
+            return;
+        }
+        if let Some(block_id) = element
+            .get_attribute("data-block-id")
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(BlockId)
+        {
+            d_pointerdown.mark_ink_changed(block_id);
+        }
+    }) as Box<dyn FnMut(web_sys::PointerEvent)>);
+    root.add_event_listener_with_callback_and_bool(
+        "pointerdown",
+        on_pointerdown.as_ref().unchecked_ref(),
+        true,
+    )?;
+    on_pointerdown.forget();
+
     let d_pointerup = driver.clone();
     let on_pointerup = Closure::wrap(Box::new(move |event: web_sys::PointerEvent| {
         let Some(target) = event.target() else {
@@ -3990,4 +4264,60 @@ pub fn start_app() -> Result<(), JsValue> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ink_save_tracker_ignores_stale_completion() {
+        let doc_id = DocId::new_v4();
+        let block_id = BlockId::new_v4();
+        let first = UpdateId::new_v4();
+        let second = UpdateId::new_v4();
+        let mut tracker = InkSaveTracker::default();
+
+        assert_eq!(tracker.changed(doc_id, block_id), InkSavePhase::Changed);
+        tracker.queued(doc_id, block_id, first);
+        assert_eq!(
+            tracker.saving(doc_id, block_id, first),
+            Some(InkSavePhase::Saving)
+        );
+        tracker.changed(doc_id, block_id);
+        tracker.queued(doc_id, block_id, second);
+
+        assert_eq!(
+            tracker.finish(doc_id, block_id, first, InkSavePhase::Saved),
+            None
+        );
+        assert_eq!(tracker.phase(doc_id, block_id), InkSavePhase::Changed);
+        assert_eq!(
+            tracker.saving(doc_id, block_id, second),
+            Some(InkSavePhase::Saving)
+        );
+        assert_eq!(
+            tracker.finish(doc_id, block_id, second, InkSavePhase::Saved),
+            Some(InkSavePhase::Saved)
+        );
+    }
+
+    #[test]
+    fn ink_save_tracker_reports_matching_failure_per_block() {
+        let doc_id = DocId::new_v4();
+        let first_block = BlockId::new_v4();
+        let second_block = BlockId::new_v4();
+        let first = UpdateId::new_v4();
+        let second = UpdateId::new_v4();
+        let mut tracker = InkSaveTracker::default();
+
+        tracker.queued(doc_id, first_block, first);
+        tracker.queued(doc_id, second_block, second);
+        tracker.saving(doc_id, first_block, first);
+        tracker.saving(doc_id, second_block, second);
+        tracker.finish(doc_id, first_block, first, InkSavePhase::Failed);
+
+        assert_eq!(tracker.phase(doc_id, first_block), InkSavePhase::Failed);
+        assert_eq!(tracker.phase(doc_id, second_block), InkSavePhase::Saving);
+    }
 }
