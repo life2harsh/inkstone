@@ -2,6 +2,11 @@
 /node_modules/
 /playwright-report/
 /test-results/
+/backups/
+.env
+.env.*
+!.env.example
+!.env.production.example
 apps/web/node_modules/
 apps/web/dist/
 *.swp
