@@ -16,7 +16,7 @@ pub type UpdateSeq = i64;
 #[serde(transparent)]
 pub struct DocId(pub Uuid);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BlockId(pub Uuid);
 

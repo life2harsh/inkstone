@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{BlockId, DocId};
 
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const INK_COLLABORATION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InkstoneDocument {
@@ -21,6 +22,14 @@ pub struct DocumentBlock {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub content: BlockContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InkCollaborationState {
+    pub version: u32,
+    pub stream_epoch: uuid::Uuid,
+    /// Stonepen-owned opaque collaboration snapshot.
+    pub snapshot: Vec<u8>,
 }
 
 impl DocumentBlock {
@@ -50,9 +59,29 @@ pub enum BlockContent {
         /// and receives current payload through StonepenHandle::export_json.
         /// No conversion to Inkstone strokes. No duplicated InkStroke structs.
         stonepen_json: String,
+        /// Absent only for legacy JSON-only Ink blocks awaiting migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collaboration: Option<InkCollaborationState>,
     },
     #[serde(rename = "divider")]
     Divider,
+}
+
+pub fn new_opaque_ink_content(
+    width: f32,
+    height: f32,
+    stream_epoch: uuid::Uuid,
+) -> Result<BlockContent, String> {
+    let (snapshot, stonepen_json) =
+        stonepen_core::new_opaque_document(width, height).map_err(|error| error.to_string())?;
+    Ok(BlockContent::Ink {
+        stonepen_json,
+        collaboration: Some(InkCollaborationState {
+            version: INK_COLLABORATION_VERSION,
+            stream_epoch,
+            snapshot,
+        }),
+    })
 }
 
 impl InkstoneDocument {
@@ -189,11 +218,12 @@ mod tests {
     fn test_ink_content_opaque() {
         let content = BlockContent::Ink {
             stonepen_json: "{\"strokes\":[]}".into(),
+            collaboration: None,
         };
         let json = serde_json::to_string(&content).unwrap();
         let back: BlockContent = serde_json::from_str(&json).unwrap();
         match back {
-            BlockContent::Ink { stonepen_json } => {
+            BlockContent::Ink { stonepen_json, .. } => {
                 assert_eq!(stonepen_json, "{\"strokes\":[]}");
                 assert!(stonepen_json.contains("strokes"));
             }
@@ -240,6 +270,7 @@ mod tests {
                 BlockId::new_v4(),
                 BlockContent::Ink {
                     stonepen_json: "opaque".into(),
+                    collaboration: None,
                 },
             ),
             DocumentBlock::new(BlockId::new_v4(), BlockContent::Divider),

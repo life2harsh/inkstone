@@ -1,9 +1,26 @@
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+use crate::document::{
+    BlockContent, DocumentBlock, INK_COLLABORATION_VERSION, InkCollaborationState, InkstoneDocument,
+};
 use crate::ids::{BlockId, DocId, UpdateId};
+use crate::text_crdt::CollaborativeTextUpdate;
 
 pub const DOCUMENT_UPDATE_VERSION: u32 = 1;
+pub const DOCUMENT_UPDATE_V2_VERSION: u32 = 2;
+pub const INK_UPDATE_PAYLOAD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborativeInkUpdate {
+    pub version: u32,
+    pub block_id: BlockId,
+    pub stream_epoch: uuid::Uuid,
+    /// Stonepen-owned opaque incremental update bytes.
+    pub update: Vec<u8>,
+    /// Present only while migrating a legacy JSON block or initializing a new stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_snapshot: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentUpdate {
@@ -34,6 +51,12 @@ pub enum DocumentOp {
 
     #[serde(rename = "set_title")]
     SetTitle { title: String },
+
+    #[serde(rename = "apply_text_update_v2")]
+    ApplyTextUpdateV2 { payload: CollaborativeTextUpdate },
+
+    #[serde(rename = "apply_ink_update_v2")]
+    ApplyInkUpdateV2 { payload: CollaborativeInkUpdate },
 }
 
 // ── Strict local-intent errors ──────────────────────────────────────────────
@@ -60,6 +83,21 @@ pub enum ApplyError {
 
     #[error("unsupported update version {0}")]
     UnsupportedUpdateVersion(u32),
+
+    #[error("ink update payload version {0} is unsupported")]
+    UnsupportedInkUpdateVersion(u32),
+
+    #[error("block {0} is not an Ink block")]
+    NotInkBlock(BlockId),
+
+    #[error("ink stream epoch does not match block {0}")]
+    InkStreamEpochMismatch(BlockId),
+
+    #[error("ink stream for block {0} requires a bootstrap snapshot")]
+    InkBootstrapRequired(BlockId),
+
+    #[error("Stonepen collaboration update failed: {0}")]
+    StonepenCollaboration(String),
 }
 
 /// Strict local-intent application.
@@ -107,6 +145,13 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
         DocumentOp::SetTitle { title } => {
             doc.title = title;
         }
+
+        DocumentOp::ApplyTextUpdateV2 { .. } => {
+            return Err(ApplyError::UnsupportedUpdateVersion(update.version));
+        }
+        DocumentOp::ApplyInkUpdateV2 { payload } => {
+            apply_ink_update(doc, payload, update.applied_at_ms)?;
+        }
     }
 
     Ok(())
@@ -118,12 +163,62 @@ fn validate_update(doc: &InkstoneDocument, update: &DocumentUpdate) -> Result<()
             doc.schema_version,
         ));
     }
-    if update.version != DOCUMENT_UPDATE_VERSION {
+    let expected_version = match &update.op {
+        DocumentOp::ApplyTextUpdateV2 { .. } | DocumentOp::ApplyInkUpdateV2 { .. } => {
+            DOCUMENT_UPDATE_V2_VERSION
+        }
+        _ => DOCUMENT_UPDATE_VERSION,
+    };
+    if update.version != expected_version {
         return Err(ApplyError::UnsupportedUpdateVersion(update.version));
     }
     if update.doc_id != doc.id {
         return Err(ApplyError::WrongDocumentId);
     }
+    Ok(())
+}
+
+fn apply_ink_update(
+    doc: &mut InkstoneDocument,
+    payload: CollaborativeInkUpdate,
+    applied_at_ms: i64,
+) -> Result<(), ApplyError> {
+    if payload.version != INK_UPDATE_PAYLOAD_VERSION {
+        return Err(ApplyError::UnsupportedInkUpdateVersion(payload.version));
+    }
+    let block = doc
+        .get_block_mut(payload.block_id)
+        .ok_or(ApplyError::BlockNotFound(payload.block_id))?;
+    let BlockContent::Ink {
+        stonepen_json,
+        collaboration,
+    } = &mut block.content
+    else {
+        return Err(ApplyError::NotInkBlock(payload.block_id));
+    };
+
+    let snapshot = match collaboration.as_ref() {
+        Some(state) if state.version != INK_COLLABORATION_VERSION => {
+            return Err(ApplyError::UnsupportedInkUpdateVersion(state.version));
+        }
+        Some(state) if state.stream_epoch != payload.stream_epoch => {
+            return Err(ApplyError::InkStreamEpochMismatch(payload.block_id));
+        }
+        Some(state) => state.snapshot.as_slice(),
+        None => payload
+            .bootstrap_snapshot
+            .as_deref()
+            .ok_or(ApplyError::InkBootstrapRequired(payload.block_id))?,
+    };
+    let (snapshot, projection) = stonepen_core::apply_opaque_update(snapshot, &payload.update)
+        .map_err(|error| ApplyError::StonepenCollaboration(error.to_string()))?;
+    *stonepen_json = projection;
+    *collaboration = Some(InkCollaborationState {
+        version: INK_COLLABORATION_VERSION,
+        stream_epoch: payload.stream_epoch,
+        snapshot,
+    });
+    block.updated_at_ms = applied_at_ms;
     Ok(())
 }
 
@@ -238,6 +333,26 @@ pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> R
             doc.title = title;
             ReplayOutcome::Applied
         }
+        DocumentOp::ApplyTextUpdateV2 { .. } => ReplayOutcome::Fatal {
+            reason: "text v2 updates require CollaborativeTextState".into(),
+        },
+        DocumentOp::ApplyInkUpdateV2 { payload } => {
+            match apply_ink_update(doc, payload, update.applied_at_ms) {
+                Ok(()) => ReplayOutcome::Applied,
+                Err(ApplyError::BlockNotFound(block_id)) => ReplayOutcome::NoOp {
+                    conflict: format!("ink target block {} not found", block_id),
+                },
+                Err(ApplyError::NotInkBlock(block_id)) => ReplayOutcome::NoOp {
+                    conflict: format!("ink target block {} has another type", block_id),
+                },
+                Err(ApplyError::InkStreamEpochMismatch(block_id)) => ReplayOutcome::NoOp {
+                    conflict: format!("ink stream epoch for block {} is stale", block_id),
+                },
+                Err(error) => ReplayOutcome::Fatal {
+                    reason: error.to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -267,6 +382,127 @@ mod tests {
             applied_at_ms,
             op,
         }
+    }
+
+    fn legacy_ink_block(block_id: BlockId) -> (DocumentBlock, Vec<u8>) {
+        let (snapshot, stonepen_json) = stonepen_core::new_opaque_document(640.0, 480.0).unwrap();
+        (
+            DocumentBlock::new(
+                block_id,
+                BlockContent::Ink {
+                    stonepen_json,
+                    collaboration: None,
+                },
+            ),
+            snapshot,
+        )
+    }
+
+    fn ink_update(
+        doc_id: DocId,
+        block_id: BlockId,
+        stream_epoch: uuid::Uuid,
+        bootstrap_snapshot: Option<Vec<u8>>,
+    ) -> DocumentUpdate {
+        DocumentUpdate {
+            version: DOCUMENT_UPDATE_V2_VERSION,
+            update_id: UpdateId::new_v4(),
+            doc_id,
+            applied_at_ms: 4_000,
+            op: DocumentOp::ApplyInkUpdateV2 {
+                payload: CollaborativeInkUpdate {
+                    version: INK_UPDATE_PAYLOAD_VERSION,
+                    block_id,
+                    stream_epoch,
+                    update: Vec::new(),
+                    bootstrap_snapshot,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_ink_migrates_to_an_opaque_snapshot_and_projection() {
+        let (mut doc, doc_id) = make_doc();
+        let block_id = BlockId::new_v4();
+        let (block, snapshot) = legacy_ink_block(block_id);
+        doc.blocks.push(block);
+        let epoch = uuid::Uuid::new_v4();
+
+        apply_update(
+            &mut doc,
+            ink_update(doc_id, block_id, epoch, Some(snapshot)),
+        )
+        .unwrap();
+
+        let BlockContent::Ink {
+            stonepen_json,
+            collaboration: Some(state),
+        } = &doc.blocks[0].content
+        else {
+            panic!("expected migrated Ink block");
+        };
+        assert_eq!(state.stream_epoch, epoch);
+        assert!(!state.snapshot.is_empty());
+        assert_eq!(
+            stonepen_core::project_opaque_snapshot(&state.snapshot).unwrap(),
+            *stonepen_json
+        );
+    }
+
+    #[test]
+    fn duplicate_ink_updates_are_idempotent() {
+        let (mut doc, doc_id) = make_doc();
+        let block_id = BlockId::new_v4();
+        let (block, snapshot) = legacy_ink_block(block_id);
+        doc.blocks.push(block);
+        let epoch = uuid::Uuid::new_v4();
+        apply_update(
+            &mut doc,
+            ink_update(doc_id, block_id, epoch, Some(snapshot)),
+        )
+        .unwrap();
+        let update = ink_update(doc_id, block_id, epoch, None);
+        apply_update(&mut doc, update.clone()).unwrap();
+        let once = serde_json::to_vec(&doc).unwrap();
+        apply_update(&mut doc, update).unwrap();
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), once);
+    }
+
+    #[test]
+    fn deleted_and_recreated_block_rejects_the_old_stream_epoch() {
+        let (mut doc, doc_id) = make_doc();
+        let block_id = BlockId::new_v4();
+        let (block, snapshot) = legacy_ink_block(block_id);
+        doc.blocks.push(block);
+        let old_epoch = uuid::Uuid::new_v4();
+        apply_update(
+            &mut doc,
+            ink_update(doc_id, block_id, old_epoch, Some(snapshot.clone())),
+        )
+        .unwrap();
+        doc.blocks.clear();
+        let (replacement, _) = legacy_ink_block(block_id);
+        doc.blocks.push(replacement);
+        let new_epoch = uuid::Uuid::new_v4();
+        apply_update(
+            &mut doc,
+            ink_update(doc_id, block_id, new_epoch, Some(snapshot)),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            sequenced_replay(&mut doc, ink_update(doc_id, block_id, old_epoch, None)),
+            ReplayOutcome::NoOp { .. }
+        ));
+        let BlockContent::Ink {
+            collaboration: Some(state),
+            ..
+        } = &doc.blocks[0].content
+        else {
+            panic!("expected collaborative Ink block");
+        };
+        assert_eq!(state.stream_epoch, new_epoch);
     }
 
     #[test]
@@ -490,6 +726,7 @@ mod tests {
             BlockId::new_v4(),
             BlockContent::Ink {
                 stonepen_json: "{}".into(),
+                collaboration: None,
             },
         );
         let id = b1.id;
@@ -504,13 +741,14 @@ mod tests {
                     block_id: id,
                     content: BlockContent::Ink {
                         stonepen_json: "{\"strokes\":[]}".into(),
+                        collaboration: None,
                     },
                 },
             ),
         )
         .unwrap();
         match &doc.blocks[0].content {
-            BlockContent::Ink { stonepen_json } => {
+            BlockContent::Ink { stonepen_json, .. } => {
                 assert_eq!(stonepen_json, "{\"strokes\":[]}");
                 assert!(stonepen_json.contains("strokes"));
             }
@@ -528,6 +766,7 @@ mod tests {
             },
             BlockContent::Ink {
                 stonepen_json: "opaque".into(),
+                collaboration: None,
             },
             BlockContent::Divider,
         ];
@@ -772,6 +1011,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ApplyError::UnsupportedUpdateVersion(99));
+    }
+
+    #[test]
+    fn test_v2_text_payload_is_explicit_and_not_legacy_replay() {
+        use crate::text_crdt::{CollaborativeTextUpdate, TextTarget};
+
+        let (mut doc, doc_id) = make_doc();
+        let update = DocumentUpdate {
+            version: DOCUMENT_UPDATE_V2_VERSION,
+            update_id: UpdateId::new_v4(),
+            doc_id,
+            applied_at_ms: 1000,
+            op: DocumentOp::ApplyTextUpdateV2 {
+                payload: CollaborativeTextUpdate {
+                    version: 2,
+                    target: TextTarget::Title,
+                    update_v1: vec![0, 0],
+                },
+            },
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["op"]["type"], "apply_text_update_v2");
+        assert_eq!(
+            apply_update(&mut doc, update).unwrap_err(),
+            ApplyError::UnsupportedUpdateVersion(2)
+        );
     }
 
     // ── Sequenced replay tests ───────────────────────────────────────────────
