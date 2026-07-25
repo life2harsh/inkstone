@@ -117,15 +117,26 @@ fn test_persistence_success_commits_to_view() {
 }
 
 #[test]
-fn test_persistence_failure_leaves_view_unchanged() {
+fn test_persistence_failure_keeps_retryable_candidate() {
     let doc_id = make_doc_id();
     let mut state = ClientState::new(doc_id);
     hydrate(&mut state, 0);
     let uid = local_intent(&mut state, set_title("Hello"));
     persist_local_fail(&mut state, uid);
     assert_eq!(state.view_doc().title, "");
+    assert_eq!(state.effective_view_doc().title, "Hello");
     assert_eq!(state.pending_local().len(), 0);
-    assert!(!state.has_pending_intent());
+    assert!(state.has_pending_intent());
+    assert!(state.local_persistence_failed());
+
+    let effects = state.transition(ClientEvent::RetryLocalPersistence);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::PersistLocalUpdate { update_id, .. }] if *update_id == uid
+    ));
+    assert!(!state.local_persistence_failed());
+    persist_local(&mut state, uid);
+    assert_eq!(state.view_doc().title, "Hello");
 }
 
 #[test]
@@ -1147,13 +1158,14 @@ fn test_stale_persistence_failure_ignored() {
     });
     assert!(state.has_pending_intent(), "pending_intent should survive");
 
-    // Real failure does clear
+    // Real failure retains the correlated candidate for retry.
     persist_local_fail(&mut state, uid);
-    assert!(!state.has_pending_intent());
+    assert!(state.has_pending_intent());
+    assert!(state.local_persistence_failed());
 }
 
 #[test]
-fn test_current_persistence_failure_prepares_next_queued_intent() {
+fn test_current_persistence_failure_retries_before_queued_intent() {
     let doc_id = make_doc_id();
     let mut state = ClientState::new(doc_id);
     hydrate(&mut state, 0);
@@ -1168,11 +1180,24 @@ fn test_current_persistence_failure_prepares_next_queued_intent() {
     });
     assert_eq!(state.intent_queue_len(), 1);
 
-    // A fails — should surface error and promote B
+    // A fails — surface the error, but do not reorder B ahead of retrying A.
     let effects = state.transition(ClientEvent::LocalPersistenceFailed { update_id: uid_a });
     let has_error = effects.iter().any(|e| matches!(e, Effect::NotifyError(_)));
     assert!(has_error, "should surface persistence failure");
-    assert!(state.has_pending_intent(), "B should become pending_intent");
+    assert!(state.has_pending_intent(), "A should remain pending_intent");
+    assert_eq!(state.intent_queue_len(), 1);
+
+    let retry = state.transition(ClientEvent::RetryLocalPersistence);
+    assert!(matches!(
+        retry.as_slice(),
+        [Effect::PersistLocalUpdate { update_id, .. }] if *update_id == uid_a
+    ));
+    persist_local(&mut state, uid_a);
+    assert_eq!(state.view_doc().title, "a");
+    assert!(
+        state.has_pending_intent(),
+        "B should be prepared after A persists"
+    );
     assert_eq!(state.intent_queue_len(), 0);
 }
 

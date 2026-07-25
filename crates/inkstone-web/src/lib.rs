@@ -156,7 +156,9 @@ impl InkSaveTracker {
             return None;
         }
         state.phase = phase;
-        state.update_id = None;
+        if phase == InkSavePhase::Saved {
+            state.update_id = None;
+        }
         Some(state.phase)
     }
 
@@ -189,6 +191,7 @@ pub struct DriverInner {
     pub workspace_db: Option<WorkspaceDb>,
     pub persistence_status: String,
     pub storage_error: Option<String>,
+    pub local_persistence_error: Option<String>,
     pub selected_doc_id: DocId,
     pub entries: Vec<WorkspaceEntry>,
     pub selected_path: Option<String>,
@@ -220,6 +223,8 @@ pub struct DriverInner {
     pub ink_brush_color: (u8, u8, u8),
     pub expanded_ink_block: Option<BlockId>,
     pub sidebar_open: bool,
+    pub deferred_navigation: Option<String>,
+    pub pending_focus_key: Option<String>,
     ink_save_tracker: InkSaveTracker,
 }
 
@@ -238,6 +243,7 @@ impl Driver {
                 workspace_db: None,
                 persistence_status: "Initializing...".to_string(),
                 storage_error: None,
+                local_persistence_error: None,
                 selected_doc_id: doc_id,
                 entries: Vec::new(),
                 selected_path: None,
@@ -269,6 +275,8 @@ impl Driver {
                 ink_brush_color: (31, 41, 55),
                 expanded_ink_block: None,
                 sidebar_open: false,
+                deferred_navigation: None,
+                pending_focus_key: None,
                 ink_save_tracker: InkSaveTracker::default(),
             })),
             Rc::new(RefCell::new(ink_runtime::InkRuntimeRegistry::default())),
@@ -329,6 +337,71 @@ impl Driver {
         };
         if let Some(visible_phase) = visible_phase {
             self.update_ink_save_phase(block_id, visible_phase);
+        }
+    }
+
+    fn handle_local_persistence_failure(
+        &self,
+        doc_id: DocId,
+        block_id: Option<BlockId>,
+        update_id: UpdateId,
+        message: String,
+    ) {
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.persistence_status = "Save failed".to_string();
+            inner.local_persistence_error = Some(message);
+        }
+        self.finish_ink_update(doc_id, block_id, update_id, InkSavePhase::Failed);
+        self.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
+        self.render();
+    }
+
+    fn retry_local_persistence(&self) {
+        if !self.0.borrow().client_state.local_persistence_failed() {
+            return;
+        }
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.persistence_status = "Retrying local save...".to_string();
+            inner.local_persistence_error = None;
+        }
+        if self.0.borrow().db.is_some() {
+            self.dispatch(ClientEvent::RetryLocalPersistence);
+            self.render();
+            return;
+        }
+
+        let this = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match IndexedDb::open("inkstone_local_db", 1).await {
+                Ok(db) => {
+                    this.0.borrow_mut().db = Some(db);
+                    this.dispatch(ClientEvent::RetryLocalPersistence);
+                    this.render();
+                }
+                Err(error) => {
+                    let mut inner = this.0.borrow_mut();
+                    inner.persistence_status = "Save failed".to_string();
+                    inner.local_persistence_error =
+                        Some(format!("Failed to reopen IndexedDB: {:?}", error));
+                    drop(inner);
+                    this.render();
+                }
+            }
+        });
+    }
+
+    fn resume_deferred_navigation(&self) {
+        let path = {
+            let mut inner = self.0.borrow_mut();
+            if inner.client_state.has_pending_intent() {
+                return;
+            }
+            inner.deferred_navigation.take()
+        };
+        if let Some(path) = path {
+            self.select_entry(&path);
         }
     }
 
@@ -498,6 +571,20 @@ impl Driver {
     fn select_entry(&self, path: &str) {
         self.flush_ink_before_transition();
         let path_str = path.to_string();
+        if self.0.borrow().client_state.has_pending_intent() {
+            let mut inner = self.0.borrow_mut();
+            inner.deferred_navigation = Some(path_str);
+            inner.sidebar_open = false;
+            inner.inspector_open = false;
+            inner.persistence_status = if inner.client_state.local_persistence_failed() {
+                "Save failed; retry before leaving this note".to_string()
+            } else {
+                "Finishing local save before navigation...".to_string()
+            };
+            drop(inner);
+            self.render();
+            return;
+        }
         let is_markdown = path_str.to_lowercase().ends_with(".md")
             && !path_str.starts_with('.')
             && !path_str.contains("/.");
@@ -857,12 +944,16 @@ impl Driver {
                 return;
             }
         };
-        self.0.borrow_mut().missing_note = Some(MissingNoteRequest {
-            raw_target: raw_target.to_string(),
-            proposed_path,
-            source_path: source_path.to_string(),
-            resolution,
-        });
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.missing_note = Some(MissingNoteRequest {
+                raw_target: raw_target.to_string(),
+                proposed_path,
+                source_path: source_path.to_string(),
+                resolution,
+            });
+            inner.pending_focus_key = Some("dismiss-missing-note".to_string());
+        }
         self.render();
     }
 
@@ -1584,18 +1675,12 @@ impl Driver {
                     let db = match db {
                         Some(d) => d,
                         None => {
-                            this.0.borrow_mut().storage_error =
-                                Some("IndexedDB handle unavailable for update".to_string());
-                            this.0.borrow_mut().persistence_status =
-                                "Storage error: IndexedDB handle unavailable".to_string();
-                            this.finish_ink_update(
+                            this.handle_local_persistence_failure(
                                 doc_id,
                                 ink_block_id,
                                 update_id,
-                                InkSavePhase::Failed,
+                                "IndexedDB handle unavailable for update".to_string(),
                             );
-                            this.dispatch(ClientEvent::LocalPersistenceFailed { update_id });
-                            this.render();
                             return;
                         }
                     };
@@ -1646,8 +1731,11 @@ impl Driver {
                         Ok(json) => {
                             match db.put_document_record(&doc_id.to_string(), &json).await {
                                 Ok(()) => {
-                                    this.0.borrow_mut().persistence_status =
-                                        "Saved to IndexedDB".to_string();
+                                    {
+                                        let mut inner = this.0.borrow_mut();
+                                        inner.persistence_status = "Saved to IndexedDB".to_string();
+                                        inner.local_persistence_error = None;
+                                    }
                                     this.finish_ink_update(
                                         doc_id,
                                         ink_block_id,
@@ -1666,24 +1754,15 @@ impl Driver {
                                     } else {
                                         this.index_workspace();
                                     }
+                                    this.resume_deferred_navigation();
                                 }
                                 Err(e) => {
-                                    this.0.borrow_mut().persistence_status =
-                                        "Failed to save update".to_string();
-                                    this.0.borrow_mut().storage_error = Some(format!(
-                                        "IndexedDB write error during update: {:?}",
-                                        e
-                                    ));
-                                    this.finish_ink_update(
+                                    this.handle_local_persistence_failure(
                                         doc_id,
                                         ink_block_id,
                                         update_id,
-                                        InkSavePhase::Failed,
+                                        format!("IndexedDB write error during update: {:?}", e),
                                     );
-                                    this.dispatch(ClientEvent::LocalPersistenceFailed {
-                                        update_id,
-                                    });
-                                    this.render();
                                 }
                             }
                         }
@@ -1823,6 +1902,9 @@ impl Driver {
             .expect("No element with id 'root' found");
 
         let active_element = document.active_element();
+        let control_focus_key = active_element
+            .as_ref()
+            .and_then(|element| element.get_attribute("data-focus-key"));
         let focus_info = active_element.and_then(|el| {
             let class = el.class_name();
             if class == "document-title-input" {
@@ -1854,6 +1936,7 @@ impl Driver {
 
         root.set_inner_html("");
 
+        let requested_focus = self.0.borrow_mut().pending_focus_key.take();
         let inner = self.0.borrow().clone();
         let client_state = &inner.client_state;
         let view_doc = client_state.effective_view_doc();
@@ -1862,6 +1945,11 @@ impl Driver {
         let storage_error = &inner.storage_error;
         let entries = &inner.entries;
         let selected_path = &inner.selected_path;
+        let viewport_width = window
+            .inner_width()
+            .ok()
+            .and_then(|width| width.as_f64())
+            .unwrap_or(1440.0);
 
         let editing_allowed = storage_error.is_none()
             && phase != SessionPhase::HydratingLocal
@@ -1869,14 +1957,26 @@ impl Driver {
             && phase != SessionPhase::Error;
 
         let app_container = document.create_element("div").unwrap();
-        app_container.set_class_name(if inner.sidebar_open {
-            "app-container sidebar-open"
-        } else {
-            "app-container"
-        });
+        let mut app_classes = vec!["app-container"];
+        if inner.sidebar_open {
+            app_classes.push("sidebar-open");
+        }
+        if inner.local_persistence_error.is_some() {
+            app_classes.push("save-failed");
+        }
+        app_container.set_class_name(&app_classes.join(" "));
 
         let sidebar = document.create_element("div").unwrap();
         sidebar.set_class_name("sidebar");
+        sidebar.set_id("workspace-navigation");
+        sidebar.set_attribute("role", "navigation").unwrap();
+        sidebar
+            .set_attribute("aria-label", "Workspace navigation")
+            .unwrap();
+        if viewport_width <= 760.0 && !inner.sidebar_open {
+            sidebar.set_attribute("inert", "").unwrap();
+            sidebar.set_attribute("aria-hidden", "true").unwrap();
+        }
         let brand = document.create_element("div").unwrap();
         brand.set_class_name("brand");
         brand.set_text_content(Some("Inkstone"));
@@ -1900,6 +2000,9 @@ impl Driver {
             let clear_btn = document.create_element("button").unwrap();
             clear_btn.set_class_name("clear-tag-btn");
             clear_btn.set_text_content(Some("×"));
+            clear_btn
+                .set_attribute("aria-label", "Clear tag filter")
+                .unwrap();
 
             active_tag_div.append_child(&tag_label).unwrap();
             active_tag_div.append_child(&clear_btn).unwrap();
@@ -1911,17 +2014,44 @@ impl Driver {
         search_input.set_type("text");
         search_input.set_class_name("search-input");
         search_input.set_placeholder("Search notes...");
+        search_input
+            .set_attribute("aria-label", "Search notes")
+            .unwrap();
+        search_input.set_attribute("role", "combobox").unwrap();
+        search_input
+            .set_attribute("aria-controls", "workspace-results")
+            .unwrap();
+        search_input
+            .set_attribute(
+                "aria-expanded",
+                if inner.search_results.is_empty() {
+                    "false"
+                } else {
+                    "true"
+                },
+            )
+            .unwrap();
+        if let Some(index) = inner.search_highlighted_index {
+            search_input
+                .set_attribute("aria-activedescendant", &format!("search-option-{}", index))
+                .unwrap();
+        }
+        search_input
+            .set_attribute("data-focus-key", "search-input")
+            .unwrap();
         search_input.set_value(&inner.search_query);
         search_container.append_child(&search_input).unwrap();
 
         if inner.search_indexing {
             let status = document.create_element("div").unwrap();
             status.set_class_name("search-status");
+            status.set_attribute("role", "status").unwrap();
             status.set_text_content(Some("Indexing notes..."));
             search_container.append_child(&status).unwrap();
         } else if !inner.search_query.trim().is_empty() {
             let status = document.create_element("div").unwrap();
             status.set_class_name("search-status");
+            status.set_attribute("role", "status").unwrap();
             let count = inner.search_results.len();
             if count == 0 {
                 status.set_text_content(Some("No matching notes"));
@@ -1953,7 +2083,7 @@ impl Driver {
             recent_list.set_class_name("recent-list");
 
             for path in &inner.recent_notes {
-                let recent_item = document.create_element("div").unwrap();
+                let recent_item = document.create_element("button").unwrap();
                 let is_active = selected_path.as_deref() == Some(path);
                 let recent_class = if is_active {
                     "recent-item active"
@@ -1962,6 +2092,12 @@ impl Driver {
                 };
                 recent_item.set_class_name(recent_class);
                 recent_item.set_attribute("data-path", path).unwrap();
+                recent_item
+                    .set_attribute("data-focus-key", &format!("recent:{}", path))
+                    .unwrap();
+                if is_active {
+                    recent_item.set_attribute("aria-current", "page").unwrap();
+                }
 
                 let file_name = explorer::file_name_only(path).to_string();
 
@@ -1987,7 +2123,11 @@ impl Driver {
         sidebar.append_child(&sidebar_heading).unwrap();
 
         let file_list = document.create_element("div").unwrap();
+        file_list.set_id("workspace-results");
         file_list.set_class_name("file-list");
+        if is_search_active {
+            file_list.set_attribute("role", "listbox").unwrap();
+        }
 
         if is_search_active {
             let tag_paths = inner
@@ -1996,9 +2136,10 @@ impl Driver {
                 .and_then(|tag| inner.knowledge.tag_to_paths.get(tag));
             if inner.search_query.trim().is_empty() && tag_paths.is_some() {
                 for path in tag_paths.unwrap() {
-                    let item_div = document.create_element("div").unwrap();
+                    let item_div = document.create_element("button").unwrap();
                     item_div.set_class_name("search-result-item");
                     item_div.set_attribute("data-path", path).unwrap();
+                    item_div.set_attribute("role", "option").unwrap();
                     item_div.set_text_content(Some(path));
                     file_list.append_child(&item_div).unwrap();
                 }
@@ -2009,7 +2150,7 @@ impl Driver {
                 file_list.append_child(&empty_results).unwrap();
             } else {
                 for (idx, result) in inner.search_results.iter().enumerate() {
-                    let item_div = document.create_element("div").unwrap();
+                    let item_div = document.create_element("button").unwrap();
                     let is_active = selected_path.as_deref() == Some(&result.path);
                     let is_highlighted = inner.search_highlighted_index == Some(idx);
 
@@ -2021,7 +2162,21 @@ impl Driver {
                         class_name.push_str(" highlighted");
                     }
                     item_div.set_class_name(&class_name);
+                    item_div.set_id(&format!("search-option-{}", idx));
+                    item_div.set_attribute("role", "option").unwrap();
+                    item_div
+                        .set_attribute(
+                            "aria-selected",
+                            if is_highlighted { "true" } else { "false" },
+                        )
+                        .unwrap();
                     item_div.set_attribute("data-path", &result.path).unwrap();
+                    item_div
+                        .set_attribute("data-focus-key", &format!("search-result:{}", result.path))
+                        .unwrap();
+                    if is_active {
+                        item_div.set_attribute("aria-current", "page").unwrap();
+                    }
 
                     let name_el = document.create_element("div").unwrap();
                     name_el.set_class_name("search-result-name");
@@ -2056,6 +2211,9 @@ impl Driver {
                 let create_input: web_sys::HtmlInputElement = create_input.unchecked_into();
                 create_input.set_class_name("explorer-create-input");
                 create_input.set_placeholder("filename.md");
+                create_input
+                    .set_attribute("aria-label", "New file path")
+                    .unwrap();
                 create_input.set_value(&inner.create_value);
                 create_row.append_child(&create_input).unwrap();
                 file_list.append_child(&create_row).unwrap();
@@ -2063,6 +2221,7 @@ impl Driver {
                 let new_btn = document.create_element("button").unwrap();
                 new_btn.set_class_name("explorer-new-btn");
                 new_btn.set_text_content(Some("+ New File"));
+                new_btn.set_attribute("data-focus-key", "new-file").unwrap();
                 file_list.append_child(&new_btn).unwrap();
             }
 
@@ -2070,7 +2229,12 @@ impl Driver {
             for flat_node in &flat_tree {
                 let indent_px = 8 + flat_node.depth * 20;
                 if flat_node.is_folder {
-                    let folder_div = document.create_element("div").unwrap();
+                    let folder_row = document.create_element("div").unwrap();
+                    folder_row.set_class_name("explorer-folder-row");
+                    folder_row
+                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                        .unwrap();
+                    let folder_div = document.create_element("button").unwrap();
                     let is_target = inner.create_folder.as_deref() == Some(&flat_node.path);
                     let folder_class = match (flat_node.is_expanded, is_target) {
                         (true, true) => "explorer-folder expanded active-target",
@@ -2085,6 +2249,19 @@ impl Driver {
                     folder_div
                         .set_attribute("data-depth", &flat_node.depth.to_string())
                         .unwrap();
+                    folder_div
+                        .set_attribute(
+                            "aria-expanded",
+                            if flat_node.is_expanded {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        )
+                        .unwrap();
+                    folder_div
+                        .set_attribute("data-focus-key", &format!("folder:{}", flat_node.path))
+                        .unwrap();
                     let toggle = document.create_element("span").unwrap();
                     toggle.set_class_name("explorer-toggle");
                     toggle.set_text_content(Some(if flat_node.is_expanded {
@@ -2097,10 +2274,18 @@ impl Driver {
                     name_span.set_class_name("folder-name");
                     name_span.set_text_content(Some(&flat_node.name));
                     folder_div.append_child(&name_span).unwrap();
-                    folder_div
-                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
+                    folder_row.append_child(&folder_div).unwrap();
+                    let create_in_folder = document.create_element("button").unwrap();
+                    create_in_folder.set_class_name("folder-create-btn");
+                    create_in_folder
+                        .set_attribute("data-path", &flat_node.path)
                         .unwrap();
-                    file_list.append_child(&folder_div).unwrap();
+                    create_in_folder
+                        .set_attribute("aria-label", &format!("Create file in {}", flat_node.name))
+                        .unwrap();
+                    create_in_folder.set_text_content(Some("+"));
+                    folder_row.append_child(&create_in_folder).unwrap();
+                    file_list.append_child(&folder_row).unwrap();
                 } else {
                     let is_active = selected_path.as_deref() == Some(&flat_node.path);
                     let is_renaming = inner.renaming_path.as_deref() == Some(&flat_node.path);
@@ -2126,12 +2311,27 @@ impl Driver {
                         let rename_input: web_sys::HtmlInputElement = rename_input.unchecked_into();
                         rename_input.set_class_name("rename-input");
                         rename_input.set_value(&inner.rename_value);
+                        rename_input
+                            .set_attribute("aria-label", &format!("Rename {}", flat_node.name))
+                            .unwrap();
                         file_entry.append_child(&rename_input).unwrap();
                     } else {
+                        let select_file = document.create_element("button").unwrap();
+                        select_file.set_class_name("file-select-btn");
+                        select_file
+                            .set_attribute("data-path", &flat_node.path)
+                            .unwrap();
+                        select_file
+                            .set_attribute("data-focus-key", &format!("file:{}", flat_node.path))
+                            .unwrap();
+                        if is_active {
+                            select_file.set_attribute("aria-current", "page").unwrap();
+                        }
                         let file_name = document.create_element("span").unwrap();
                         file_name.set_class_name("file-name");
                         file_name.set_text_content(Some(&flat_node.name));
-                        file_entry.append_child(&file_name).unwrap();
+                        select_file.append_child(&file_name).unwrap();
+                        file_entry.append_child(&select_file).unwrap();
                     }
 
                     let file_actions = document.create_element("span").unwrap();
@@ -2142,7 +2342,13 @@ impl Driver {
                     rename_btn
                         .set_attribute("data-path", &flat_node.path)
                         .unwrap();
+                    rename_btn
+                        .set_attribute("data-focus-key", &format!("rename:{}", flat_node.path))
+                        .unwrap();
                     rename_btn.set_text_content(Some("Rename"));
+                    rename_btn
+                        .set_attribute("aria-label", &format!("Rename {}", flat_node.name))
+                        .unwrap();
                     file_actions.append_child(&rename_btn).unwrap();
 
                     let delete_btn = document.create_element("button").unwrap();
@@ -2151,6 +2357,9 @@ impl Driver {
                         .set_attribute("data-path", &flat_node.path)
                         .unwrap();
                     delete_btn.set_text_content(Some("Delete"));
+                    delete_btn
+                        .set_attribute("aria-label", &format!("Delete {}", flat_node.name))
+                        .unwrap();
                     file_actions.append_child(&delete_btn).unwrap();
 
                     file_entry.append_child(&file_actions).unwrap();
@@ -2191,6 +2400,18 @@ impl Driver {
         nav_toggle
             .set_attribute("aria-label", "Toggle workspace navigation")
             .unwrap();
+        nav_toggle
+            .set_attribute("aria-controls", "workspace-navigation")
+            .unwrap();
+        nav_toggle
+            .set_attribute(
+                "aria-expanded",
+                if inner.sidebar_open { "true" } else { "false" },
+            )
+            .unwrap();
+        nav_toggle
+            .set_attribute("data-focus-key", "sidebar-toggle")
+            .unwrap();
         topbar.append_child(&nav_toggle).unwrap();
         let breadcrumb = document.create_element("div").unwrap();
         breadcrumb.set_class_name("breadcrumb");
@@ -2201,10 +2422,14 @@ impl Driver {
         let quick_search = document.create_element("button").unwrap();
         quick_search.set_class_name("topbar-search-btn");
         quick_search.set_text_content(Some("Search pages"));
+        quick_search
+            .set_attribute("data-focus-key", "quick-search")
+            .unwrap();
         topbar_actions.append_child(&quick_search).unwrap();
         let save_status = document.create_element("span").unwrap();
         save_status.set_class_name("topbar-save-status");
         save_status.set_text_content(Some(persistence_status));
+        save_status.set_attribute("role", "status").unwrap();
         topbar_actions.append_child(&save_status).unwrap();
         if selected_path.is_some() {
             let mode_bar = document.create_element("div").unwrap();
@@ -2212,6 +2437,9 @@ impl Driver {
             let edit_btn = document.create_element("button").unwrap();
             edit_btn.set_class_name("mode-toggle-btn");
             edit_btn.set_text_content(Some("Edit"));
+            edit_btn
+                .set_attribute("data-focus-key", "mode-edit")
+                .unwrap();
             edit_btn
                 .set_attribute(
                     "aria-pressed",
@@ -2231,6 +2459,9 @@ impl Driver {
             preview_btn.set_attribute("data-mode", "preview").unwrap();
             preview_btn.set_text_content(Some("Preview"));
             preview_btn
+                .set_attribute("data-focus-key", "mode-preview")
+                .unwrap();
+            preview_btn
                 .set_attribute(
                     "aria-pressed",
                     if inner.document_mode == DocumentMode::Preview {
@@ -2247,6 +2478,22 @@ impl Driver {
             let inspector_toggle = document.create_element("button").unwrap();
             inspector_toggle.set_class_name("mode-toggle-btn toggle-inspector-btn");
             inspector_toggle.set_text_content(Some("Inspector"));
+            inspector_toggle
+                .set_attribute("aria-controls", "document-inspector")
+                .unwrap();
+            inspector_toggle
+                .set_attribute(
+                    "aria-expanded",
+                    if inner.inspector_open {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .unwrap();
+            inspector_toggle
+                .set_attribute("data-focus-key", "inspector-toggle")
+                .unwrap();
             mode_bar.append_child(&inspector_toggle).unwrap();
             topbar_actions.append_child(&mode_bar).unwrap();
         }
@@ -2277,6 +2524,23 @@ impl Driver {
             closed_div.set_class_name("closed-state");
             closed_div.set_text_content(Some("No document open."));
             main_content.append_child(&closed_div).unwrap();
+        }
+
+        if let Some(error) = &inner.local_persistence_error {
+            let recovery = document.create_element("div").unwrap();
+            recovery.set_class_name("save-recovery");
+            recovery.set_attribute("role", "alert").unwrap();
+            let message = document.create_element("p").unwrap();
+            message.set_text_content(Some(&format!(
+                "Your latest change is not saved locally. {}",
+                error
+            )));
+            let retry = document.create_element("button").unwrap();
+            retry.set_class_name("retry-save-btn");
+            retry.set_text_content(Some("Retry save"));
+            recovery.append_child(&message).unwrap();
+            recovery.append_child(&retry).unwrap();
+            main_content.append_child(&recovery).unwrap();
         }
 
         if editing_allowed && selected_path.is_some() {
@@ -2324,12 +2588,20 @@ impl Driver {
                     let dismiss_btn = document.create_element("button").unwrap();
                     dismiss_btn.set_class_name("link-message-dismiss");
                     dismiss_btn.set_text_content(Some("×"));
+                    dismiss_btn
+                        .set_attribute("aria-label", "Dismiss message")
+                        .unwrap();
                     msg_div.append_child(&dismiss_btn).unwrap();
                     editor_container.append_child(&msg_div).unwrap();
                 }
                 if let Some(request) = &inner.missing_note {
                     let prompt = document.create_element("div").unwrap();
                     prompt.set_class_name("link-message missing-note-confirmation");
+                    prompt.set_attribute("role", "alertdialog").unwrap();
+                    prompt.set_attribute("aria-modal", "true").unwrap();
+                    prompt
+                        .set_attribute("aria-label", "Create missing note")
+                        .unwrap();
                     prompt
                         .set_text_content(Some(&format!("Note not found: {}", request.raw_target)));
                     let create = document.create_element("button").unwrap();
@@ -2338,6 +2610,9 @@ impl Driver {
                     let dismiss = document.create_element("button").unwrap();
                     dismiss.set_class_name("dismiss-missing-note-btn");
                     dismiss.set_text_content(Some("Dismiss"));
+                    dismiss
+                        .set_attribute("data-focus-key", "dismiss-missing-note")
+                        .unwrap();
                     prompt.append_child(&create).unwrap();
                     prompt.append_child(&dismiss).unwrap();
                     editor_container.append_child(&prompt).unwrap();
@@ -2355,6 +2630,10 @@ impl Driver {
                     title_input.set_type("text");
                     title_input.set_class_name("document-title-input");
                     title_input.set_placeholder("Untitled note");
+                    title_input
+                        .set_attribute("aria-label", "Document title")
+                        .unwrap();
+                    title_input.set_disabled(inner.local_persistence_error.is_some());
                     title_input.set_value(&view_doc.title);
                     document_header.append_child(&title_input).unwrap();
                 } else {
@@ -2517,6 +2796,13 @@ impl Driver {
                                 textarea.set_class_name("block-textarea markdown-source-input");
                                 textarea.set_placeholder("Write Markdown...");
                                 textarea
+                                    .set_attribute(
+                                        "aria-label",
+                                        &format!("Markdown block {}", block_index + 1),
+                                    )
+                                    .unwrap();
+                                textarea.set_disabled(inner.local_persistence_error.is_some());
+                                textarea
                                     .set_attribute("data-block-id", &block_id.to_string())
                                     .unwrap();
                                 textarea
@@ -2531,6 +2817,13 @@ impl Driver {
                                     textarea.unchecked_into();
                                 textarea.set_class_name("block-textarea math-source-input");
                                 textarea.set_placeholder("Enter TeX or mathematical source...");
+                                textarea
+                                    .set_attribute(
+                                        "aria-label",
+                                        &format!("Math source block {}", block_index + 1),
+                                    )
+                                    .unwrap();
+                                textarea.set_disabled(inner.local_persistence_error.is_some());
                                 textarea
                                     .set_attribute("data-block-id", &block_id.to_string())
                                     .unwrap();
@@ -2644,6 +2937,7 @@ impl Driver {
                                 toolbar.append_child(&expand).unwrap();
                                 let save_state = document.create_element("span").unwrap();
                                 save_state.set_class_name("ink-save-state");
+                                save_state.set_attribute("role", "status").unwrap();
                                 save_state
                                     .set_attribute("data-block-id", &block_id.to_string())
                                     .unwrap();
@@ -2863,14 +3157,29 @@ impl Driver {
         app_container.append_child(&main_content).unwrap();
 
         let inspector = document.create_element("div").unwrap();
+        inspector.set_id("document-inspector");
+        inspector.set_attribute("role", "complementary").unwrap();
+        inspector
+            .set_attribute("aria-label", "Document inspector")
+            .unwrap();
         if inner.inspector_open {
             inspector.set_class_name("inspector open");
         } else {
             inspector.set_class_name("inspector");
         }
+        if viewport_width <= 1180.0 && !inner.inspector_open {
+            inspector.set_attribute("inert", "").unwrap();
+            inspector.set_attribute("aria-hidden", "true").unwrap();
+        }
 
+        let inspector_header = document.create_element("div").unwrap();
+        inspector_header.set_class_name("inspector-header");
         let tabs_div = document.create_element("div").unwrap();
         tabs_div.set_class_name("inspector-tabs");
+        tabs_div.set_attribute("role", "tablist").unwrap();
+        tabs_div
+            .set_attribute("aria-label", "Inspector sections")
+            .unwrap();
 
         for tab_name in &["Backlinks", "Outline", "Tags", "Graph"] {
             let tab = document.create_element("button").unwrap();
@@ -2880,17 +3189,54 @@ impl Driver {
                 tab.set_class_name("inspector-tab");
             }
             tab.set_attribute("data-tab", tab_name).unwrap();
+            let tab_id = format!("inspector-tab-{}", tab_name.to_lowercase());
+            tab.set_id(&tab_id);
+            tab.set_attribute("role", "tab").unwrap();
+            tab.set_attribute("aria-controls", "inspector-panel")
+                .unwrap();
+            tab.set_attribute(
+                "aria-selected",
+                if &inner.knowledge_tab == tab_name {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .unwrap();
+            tab.set_attribute(
+                "tabindex",
+                if &inner.knowledge_tab == tab_name {
+                    "0"
+                } else {
+                    "-1"
+                },
+            )
+            .unwrap();
+            tab.set_attribute("data-focus-key", &format!("inspector-tab:{}", tab_name))
+                .unwrap();
             tab.set_text_content(Some(tab_name));
             tabs_div.append_child(&tab).unwrap();
         }
+        inspector_header.append_child(&tabs_div).unwrap();
         let inspector_close = document.create_element("button").unwrap();
         inspector_close.set_class_name("toggle-inspector-btn inspector-close-btn");
         inspector_close.set_text_content(Some("Hide"));
-        tabs_div.append_child(&inspector_close).unwrap();
-        inspector.append_child(&tabs_div).unwrap();
+        inspector_close
+            .set_attribute("aria-label", "Close document inspector")
+            .unwrap();
+        inspector_header.append_child(&inspector_close).unwrap();
+        inspector.append_child(&inspector_header).unwrap();
 
         let section = document.create_element("div").unwrap();
+        section.set_id("inspector-panel");
         section.set_class_name("inspector-section");
+        section.set_attribute("role", "tabpanel").unwrap();
+        section
+            .set_attribute(
+                "aria-labelledby",
+                &format!("inspector-tab-{}", inner.knowledge_tab.to_lowercase()),
+            )
+            .unwrap();
         section
             .set_attribute("data-section", &inner.knowledge_tab.to_lowercase())
             .unwrap();
@@ -2899,7 +3245,7 @@ impl Driver {
             if let Some(path) = selected_path {
                 if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
                     for heading in &knowledge.headings {
-                        let item = document.create_element("div").unwrap();
+                        let item = document.create_element("button").unwrap();
                         item.set_class_name("outline-item");
                         item.set_text_content(Some(&heading.text));
                         item.set_attribute("data-anchor", &heading.anchor).unwrap();
@@ -2940,7 +3286,7 @@ impl Driver {
                     let mut has_links = false;
                     for outlink in &knowledge.outgoing_links {
                         has_links = true;
-                        let item = document.create_element("div").unwrap();
+                        let item = document.create_element("button").unwrap();
                         let resolved_path = if outlink.is_wikilink {
                             inner.knowledge.resolve_wikilink(path, &outlink.target_raw)
                         } else {
@@ -2999,12 +3345,12 @@ impl Driver {
                     section.append_child(&empty).unwrap();
                 } else {
                     for backlink in backlinks {
-                        let item = document.create_element("div").unwrap();
+                        let item = document.create_element("button").unwrap();
                         item.set_class_name("link-item");
                         item.set_text_content(Some(&backlink.source_name));
                         item.set_attribute("data-path", &backlink.source_path)
                             .unwrap();
-                        let detail = document.create_element("div").unwrap();
+                        let detail = document.create_element("span").unwrap();
                         detail.set_class_name("backlink-context");
                         detail.set_text_content(Some(&format!(
                             "{}\n{}",
@@ -3027,7 +3373,7 @@ impl Driver {
                 let mut tags: Vec<&String> = tags.iter().collect();
                 tags.sort();
                 for tag in tags {
-                    let item = document.create_element("div").unwrap();
+                    let item = document.create_element("button").unwrap();
                     item.set_class_name("tag-item");
                     item.set_attribute("data-tag", tag).unwrap();
                     item.set_text_content(Some(&format!("#{}", tag)));
@@ -3048,7 +3394,7 @@ impl Driver {
                 section.append_child(&empty).unwrap();
             } else {
                 for (tag, count) in tags {
-                    let item = document.create_element("div").unwrap();
+                    let item = document.create_element("button").unwrap();
                     item.set_class_name("tag-item");
                     item.set_attribute("data-tag", &tag).unwrap();
 
@@ -3119,11 +3465,9 @@ impl Driver {
                     .set_attribute("class", &format!("local-graph-node {}", kind))
                     .unwrap();
                 group.set_attribute("data-path", &node.path).unwrap();
-                group.set_attribute("data-graph-path", &node.path).unwrap();
                 let circle = document.create_element_ns(svg_ns, "circle").unwrap();
                 circle.set_attribute("cx", &node.x.to_string()).unwrap();
                 circle.set_attribute("cy", &node.y.to_string()).unwrap();
-                circle.set_attribute("data-graph-path", &node.path).unwrap();
                 circle
                     .set_attribute(
                         "r",
@@ -3154,7 +3498,17 @@ impl Driver {
                     .unwrap();
                 hit_target.set_attribute("data-path", &node.path).unwrap();
                 hit_target
-                    .set_attribute("aria-label", &format!("Open {}", node.label))
+                    .set_attribute("data-focus-key", &format!("graph:{}", node.path))
+                    .unwrap();
+                hit_target
+                    .set_attribute(
+                        "aria-label",
+                        &if node.kind == local_graph::GraphNodeKind::Active {
+                            format!("Open {} (current note)", node.label)
+                        } else {
+                            format!("Open {}", node.label)
+                        },
+                    )
                     .unwrap();
                 let size = if node.kind == local_graph::GraphNodeKind::Active {
                     58
@@ -3207,6 +3561,13 @@ impl Driver {
             if let Some(el) = document.query_selector(".explorer-create-input").unwrap() {
                 let input: web_sys::HtmlInputElement = el.unchecked_into();
                 let _ = input.focus();
+            }
+        } else if let Some(key) = requested_focus.or(control_focus_key) {
+            let selector = format!("[data-focus-key=\"{}\"]", key.replace('"', "\\\""));
+            if let Ok(Some(element)) = document.query_selector(&selector) {
+                if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = element.focus();
+                }
             }
         } else if let Some((target, start, end)) = focus_info {
             if target == "search" {
@@ -3333,6 +3694,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     let state = &inner.client_state;
                     let phase = state.phase();
                     inner.storage_error.is_none()
+                        && inner.local_persistence_error.is_none()
                         && phase != SessionPhase::HydratingLocal
                         && phase != SessionPhase::Closed
                         && phase != SessionPhase::Error
@@ -3398,13 +3760,8 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Err(_) => return,
         };
         let class = el.get_attribute("class").unwrap_or_default();
-        let editing_allowed = {
-            let inner = d_click.0.borrow();
-            let has_err = inner.storage_error.is_some();
-            !has_err
-        };
-
-        if !editing_allowed {
+        if class == "retry-save-btn" {
+            d_click.retry_local_persistence();
             return;
         }
 
@@ -3416,12 +3773,22 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if class == "sidebar-toggle-btn" {
             let mut inner = d_click.0.borrow_mut();
             inner.sidebar_open = !inner.sidebar_open;
+            inner.pending_focus_key = Some(if inner.sidebar_open {
+                "search-input".to_string()
+            } else {
+                "sidebar-toggle".to_string()
+            });
             drop(inner);
             d_click.render();
             return;
         }
         if class == "drawer-backdrop" {
             let mut inner = d_click.0.borrow_mut();
+            inner.pending_focus_key = Some(if inner.inspector_open {
+                "inspector-toggle".to_string()
+            } else {
+                "sidebar-toggle".to_string()
+            });
             inner.sidebar_open = false;
             inner.inspector_open = false;
             drop(inner);
@@ -3485,6 +3852,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
         // ── Explorer: new file button (root level) ─────────────
         if class == "explorer-new-btn" {
+            if d_click.0.borrow().client_state.has_pending_intent() {
+                return;
+            }
             let mut inner = d_click.0.borrow_mut();
             inner.show_create = true;
             inner.create_value = String::new();
@@ -3494,8 +3864,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Explorer: folder target (click row to target + expand) ──
-        if class == "explorer-folder" || class == "explorer-folder expanded" {
+        if class == "folder-create-btn" {
             if let Some(path) = el.get_attribute("data-path") {
                 let mut inner = d_click.0.borrow_mut();
                 inner.expanded_folders.insert(path.clone());
@@ -3507,26 +3876,31 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             }
             return;
         }
-        if class == "explorer-toggle" {
-            if let Some(parent) = el.parent_element() {
-                if let Some(path) = parent.get_attribute("data-path") {
-                    let mut inner = d_click.0.borrow_mut();
-                    if inner.expanded_folders.contains(&path) {
-                        inner.expanded_folders.remove(&path);
-                    } else {
-                        inner.expanded_folders.insert(path);
-                    }
-                    drop(inner);
-                    d_click.render();
+        if let Ok(Some(folder)) = el.closest(".explorer-folder") {
+            if let Some(path) = folder.get_attribute("data-path") {
+                let mut inner = d_click.0.borrow_mut();
+                if inner.expanded_folders.contains(&path) {
+                    inner.expanded_folders.remove(&path);
+                } else {
+                    inner.expanded_folders.insert(path.clone());
                 }
+                inner.pending_focus_key = Some(format!("folder:{}", path));
+                drop(inner);
+                d_click.render();
             }
             return;
         }
 
         // ── Workspace: file entry click (select) ──────────────────
-        if class == "file-entry" || class == "file-entry active" || class == "file-name" {
+        if class == "file-entry"
+            || class == "file-entry active"
+            || class == "file-name"
+            || class == "file-select-btn"
+        {
             let path = el.get_attribute("data-path").or_else(|| {
-                el.parent_element()
+                el.closest("[data-path]")
+                    .ok()
+                    .flatten()
                     .and_then(|p| p.get_attribute("data-path"))
             });
             if let Some(p) = path {
@@ -3537,6 +3911,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
         // ── Workspace: rename button (inline rename) ─────────────
         if class == "rename-btn" {
+            if d_click.0.borrow().client_state.has_pending_intent() {
+                return;
+            }
             if let Some(path) = el.get_attribute("data-path") {
                 let mut inner = d_click.0.borrow_mut();
                 let file_name = explorer::file_name_only(&path);
@@ -3550,6 +3927,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
         // ── Workspace: delete button ──────────────────────────────
         if class == "delete-btn" {
+            if d_click.0.borrow().client_state.has_pending_intent() {
+                return;
+            }
             if let Some(path) = el.get_attribute("data-path") {
                 if let Some(window) = web_sys::window() {
                     let confirmed = window
@@ -3567,6 +3947,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
 
         if let Ok(Some(action_element)) = el.closest("[data-block-action]") {
+            if d_click.0.borrow().local_persistence_error.is_some() {
+                return;
+            }
             let Some(block_id) = action_element
                 .get_attribute("data-block-id")
                 .and_then(|value| uuid::Uuid::parse_str(&value).ok())
@@ -3623,6 +4006,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             let action = action_element
                 .get_attribute("data-ink-action")
                 .unwrap_or_default();
+            if action != "expand" && d_click.0.borrow().local_persistence_error.is_some() {
+                return;
+            }
             match action.as_str() {
                 "tool" => {
                     let tool = action_element
@@ -3685,12 +4071,23 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                         }
                         if expanded {
                             let _ = wrapper.class_list().add_1("expanded");
+                            let _ = wrapper.set_attribute("role", "dialog");
+                            let _ = wrapper.set_attribute("aria-modal", "true");
+                            let _ = wrapper.set_attribute("aria-label", "Expanded Ink drawing");
                             action_element.set_text_content(Some("Collapse"));
                             let _ =
                                 action_element.set_attribute("aria-label", "Collapse Ink drawing");
                             let _ = action_element.set_attribute("aria-expanded", "true");
+                            if let Ok(button) =
+                                action_element.clone().dyn_into::<web_sys::HtmlElement>()
+                            {
+                                let _ = button.focus();
+                            }
                         } else {
                             let _ = wrapper.class_list().remove_1("expanded");
+                            let _ = wrapper.remove_attribute("role");
+                            let _ = wrapper.remove_attribute("aria-modal");
+                            let _ = wrapper.remove_attribute("aria-label");
                             action_element.set_text_content(Some("Expand"));
                             let _ =
                                 action_element.set_attribute("aria-label", "Expand Ink drawing");
@@ -3721,6 +4118,11 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         {
             let mut inner = d_click.0.borrow_mut();
             inner.inspector_open = !inner.inspector_open;
+            inner.pending_focus_key = Some(if inner.inspector_open {
+                format!("inspector-tab:{}", inner.knowledge_tab)
+            } else {
+                "inspector-toggle".to_string()
+            });
             drop(inner);
             d_click.render();
             return;
@@ -3764,6 +4166,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             if let Some(tab_name) = el.get_attribute("data-tab") {
                 let mut inner = d_click.0.borrow_mut();
                 inner.knowledge_tab = tab_name;
+                inner.pending_focus_key = Some(format!("inspector-tab:{}", inner.knowledge_tab));
                 drop(inner);
                 d_click.render();
             }
@@ -3878,6 +4281,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             let state = &inner.client_state;
             let phase = state.phase();
             inner.storage_error.is_none()
+                && inner.local_persistence_error.is_none()
                 && phase != SessionPhase::HydratingLocal
                 && phase != SessionPhase::Closed
                 && phase != SessionPhase::Error
@@ -4022,9 +4426,34 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     )?;
     on_visibility.forget();
 
+    let d_resize = driver.clone();
+    let on_resize = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        d_resize.render();
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    web_sys::window()
+        .expect("No global window found")
+        .add_event_listener_with_callback("resize", on_resize.as_ref().unchecked_ref())?;
+    on_resize.forget();
+
     let d_keydown = driver.clone();
     let on_keydown = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
         if event.is_composing() {
+            return;
+        }
+        if event.key() == "Tab"
+            && d_keydown.0.borrow().expanded_ink_block.is_some()
+            && d_keydown.0.borrow().document_mode == DocumentMode::Preview
+        {
+            event.prevent_default();
+            if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+                if let Ok(Some(button)) =
+                    document.query_selector(".preview-ink.expanded [data-ink-action=\"expand\"]")
+                {
+                    if let Ok(button) = button.dyn_into::<web_sys::HtmlElement>() {
+                        let _ = button.focus();
+                    }
+                }
+            }
             return;
         }
         if event.key() == "Escape" {
@@ -4035,6 +4464,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     let selector = format!(".expanded[data-block-id=\"{}\"]", block_id);
                     if let Ok(Some(wrapper)) = document.query_selector(&selector) {
                         let _ = wrapper.class_list().remove_1("expanded");
+                        let _ = wrapper.remove_attribute("role");
+                        let _ = wrapper.remove_attribute("aria-modal");
+                        let _ = wrapper.remove_attribute("aria-label");
                         if let Ok(Some(main_content)) = wrapper.closest(".main-content") {
                             let _ = main_content.class_list().remove_1("ink-expanded");
                         }
@@ -4051,6 +4483,31 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     }
                 }
                 d_keydown.1.borrow_mut().resize(block_id);
+                return;
+            }
+            if d_keydown.0.borrow().missing_note.is_some() {
+                event.prevent_default();
+                d_keydown.0.borrow_mut().missing_note = None;
+                d_keydown.render();
+                return;
+            }
+            let focus_key = {
+                let mut inner = d_keydown.0.borrow_mut();
+                if inner.inspector_open {
+                    inner.inspector_open = false;
+                    inner.pending_focus_key = Some("inspector-toggle".to_string());
+                    Some("inspector-toggle")
+                } else if inner.sidebar_open {
+                    inner.sidebar_open = false;
+                    inner.pending_focus_key = Some("sidebar-toggle".to_string());
+                    Some("sidebar-toggle")
+                } else {
+                    None
+                }
+            };
+            if focus_key.is_some() {
+                event.prevent_default();
+                d_keydown.render();
                 return;
             }
         }
@@ -4091,6 +4548,30 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         };
         let class = el.class_name();
 
+        if el.class_list().contains("inspector-tab") {
+            let tabs = ["Backlinks", "Outline", "Tags", "Graph"];
+            let current = el
+                .get_attribute("data-tab")
+                .and_then(|name| tabs.iter().position(|tab| *tab == name))
+                .unwrap_or(0);
+            let next = match event.key().as_str() {
+                "ArrowRight" => Some((current + 1) % tabs.len()),
+                "ArrowLeft" => Some((current + tabs.len() - 1) % tabs.len()),
+                "Home" => Some(0),
+                "End" => Some(tabs.len() - 1),
+                _ => None,
+            };
+            if let Some(next) = next {
+                event.prevent_default();
+                let mut inner = d_keydown.0.borrow_mut();
+                inner.knowledge_tab = tabs[next].to_string();
+                inner.pending_focus_key = Some(format!("inspector-tab:{}", tabs[next]));
+                drop(inner);
+                d_keydown.render();
+            }
+            return;
+        }
+
         // ── Search input keydown ──────────────────────────────────
         if class == "search-input" {
             if event.key() == "ArrowDown" {
@@ -4123,6 +4604,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 d_keydown.0.borrow_mut().show_create = false;
                 d_keydown.0.borrow_mut().create_value = String::new();
                 d_keydown.0.borrow_mut().create_folder = None;
+                d_keydown.0.borrow_mut().pending_focus_key = Some("new-file".to_string());
                 d_keydown.render();
             }
             return;
@@ -4154,12 +4636,19 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 event.prevent_default();
                 d_keydown.0.borrow_mut().renaming_path = None;
                 d_keydown.0.borrow_mut().rename_value = String::new();
+                if let Some(path) = d_keydown.0.borrow().selected_path.clone() {
+                    d_keydown.0.borrow_mut().pending_focus_key = Some(format!("file:{}", path));
+                }
                 d_keydown.render();
             }
             return;
         }
     }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
-    root.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
+    web_sys::window()
+        .expect("No global window found")
+        .document()
+        .expect("No global document found")
+        .add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
     on_keydown.forget();
 
     let on_focusout = Closure::wrap(Box::new(move |event: web_sys::FocusEvent| {

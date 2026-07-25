@@ -21,11 +21,13 @@ async function resetWorkspace(page) {
 }
 
 async function ensureWorkspaceOpen(page) {
+  await expect(page.locator('.explorer-new-btn')).toBeAttached();
   const toggle = page.locator('.sidebar-toggle-btn');
   if (await toggle.isVisible() && !/sidebar-open/.test(await page.locator('.app-container').getAttribute('class'))) {
     await toggle.click();
     await expect(page.locator('.app-container')).toHaveClass(/sidebar-open/);
   }
+  await expect(page.locator('.sidebar')).toBeVisible();
 }
 
 async function ensureInspectorOpen(page) {
@@ -103,6 +105,20 @@ async function createNote(page, path, title, markdown) {
   await persisted(page, title);
   await page.locator('.block-textarea').fill(markdown);
   await persisted(page, markdown.split('\n').at(-1));
+}
+
+async function createStressWorkspace(page, count = 100) {
+  test.setTimeout(120_000);
+  for (let index = 0; index < count; index += 1) {
+    const padded = String(index).padStart(3, '0');
+    const previous = index === 0 ? '' : ` [[Stress/Note ${String(index - 1).padStart(3, '0')}]]`;
+    await createNote(
+      page,
+      `Stress/Note ${padded}.md`,
+      `Stress Note ${padded}`,
+      `# Stress Note ${padded}\n\nSearch corpus token-${padded}.${previous} #stress`
+    );
+  }
 }
 
 async function drawInkStroke(page, canvas = page.locator('.block-wrapper[data-block-type="ink"] canvas')) {
@@ -230,11 +246,15 @@ async function openNote(page, path, title) {
   for (let index = 1; index < segments.length; index += 1) {
     const folderPath = segments.slice(0, index).join('/');
     const folder = page.locator(`.explorer-folder[data-path="${folderPath}"]`);
-    if (await folder.isVisible() && !/expanded/.test(await folder.getAttribute('class'))) {
+    await expect(folder).toBeAttached();
+    await ensureWorkspaceOpen(page);
+    if (await folder.getAttribute('aria-expanded') === 'false') {
       await folder.click();
     }
   }
-  await page.locator(`.file-entry[data-path="${path}"]`).click();
+  const file = page.locator(`.file-entry[data-path="${path}"] .file-select-btn`);
+  await expect(file).toBeVisible();
+  await file.click();
   await expect(page.locator('.breadcrumb')).toHaveText(path);
   await expect(page.locator('.document-title-input')).toHaveValue(title);
 }
@@ -244,6 +264,12 @@ function failOnBrowserErrors(page) {
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
   return () => expect(errors, errors.join('\n')).toEqual([]);
+}
+
+function consumeExpectedBrowserErrors(page, pattern) {
+  const expected = page.__browserErrors.filter(message => pattern.test(message));
+  expect(expected.length, `expected browser error matching ${pattern}`).toBeGreaterThan(0);
+  page.__browserErrors = page.__browserErrors.filter(message => !pattern.test(message));
 }
 
 test.beforeEach(async ({ page }) => resetWorkspace(page));
@@ -272,6 +298,57 @@ test('persists edits through switching and reload', async ({ page }) => {
   await page.reload();
   await openNote(page, 'A.md', 'Alpha persisted');
   await expect(page.locator('.block-textarea')).toHaveValue('# Durable body');
+});
+
+test('Markdown persistence failure remains visible and retries normally', async ({ page }) => {
+  await createNote(page, 'Failure.md', 'Failure recovery', '# Durable baseline');
+  await page.evaluate(async () => {
+    const module = await import('/pkg/inkstone_web.js');
+    module.close_local_db();
+  });
+
+  await page.locator('.markdown-source-input').fill('# Retry this Markdown');
+  await expect(page.locator('.save-recovery')).toBeVisible();
+  await expect(page.locator('.save-recovery')).toContainText('not saved locally');
+  await expect(page.locator('.markdown-source-input')).toHaveValue('# Retry this Markdown');
+  await expect(page.locator('.topbar-save-status')).toHaveText(/failed/i);
+  await expect(page.getByRole('button', { name: 'Retry save' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Retry save' }).click();
+  await persisted(page, 'Retry this Markdown');
+  await expect(page.locator('.save-recovery')).toHaveCount(0);
+  await page.reload();
+  await openNote(page, 'Failure.md', 'Failure recovery');
+  await expect(page.locator('.markdown-source-input')).toHaveValue('# Retry this Markdown');
+  consumeExpectedBrowserErrors(page, /Failed to persist local update/);
+});
+
+test('Ink persistence failure is update-correlated and recoverable', async ({ page }) => {
+  await createNote(page, 'Ink Failure.md', 'Ink failure recovery', '# Ink failure');
+  await addBlock(page, 'ink');
+  await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
+  const before = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await page.evaluate(async () => {
+    const module = await import('/pkg/inkstone_web.js');
+    module.close_local_db();
+  });
+
+  await drawInkStroke(page);
+  const inkState = page.locator('.ink-save-state');
+  await expect(inkState).toHaveAttribute('data-state', 'failed');
+  await expect(inkState).toHaveText('Save failed');
+  await expect(inkState).not.toHaveText('Saved locally');
+  await expect(page.locator('.save-recovery')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Retry save' }).click();
+  await expect(inkState).toHaveAttribute('data-state', /saving|saved/);
+  await expect(inkState).toHaveText('Saved locally');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).not.toBe(before);
+  const recovered = (await latestBlockContent(page, 'ink')).stonepen_json;
+  await page.reload();
+  await openNote(page, 'Ink Failure.md', 'Ink failure recovery');
+  await expect.poll(async () => (await latestBlockContent(page, 'ink')).stonepen_json).toBe(recovered);
+  consumeExpectedBrowserErrors(page, /Failed to persist local update/);
 });
 
 test('focused textarea switches to Preview on the first click', async ({ page }) => {
@@ -306,6 +383,66 @@ test('search and recent results navigate to the selected note', async ({ page })
   await ensureWorkspaceOpen(page);
   await page.locator('.recent-item[data-path="B.md"]').click();
   await expect(page.locator('.breadcrumb')).toHaveText('B.md');
+});
+
+test('keyboard journey reaches search, files, inspector tabs, and restored controls', async ({ page }) => {
+  await createNote(page, 'Keyboard/Alpha.md', 'Keyboard Alpha', '# Keyboard search target');
+  await createNote(page, 'Keyboard/Beta.md', 'Keyboard Beta', '# Secondary note');
+
+  await page.keyboard.press('Control+K');
+  await expect(page.locator('.search-input')).toBeFocused();
+  await page.keyboard.type('Keyboard search target');
+  await expect(page.locator('.search-result-item[data-path="Keyboard/Alpha.md"]')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.breadcrumb')).toHaveText('Keyboard/Alpha.md');
+
+  await page.setViewportSize({ width: 900, height: 800 });
+  const inspectorToggle = page.getByRole('button', { name: 'Inspector', exact: true });
+  await inspectorToggle.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.inspector')).toHaveClass(/open/);
+  const firstTab = page.locator('.inspector-tab').first();
+  await firstTab.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.locator('.inspector-tab[data-tab="Outline"]')).toBeFocused();
+  await expect(page.locator('.inspector-tab[data-tab="Outline"]')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('End');
+  await expect(page.locator('.inspector-tab[data-tab="Graph"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.inspector')).not.toHaveClass(/open/);
+  await expect(inspectorToggle).toBeFocused();
+
+  await ensureWorkspaceOpen(page);
+  const newFile = page.getByRole('button', { name: '+ New File', exact: true });
+  await newFile.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.explorer-create-input')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(newFile).toBeFocused();
+});
+
+test('failed save defers navigation and resumes after retry', async ({ page }) => {
+  await createNote(page, 'Race/A.md', 'Race A', '# Baseline A');
+  await createNote(page, 'Race/B.md', 'Race B', '# Baseline B');
+  await openNote(page, 'Race/A.md', 'Race A');
+  await page.evaluate(async () => {
+    const module = await import('/pkg/inkstone_web.js');
+    module.close_local_db();
+  });
+
+  await page.locator('.markdown-source-input').fill('# Unsaved but retained A');
+  await expect(page.locator('.save-recovery')).toBeVisible();
+  await ensureWorkspaceOpen(page);
+  await page.locator('.file-entry[data-path="Race/B.md"] .file-select-btn').click();
+  await expect(page.locator('.breadcrumb')).toHaveText('Race/A.md');
+  await expect(page.locator('.topbar-save-status')).toContainText('retry before leaving');
+
+  await page.getByRole('button', { name: 'Retry save' }).click();
+  await expect(page.locator('.breadcrumb')).toHaveText('Race/B.md');
+  await page.reload();
+  await openNote(page, 'Race/A.md', 'Race A');
+  await expect(page.locator('.markdown-source-input')).toHaveValue('# Unsaved but retained A');
+  consumeExpectedBrowserErrors(page, /Failed to persist local update/);
 });
 
 test('recent notes are newest-first without duplicates', async ({ page }) => {
@@ -365,6 +502,48 @@ test('workspace fits the configured viewport', async ({ page }, testInfo) => {
   await page.keyboard.press('Control+K');
   await expect(page.locator('.app-container')).toHaveClass(/sidebar-open/);
   await expect(page.locator('.search-input')).toBeFocused();
+});
+
+test('workspace remains usable across the release viewport matrix', async ({ page }) => {
+  await createNote(page, 'Viewport.md', 'Viewport proof', '# Responsive workspace');
+  for (const viewport of [
+    { width: 320, height: 568 },
+    { width: 768, height: 1024 },
+    { width: 1280, height: 720 },
+    { width: 1440, height: 900 }
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(page.locator('.document-title-input')).toBeVisible();
+    const dimensions = await page.evaluate(() => ({
+      documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      bodyOverflow: document.body.scrollWidth - window.innerWidth
+    }));
+    expect(dimensions.documentOverflow, `${viewport.width}x${viewport.height} document overflow`).toBeLessThanOrEqual(0);
+    expect(dimensions.bodyOverflow, `${viewport.width}x${viewport.height} body overflow`).toBeLessThanOrEqual(0);
+  }
+});
+
+test('100-note workspace remains searchable and navigable', async ({ page }) => {
+  await createStressWorkspace(page);
+  await page.reload();
+  await ensureWorkspaceOpen(page);
+  await page.locator('.search-input').fill('token-073');
+  const result = page.locator('.search-result-item[data-path="Stress/Note 073.md"]');
+  await expect(result).toBeVisible();
+  await result.click();
+  await expect(page.locator('.document-title-input')).toHaveValue('Stress Note 073');
+  await expect(page.locator('.markdown-source-input')).toHaveValue(/token-073/);
+});
+
+test('soak iteration preserves the latest edit through rapid navigation', async ({ page }) => {
+  await createNote(page, 'Soak/A.md', 'Soak A', '# Initial A');
+  await createNote(page, 'Soak/B.md', 'Soak B', '# Initial B');
+  await openNote(page, 'Soak/A.md', 'Soak A');
+  await page.locator('.markdown-source-input').fill('# Latest A');
+  await persisted(page, 'Latest A');
+  await openNote(page, 'Soak/B.md', 'Soak B');
+  await openNote(page, 'Soak/A.md', 'Soak A');
+  await expect(page.locator('.markdown-source-input')).toHaveValue('# Latest A');
 });
 
 test('creates and reloads Markdown, Math, Ink, and Divider blocks', async ({ page }) => {
@@ -530,6 +709,7 @@ test('Stonepen drawing, tools, undo, redo, navigation, and reload are durable', 
   await expect.poll(async () => latestBlockContent(page, 'ink')).not.toBeNull();
   const initialJson = (await latestBlockContent(page, 'ink')).stonepen_json;
   const initialPixels = await canvas.evaluate(element => element.toDataURL());
+  await canvas.scrollIntoViewIfNeeded();
   const box = await canvas.boundingBox();
   await page.mouse.move(box.x + 60, box.y + 95);
   await page.mouse.down();
@@ -624,7 +804,7 @@ test('populated research notebook is durable and composed', async ({ page }, tes
     await drawInkStroke(page);
     await expect(page.locator('.ink-save-state')).toHaveText('Saved locally');
   } else {
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/edit-desktop.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/edit-desktop.png', fullPage: true });
   }
 
   await page.getByRole('button', { name: 'Preview', exact: true }).click();
@@ -652,14 +832,14 @@ test('populated research notebook is durable and composed', async ({ page }, tes
   await expect(page.locator('.inspector-section[data-section="backlinks"] .backlink-context')).toHaveCount(7);
   await expect(page.locator('.inspector-section')).toContainText('Research/Conjugate Priors.md');
   if (!isMobile) {
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-backlinks.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-backlinks.png', fullPage: true });
   }
 
   await page.locator('.inspector-tab[data-tab="Graph"]').click();
   await expect(page.locator('.local-graph-node')).toHaveCount(8);
   await expect(page.locator('.local-graph-node.active')).toContainText('Bayes Rule Deriva');
   if (!isMobile) {
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-graph.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-graph.png', fullPage: true });
   }
   await page.locator('.graph-node-hit[data-path="Research/Conjugate Priors.md"]').click();
   await expect(page.locator('.breadcrumb')).toHaveText('Research/Conjugate Priors.md');
@@ -673,17 +853,17 @@ test('populated research notebook is durable and composed', async ({ page }, tes
   await expect(page.locator('.preview-ink')).toHaveClass(/expanded/);
   await expect(page.locator('.ink-tool-btn')).toHaveCount(0);
   if (!isMobile) {
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-ink-expanded.png' });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-ink-expanded.png' });
   }
   await page.getByRole('button', { name: 'Collapse Ink drawing' }).click();
   await expect(page.locator('.preview-ink')).not.toHaveClass(/expanded/);
 
   if (isMobile) {
     await page.locator('.main-content').evaluate(element => { element.scrollTop = 0; });
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-mobile.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-mobile.png', fullPage: true });
   } else {
     await page.locator('.main-content').evaluate(element => { element.scrollTop = 0; });
-    await page.screenshot({ path: '/tmp/inkstone-final-preview/preview-desktop.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-desktop.png', fullPage: true });
   }
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   await expect(page.locator('.markdown-source-input')).toHaveValue(/Posterior inference/);

@@ -69,6 +69,7 @@ pub enum ClientEvent {
     LocalPersistenceFailed {
         update_id: UpdateId,
     },
+    RetryLocalPersistence,
     LocalHydrationLoaded {
         lifecycle: LifecycleId,
         confirmed_doc: Option<InkstoneDocument>,
@@ -217,6 +218,7 @@ pub struct ClientState {
     view_doc: InkstoneDocument,
     inbox: SequencedInbox,
     pending_intent: Option<PreparedLocalUpdate>,
+    local_persistence_failed: bool,
     intent_queue: VecDeque<QueuedIntent>,
     pending_confirmation: Option<PendingConfirmationState>,
     next_confirm_token: u64,
@@ -250,6 +252,7 @@ impl ClientState {
             pending_local: Vec::new(),
             inbox: SequencedInbox::new(),
             pending_intent: None,
+            local_persistence_failed: false,
             intent_queue: VecDeque::new(),
             pending_confirmation: None,
             next_confirm_token: 0,
@@ -311,6 +314,10 @@ impl ClientState {
 
     pub fn has_pending_intent(&self) -> bool {
         self.pending_intent.is_some()
+    }
+
+    pub fn local_persistence_failed(&self) -> bool {
+        self.local_persistence_failed
     }
 
     pub fn intent_queue_len(&self) -> usize {
@@ -626,6 +633,7 @@ impl ClientState {
                 self.view_doc = new_document(doc_id);
                 self.inbox.clear();
                 self.pending_intent = None;
+                self.local_persistence_failed = false;
                 self.intent_queue.clear();
                 self.pending_confirmation = None;
                 self.pending_conflicts.clear();
@@ -649,6 +657,7 @@ impl ClientState {
                 self.pending_local.clear();
                 self.inbox.clear();
                 self.pending_intent = None;
+                self.local_persistence_failed = false;
                 self.intent_queue.clear();
                 self.pending_confirmation = None;
                 self.pending_conflicts.clear();
@@ -717,6 +726,7 @@ impl ClientState {
             ClientEvent::LocalUpdatePersisted { update_id } => match &self.pending_intent {
                 Some(prepared) if prepared.update.update_id == update_id => {
                     let prepared = self.pending_intent.take().unwrap();
+                    self.local_persistence_failed = false;
                     let was_live = self.phase == SessionPhase::Live;
                     self.pending_local.push(prepared.update.clone());
                     self.rebuild_view();
@@ -731,19 +741,32 @@ impl ClientState {
                 _ => vec![],
             },
 
-            // ── LocalPersistenceFailed: check update_id match ───────────
+            // Keep the candidate visible and retryable until the exact write succeeds.
             ClientEvent::LocalPersistenceFailed { update_id } => match &self.pending_intent {
                 Some(prepared) if prepared.update.update_id == update_id => {
-                    self.pending_intent = None;
-                    let mut effects = vec![Effect::NotifyError(format!(
+                    self.local_persistence_failed = true;
+                    vec![Effect::NotifyError(format!(
                         "Failed to persist local update {}",
                         update_id
-                    ))];
-                    effects.extend(self.prepare_next_intent());
-                    effects
+                    ))]
                 }
                 _ => vec![],
             },
+
+            ClientEvent::RetryLocalPersistence => {
+                if !self.local_persistence_failed {
+                    vec![]
+                } else if let Some(prepared) = &self.pending_intent {
+                    self.local_persistence_failed = false;
+                    vec![Effect::PersistLocalUpdate {
+                        update_id: prepared.update.update_id,
+                        update: prepared.update.clone(),
+                    }]
+                } else {
+                    self.local_persistence_failed = false;
+                    vec![]
+                }
+            }
 
             // ── LocalHydrationLoaded ──────────────────────────────────────
             ClientEvent::LocalHydrationLoaded {
