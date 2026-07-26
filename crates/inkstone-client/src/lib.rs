@@ -1,4 +1,6 @@
+pub mod assets;
 pub mod inbox;
+pub mod text_sync;
 
 use std::collections::VecDeque;
 
@@ -9,6 +11,21 @@ use inkstone_core::{DocumentUpdate, new_document};
 use serde::{Deserialize, Serialize};
 
 use crate::inbox::SequencedInbox;
+
+fn update_version(op: &DocumentOp) -> u32 {
+    match op {
+        DocumentOp::ApplyTextUpdateV2 { .. } | DocumentOp::ApplyInkUpdateV2 { .. } => {
+            inkstone_core::doc_ops::DOCUMENT_UPDATE_V2_VERSION
+        }
+        _ => inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION,
+    }
+}
+
+fn main_state_update_supported(update: &DocumentUpdate) -> bool {
+    update.version == inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION
+        || update.version == inkstone_core::doc_ops::DOCUMENT_UPDATE_V2_VERSION
+            && matches!(update.op, DocumentOp::ApplyInkUpdateV2 { .. })
+}
 
 // ── Public token types ─────────────────────────────────────────────────────
 
@@ -70,6 +87,7 @@ pub enum ClientEvent {
         update_id: UpdateId,
     },
     RetryLocalPersistence,
+    RetrySync,
     LocalHydrationLoaded {
         lifecycle: LifecycleId,
         confirmed_doc: Option<InkstoneDocument>,
@@ -206,6 +224,8 @@ struct QueuedIntent {
 struct PendingConfirmationState {
     token: ConfirmToken,
     payload: ConfirmationPayload,
+    persistence_retries: u8,
+    replay_conflict: Option<PendingConflict>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +252,9 @@ pub struct ClientState {
     next_connection_id: u64,
     active_fetch_id: Option<FetchId>,
     active_fetch_purpose: Option<FetchPurpose>,
+    active_fetch_after_seq: Option<i64>,
+    active_fetch_through_seq: Option<i64>,
+    active_fetch_limit: Option<i64>,
     next_fetch_id: u64,
     reconnect_token: Option<ReconnectToken>,
     next_reconnect_token: u64,
@@ -265,6 +288,9 @@ impl ClientState {
             next_connection_id: 0,
             active_fetch_id: None,
             active_fetch_purpose: None,
+            active_fetch_after_seq: None,
+            active_fetch_through_seq: None,
+            active_fetch_limit: None,
             next_fetch_id: 0,
             reconnect_token: None,
             next_reconnect_token: 0,
@@ -352,11 +378,58 @@ impl ClientState {
         self.ready_catchup_target
     }
 
+    pub fn is_confirmation_completion_current(
+        &self,
+        lifecycle: LifecycleId,
+        doc_id: DocId,
+        token: ConfirmToken,
+    ) -> bool {
+        lifecycle == self.lifecycle_id
+            && doc_id == self.doc_id
+            && self
+                .pending_confirmation
+                .as_ref()
+                .is_some_and(|pending| pending.token == token && pending.payload.doc_id == doc_id)
+    }
+
     fn reconnect_delay(&self) -> u64 {
         const BASE_MS: u64 = 1000;
         const MAX_MS: u64 = 60_000;
         let delay = BASE_MS.saturating_mul(2u64.saturating_pow(self.reconnect_attempts));
         delay.min(MAX_MS)
+    }
+
+    fn clear_active_fetch(&mut self) {
+        self.active_fetch_id = None;
+        self.active_fetch_purpose = None;
+        self.active_fetch_after_seq = None;
+        self.active_fetch_through_seq = None;
+        self.active_fetch_limit = None;
+    }
+
+    fn fetch_updates(
+        &mut self,
+        purpose: FetchPurpose,
+        after_seq: i64,
+        through_seq: i64,
+        limit: i64,
+    ) -> Effect {
+        let fetch_id = FetchId(self.next_fetch_id);
+        self.next_fetch_id += 1;
+        self.active_fetch_id = Some(fetch_id);
+        self.active_fetch_purpose = Some(purpose);
+        self.active_fetch_after_seq = Some(after_seq);
+        self.active_fetch_through_seq = Some(through_seq);
+        self.active_fetch_limit = Some(limit);
+        Effect::FetchUpdates {
+            lifecycle: self.lifecycle_id,
+            fetch_id,
+            purpose,
+            doc_id: self.doc_id,
+            after_seq,
+            through_seq,
+            limit,
+        }
     }
 
     fn rebuild_view(&mut self) {
@@ -390,9 +463,13 @@ impl ClientState {
     }
 
     fn enter_live(&mut self) -> Vec<Effect> {
+        if self.phase != SessionPhase::CatchingUp || self.active_connection_id.is_none() {
+            return vec![];
+        }
         self.phase = SessionPhase::Live;
         self.reconnect_attempts = 0;
         self.ready_catchup_target = None;
+        self.clear_active_fetch();
 
         let mut effects: Vec<Effect> = Vec::new();
         for update in &self.pending_local {
@@ -404,7 +481,7 @@ impl ClientState {
     fn prepare_next_intent(&mut self) -> Vec<Effect> {
         while let Some(queued) = self.intent_queue.pop_front() {
             let update = DocumentUpdate {
-                version: inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION,
+                version: update_version(&queued.op),
                 update_id: queued.update_id,
                 doc_id: self.doc_id,
                 applied_at_ms: queued.applied_at_ms,
@@ -435,19 +512,12 @@ impl ClientState {
             return self.enter_live();
         }
         self.ready_catchup_target = Some(ready_seq);
-        let fetch_id = FetchId(self.next_fetch_id);
-        self.next_fetch_id += 1;
-        self.active_fetch_id = Some(fetch_id);
-        self.active_fetch_purpose = Some(FetchPurpose::BootstrapCatchUp);
-        vec![Effect::FetchUpdates {
-            lifecycle: self.lifecycle_id,
-            fetch_id,
-            purpose: FetchPurpose::BootstrapCatchUp,
-            doc_id: self.doc_id,
-            after_seq: self.confirmed_seq,
-            through_seq: ready_seq,
-            limit: 500,
-        }]
+        vec![self.fetch_updates(
+            FetchPurpose::BootstrapCatchUp,
+            self.confirmed_seq,
+            ready_seq,
+            500,
+        )]
     }
 
     fn drain_inbox(&mut self) -> Vec<Effect> {
@@ -471,8 +541,7 @@ impl ClientState {
             // If a LiveGapRecovery fetch was in flight, the gap has now been
             // filled naturally by a WebSocket delivery, so clear the fetch state.
             if self.active_fetch_purpose == Some(FetchPurpose::LiveGapRecovery) {
-                self.active_fetch_id = None;
-                self.active_fetch_purpose = None;
+                self.clear_active_fetch();
             }
 
             let was_pending = self
@@ -483,7 +552,7 @@ impl ClientState {
             let mut candidate = self.confirmed_doc.clone();
             let outcome = sequenced_replay(&mut candidate, entry_update.clone());
 
-            match outcome {
+            let replay_conflict = match outcome {
                 ReplayOutcome::Fatal { reason } => {
                     self.phase = SessionPhase::Error;
                     self.errors.push(format!("Fatal replay: {}", reason));
@@ -491,60 +560,76 @@ impl ClientState {
                     effects.push(Effect::NotifyError(format!("Fatal replay: {}", reason)));
                     return effects;
                 }
-                _ => {
-                    let mut new_pending_local = Vec::new();
-                    for pending in &self.pending_local {
-                        if pending.update_id != entry_update.update_id {
-                            let mut rebased = candidate.clone();
-                            match sequenced_replay(&mut rebased, pending.clone()) {
-                                ReplayOutcome::Fatal { .. } => continue,
-                                ReplayOutcome::Adjusted { reason } => {
-                                    new_pending_local.push(pending.clone());
-                                    self.pending_conflicts.push(PendingConflict {
-                                        update_id: pending.update_id,
-                                        outcome: "Adjusted".into(),
-                                        reason,
-                                    });
-                                }
-                                ReplayOutcome::NoOp { conflict } => {
-                                    new_pending_local.push(pending.clone());
-                                    self.pending_conflicts.push(PendingConflict {
-                                        update_id: pending.update_id,
-                                        outcome: "NoOp".into(),
-                                        reason: conflict,
-                                    });
-                                }
-                                _ => {
-                                    new_pending_local.push(pending.clone());
-                                }
+                ReplayOutcome::Adjusted { reason } => Some(PendingConflict {
+                    update_id: entry_update.update_id,
+                    outcome: "Adjusted remote update".into(),
+                    reason,
+                }),
+                ReplayOutcome::NoOp { conflict } => Some(PendingConflict {
+                    update_id: entry_update.update_id,
+                    outcome: "No-op remote update".into(),
+                    reason: conflict,
+                }),
+                ReplayOutcome::Applied => None,
+            };
+            {
+                let mut new_pending_local = Vec::new();
+                for pending in &self.pending_local {
+                    if pending.update_id != entry_update.update_id {
+                        let mut rebased = candidate.clone();
+                        match sequenced_replay(&mut rebased, pending.clone()) {
+                            ReplayOutcome::Fatal { .. } => continue,
+                            ReplayOutcome::Adjusted { reason } => {
+                                new_pending_local.push(pending.clone());
+                                self.pending_conflicts.push(PendingConflict {
+                                    update_id: pending.update_id,
+                                    outcome: "Adjusted".into(),
+                                    reason,
+                                });
+                            }
+                            ReplayOutcome::NoOp { conflict } => {
+                                new_pending_local.push(pending.clone());
+                                self.pending_conflicts.push(PendingConflict {
+                                    update_id: pending.update_id,
+                                    outcome: "NoOp".into(),
+                                    reason: conflict,
+                                });
+                            }
+                            _ => {
+                                new_pending_local.push(pending.clone());
                             }
                         }
                     }
-
-                    let remove_id = if was_pending {
-                        Some(entry_update.update_id)
-                    } else {
-                        None
-                    };
-
-                    let payload = ConfirmationPayload {
-                        doc_id: self.doc_id,
-                        confirmed_seq: entry_seq,
-                        confirmed_doc: candidate.clone(),
-                        remove_outbox_update_id: remove_id,
-                        pending_updates_after_rebase: new_pending_local.clone(),
-                    };
-
-                    let token = ConfirmToken(self.next_confirm_token);
-                    self.next_confirm_token += 1;
-
-                    effects.push(Effect::PersistConfirmation {
-                        token,
-                        checkpoint: payload.clone(),
-                    });
-                    self.pending_confirmation = Some(PendingConfirmationState { token, payload });
-                    break;
                 }
+
+                let remove_id = if was_pending {
+                    Some(entry_update.update_id)
+                } else {
+                    None
+                };
+
+                let payload = ConfirmationPayload {
+                    doc_id: self.doc_id,
+                    confirmed_seq: entry_seq,
+                    confirmed_doc: candidate.clone(),
+                    remove_outbox_update_id: remove_id,
+                    pending_updates_after_rebase: new_pending_local.clone(),
+                };
+
+                let token = ConfirmToken(self.next_confirm_token);
+                self.next_confirm_token += 1;
+
+                effects.push(Effect::PersistConfirmation {
+                    token,
+                    checkpoint: payload.clone(),
+                });
+                self.pending_confirmation = Some(PendingConfirmationState {
+                    token,
+                    payload,
+                    persistence_retries: 0,
+                    replay_conflict,
+                });
+                break;
             }
         }
 
@@ -554,12 +639,18 @@ impl ClientState {
     fn apply_confirmation(&mut self, token: ConfirmToken) -> Vec<Effect> {
         let stored = match &self.pending_confirmation {
             None => {
+                if token.0 < self.next_confirm_token {
+                    return vec![];
+                }
                 self.phase = SessionPhase::Error;
                 self.errors
                     .push("ConfirmationPersisted with no pending confirmation".into());
                 return vec![];
             }
             Some(pc) if pc.token != token => {
+                if token.0 < pc.token.0 {
+                    return vec![];
+                }
                 self.phase = SessionPhase::Error;
                 self.errors.push(format!(
                     "Confirmation token mismatch: expected {:?}, got {:?}",
@@ -578,6 +669,9 @@ impl ClientState {
         self.confirmed_seq = payload.confirmed_seq;
         self.pending_local = payload.pending_updates_after_rebase;
         self.rebuild_view();
+        if let Some(conflict) = stored.replay_conflict {
+            self.pending_conflicts.push(conflict);
+        }
 
         let mut effects = self.drain_inbox();
 
@@ -587,20 +681,13 @@ impl ClientState {
                     effects.extend(self.enter_live());
                     // Drain any post-boundary inbox entries immediately
                     effects.extend(self.drain_inbox());
-                } else if self.inbox.is_empty() {
-                    let fetch_id = FetchId(self.next_fetch_id);
-                    self.next_fetch_id += 1;
-                    self.active_fetch_id = Some(fetch_id);
-                    self.active_fetch_purpose = Some(FetchPurpose::BootstrapCatchUp);
-                    effects.push(Effect::FetchUpdates {
-                        lifecycle: self.lifecycle_id,
-                        fetch_id,
-                        purpose: FetchPurpose::BootstrapCatchUp,
-                        doc_id: self.doc_id,
-                        after_seq: self.confirmed_seq,
-                        through_seq: target,
-                        limit: 500,
-                    });
+                } else if self.active_fetch_id.is_none() {
+                    effects.push(self.fetch_updates(
+                        FetchPurpose::BootstrapCatchUp,
+                        self.confirmed_seq,
+                        target,
+                        500,
+                    ));
                 }
             }
         }
@@ -639,8 +726,7 @@ impl ClientState {
                 self.pending_conflicts.clear();
                 self.reconnect_attempts = 0;
                 self.ready_catchup_target = None;
-                self.active_fetch_id = None;
-                self.active_fetch_purpose = None;
+                self.clear_active_fetch();
                 self.active_connection_id = None;
                 self.reconnect_token = None;
                 vec![
@@ -663,8 +749,7 @@ impl ClientState {
                 self.pending_conflicts.clear();
                 self.reconnect_attempts = 0;
                 self.ready_catchup_target = None;
-                self.active_fetch_id = None;
-                self.active_fetch_purpose = None;
+                self.clear_active_fetch();
                 self.active_connection_id = None;
                 self.reconnect_token = None;
                 vec![Effect::CancelReconnect, Effect::DisconnectSocket]
@@ -676,17 +761,18 @@ impl ClientState {
                 update_id,
                 applied_at_ms,
             } => {
+                let allowed_phases = [
+                    SessionPhase::Offline,
+                    SessionPhase::Connecting,
+                    SessionPhase::CatchingUp,
+                    SessionPhase::Live,
+                ];
+                if !allowed_phases.contains(&self.phase) {
+                    self.errors.push("LocalIntent in invalid phase".into());
+                    return vec![Effect::NotifyError("Cannot edit in this phase".into())];
+                }
+
                 if self.pending_intent.is_some() {
-                    let allowed_phases = [
-                        SessionPhase::Offline,
-                        SessionPhase::Connecting,
-                        SessionPhase::CatchingUp,
-                        SessionPhase::Live,
-                    ];
-                    if !allowed_phases.contains(&self.phase) {
-                        self.errors.push("LocalIntent in invalid phase".into());
-                        return vec![Effect::NotifyError("Cannot edit in this phase".into())];
-                    }
                     self.intent_queue.push_back(QueuedIntent {
                         op,
                         update_id,
@@ -696,7 +782,7 @@ impl ClientState {
                 }
 
                 let update = DocumentUpdate {
-                    version: inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION,
+                    version: update_version(&op),
                     update_id,
                     doc_id: self.doc_id,
                     applied_at_ms,
@@ -768,6 +854,19 @@ impl ClientState {
                 }
             }
 
+            ClientEvent::RetrySync => {
+                if self.phase != SessionPhase::Offline {
+                    vec![]
+                } else {
+                    self.reconnect_token = None;
+                    self.reconnect_attempts = 0;
+                    vec![Effect::CancelReconnect]
+                        .into_iter()
+                        .chain(self.emit_connect_socket())
+                        .collect()
+                }
+            }
+
             // ── LocalHydrationLoaded ──────────────────────────────────────
             ClientEvent::LocalHydrationLoaded {
                 lifecycle,
@@ -811,7 +910,7 @@ impl ClientState {
                             pu.update_id, pu.doc_id
                         ));
                     }
-                    if pu.version != inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION {
+                    if !main_state_update_supported(pu) {
                         errors.push(format!(
                             "pending update {} has unsupported version {}",
                             pu.update_id, pu.version
@@ -869,9 +968,14 @@ impl ClientState {
                     return vec![];
                 }
                 if self.phase == SessionPhase::Closed || self.phase == SessionPhase::Error {
+                    self.active_connection_id = None;
+                    self.clear_active_fetch();
+                    self.ready_catchup_target = None;
                     return vec![];
                 }
                 self.active_connection_id = None;
+                self.clear_active_fetch();
+                self.ready_catchup_target = None;
                 self.phase = SessionPhase::Offline;
                 let delay = self.reconnect_delay();
                 self.reconnect_attempts += 1;
@@ -908,6 +1012,8 @@ impl ClientState {
                 self.phase = SessionPhase::CatchingUp;
                 self.reconnect_attempts = 0;
                 self.reconnect_token = None;
+                self.errors
+                    .retain(|error| !error.starts_with("Catch-up failed:"));
                 self.catch_up(current_seq)
             }
 
@@ -928,7 +1034,7 @@ impl ClientState {
                 // Do NOT reject seq > ready_catchup_target during CatchingUp —
                 // these are buffered until we reach Live.
 
-                let fatal = self.inbox.store(seq, update.clone());
+                let fatal = self.inbox.store(seq, update.clone(), self.confirmed_seq);
                 if let Some(e) = fatal {
                     self.phase = SessionPhase::Error;
                     self.errors.push(e.message);
@@ -946,19 +1052,12 @@ impl ClientState {
 
                 if self.phase == SessionPhase::Live && self.inbox.has_gap(self.confirmed_seq) {
                     if self.active_fetch_id.is_none() {
-                        let fetch_id = FetchId(self.next_fetch_id);
-                        self.next_fetch_id += 1;
-                        self.active_fetch_id = Some(fetch_id);
-                        self.active_fetch_purpose = Some(FetchPurpose::LiveGapRecovery);
-                        return vec![Effect::FetchUpdates {
-                            lifecycle: self.lifecycle_id,
-                            fetch_id,
-                            purpose: FetchPurpose::LiveGapRecovery,
-                            doc_id: self.doc_id,
-                            after_seq: self.confirmed_seq,
-                            through_seq: self.confirmed_seq + 1,
-                            limit: 1,
-                        }];
+                        return vec![self.fetch_updates(
+                            FetchPurpose::LiveGapRecovery,
+                            self.confirmed_seq,
+                            self.confirmed_seq + 1,
+                            1,
+                        )];
                     }
                 }
 
@@ -977,12 +1076,53 @@ impl ClientState {
                 if self.active_fetch_id != Some(fetch_id) {
                     return vec![];
                 }
-                let purpose = self.active_fetch_purpose.take();
-                self.active_fetch_id = None;
+
+                let purpose = match self.active_fetch_purpose {
+                    Some(purpose) => purpose,
+                    None => {
+                        self.clear_active_fetch();
+                        return vec![];
+                    }
+                };
+                let valid_phase = match purpose {
+                    FetchPurpose::BootstrapCatchUp => self.phase == SessionPhase::CatchingUp,
+                    FetchPurpose::LiveGapRecovery => self.phase == SessionPhase::Live,
+                };
+                if !valid_phase || self.active_connection_id.is_none() {
+                    self.clear_active_fetch();
+                    return vec![];
+                }
+
+                let (after_seq, through_seq, limit) = match (
+                    self.active_fetch_after_seq,
+                    self.active_fetch_through_seq,
+                    self.active_fetch_limit,
+                ) {
+                    (Some(after_seq), Some(through_seq), Some(limit)) => {
+                        (after_seq, through_seq, limit)
+                    }
+                    _ => {
+                        self.clear_active_fetch();
+                        self.phase = SessionPhase::Error;
+                        self.errors
+                            .push("Active fetch is missing range metadata".into());
+                        return vec![];
+                    }
+                };
+                self.clear_active_fetch();
+
+                if purpose == FetchPurpose::BootstrapCatchUp
+                    && self.ready_catchup_target != Some(through_seq)
+                {
+                    self.phase = SessionPhase::Error;
+                    self.errors
+                        .push("Bootstrap fetch does not match the active catch-up target".into());
+                    return vec![];
+                }
 
                 if items.is_empty() {
                     match purpose {
-                        Some(FetchPurpose::BootstrapCatchUp) => {
+                        FetchPurpose::BootstrapCatchUp => {
                             if let Some(target) = self.ready_catchup_target {
                                 if self.confirmed_seq < target {
                                     self.phase = SessionPhase::Error;
@@ -993,34 +1133,66 @@ impl ClientState {
                             }
                             return vec![];
                         }
-                        Some(FetchPurpose::LiveGapRecovery) => {
+                        FetchPurpose::LiveGapRecovery => {
                             self.phase = SessionPhase::Error;
                             self.errors
                                 .push("Live gap recovery returned empty page".into());
                             return vec![];
                         }
-                        None => return vec![],
                     }
                 }
 
-                for item in &items {
-                    if let Some(target) = self.ready_catchup_target {
-                        if item.seq > target {
-                            self.phase = SessionPhase::Error;
-                            self.errors.push(format!(
-                                "Catch-up seq {} exceeds target {}",
-                                item.seq, target
-                            ));
-                            return vec![];
-                        }
+                if limit <= 0 || items.len() as i64 > limit {
+                    self.phase = SessionPhase::Error;
+                    self.errors.push(format!(
+                        "Malformed catch-up page: {} items exceeds limit {}",
+                        items.len(),
+                        limit
+                    ));
+                    return vec![];
+                }
+
+                for (index, item) in items.iter().enumerate() {
+                    let expected_seq = after_seq
+                        .checked_add(index as i64 + 1)
+                        .filter(|seq| *seq <= through_seq);
+                    if expected_seq != Some(item.seq) {
+                        self.phase = SessionPhase::Error;
+                        self.errors.push(format!(
+                            "Malformed catch-up page: expected seq {:?}, got {}",
+                            expected_seq, item.seq
+                        ));
+                        return vec![];
                     }
-                    let fatal = self.inbox.store(item.seq, item.update.clone());
+                    if item.update.doc_id != self.doc_id {
+                        self.phase = SessionPhase::Error;
+                        self.errors.push(format!(
+                            "Catch-up update {} has wrong doc_id {}",
+                            item.update.update_id, item.update.doc_id
+                        ));
+                        return vec![];
+                    }
+                    if !main_state_update_supported(&item.update) {
+                        self.phase = SessionPhase::Error;
+                        self.errors.push(format!(
+                            "Catch-up update {} has unsupported version {}",
+                            item.update.update_id, item.update.version
+                        ));
+                        return vec![];
+                    }
+                }
+
+                let mut staged_inbox = self.inbox.clone();
+                for item in &items {
+                    let fatal =
+                        staged_inbox.store(item.seq, item.update.clone(), self.confirmed_seq);
                     if let Some(e) = fatal {
                         self.phase = SessionPhase::Error;
                         self.errors.push(e.message);
                         return vec![];
                     }
                 }
+                self.inbox = staged_inbox;
 
                 let mut effects = self.drain_inbox();
                 if effects.is_empty() {
@@ -1029,22 +1201,15 @@ impl ClientState {
                             effects = self.enter_live();
                             effects.extend(self.drain_inbox());
                         } else if self.confirmed_seq < target
-                            && self.inbox.is_empty()
                             && self.pending_confirmation.is_none()
+                            && self.active_fetch_id.is_none()
                         {
-                            let fetch_id = FetchId(self.next_fetch_id);
-                            self.next_fetch_id += 1;
-                            self.active_fetch_id = Some(fetch_id);
-                            self.active_fetch_purpose = Some(FetchPurpose::BootstrapCatchUp);
-                            effects.push(Effect::FetchUpdates {
-                                lifecycle: self.lifecycle_id,
-                                fetch_id,
-                                purpose: FetchPurpose::BootstrapCatchUp,
-                                doc_id: self.doc_id,
-                                after_seq: self.confirmed_seq,
-                                through_seq: target,
-                                limit: 500,
-                            });
+                            effects.push(self.fetch_updates(
+                                FetchPurpose::BootstrapCatchUp,
+                                self.confirmed_seq,
+                                target,
+                                500,
+                            ));
                         }
                     }
                 }
@@ -1063,23 +1228,46 @@ impl ClientState {
                 if self.active_fetch_id != Some(fetch_id) {
                     return vec![];
                 }
-                self.active_fetch_id = None;
-                self.active_fetch_purpose = None;
-                self.errors.push(format!("Catch-up failed: {}", reason));
-                self.phase = SessionPhase::Error;
-                vec![Effect::NotifyError(format!("Catch-up failed: {}", reason))]
+                self.clear_active_fetch();
+                let message = format!("Catch-up failed: {}", reason);
+                self.errors.push(message.clone());
+                self.active_connection_id = None;
+                self.ready_catchup_target = None;
+                self.phase = SessionPhase::Offline;
+                let delay = self.reconnect_delay();
+                self.reconnect_attempts += 1;
+                let token = ReconnectToken(self.next_reconnect_token);
+                self.next_reconnect_token += 1;
+                self.reconnect_token = Some(token);
+                vec![
+                    Effect::DisconnectSocket,
+                    Effect::NotifyError(message),
+                    Effect::ScheduleReconnect {
+                        lifecycle: self.lifecycle_id,
+                        reconnect_token: token,
+                        delay_ms: delay,
+                    },
+                ]
             }
 
             ClientEvent::ConfirmationPersisted { token } => self.apply_confirmation(token),
 
             ClientEvent::ConfirmationPersistenceFailed { token } => {
-                match &self.pending_confirmation {
-                    Some(pc) if pc.token == token => {
+                match &mut self.pending_confirmation {
+                    Some(pc) if pc.token == token && pc.persistence_retries < 3 => {
+                        pc.persistence_retries += 1;
                         self.errors.push("Confirmation persistence failed".into());
                         vec![Effect::PersistConfirmation {
                             token,
                             checkpoint: pc.payload.clone(),
                         }]
+                    }
+                    Some(pc) if pc.token == token => {
+                        self.phase = SessionPhase::Error;
+                        let message =
+                            "Confirmation persistence failed after three retries".to_string();
+                        self.errors.push(message.clone());
+                        vec![Effect::NotifyError(message)]
                     }
                     _ => vec![],
                 }
