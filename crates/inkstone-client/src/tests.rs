@@ -203,6 +203,56 @@ fn test_offline_persisted_local_edit_does_not_send() {
 }
 
 #[test]
+fn offline_ink_update_survives_hydration_and_sends_after_reconnect() {
+    let doc_id = make_doc_id();
+    let block_id = BlockId::new_v4();
+    let stream_epoch = uuid::Uuid::new_v4();
+    let mut document = new_document(doc_id);
+    document.blocks.push(DocumentBlock::new(
+        block_id,
+        inkstone_core::new_opaque_ink_content(640.0, 480.0, stream_epoch).unwrap(),
+    ));
+    let pending = DocumentUpdate {
+        version: inkstone_core::DOCUMENT_UPDATE_V2_VERSION,
+        update_id: UpdateId::new_v4(),
+        doc_id,
+        applied_at_ms: 2_000,
+        op: DocumentOp::ApplyInkUpdateV2 {
+            payload: inkstone_core::CollaborativeInkUpdate {
+                version: inkstone_core::INK_UPDATE_PAYLOAD_VERSION,
+                block_id,
+                stream_epoch,
+                update: Vec::new(),
+                bootstrap_snapshot: None,
+            },
+        },
+    };
+
+    let mut state = ClientState::new(doc_id);
+    state.transition(ClientEvent::OpenDocument { doc_id });
+    state.transition(ClientEvent::LocalHydrationLoaded {
+        lifecycle: state.lifecycle_id(),
+        confirmed_doc: Some(document),
+        confirmed_seq: 5,
+        pending_updates: vec![pending.clone()],
+    });
+    assert_eq!(state.pending_local().len(), 1);
+    let connection_id = state.active_connection_id().unwrap();
+    let effects = state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id(),
+        connection_id,
+        current_seq: 5,
+    });
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendUpdate(update)
+            if update.update_id == pending.update_id
+                && matches!(update.op, DocumentOp::ApplyInkUpdateV2 { .. })
+    )));
+}
+
+#[test]
 fn test_enter_live_resends_pending_update() {
     let doc_id = make_doc_id();
     let mut state = ClientState::new(doc_id);
@@ -442,6 +492,73 @@ fn test_multi_page_catch_up_emits_next_fetch() {
 }
 
 #[test]
+fn test_multi_page_catch_up_continues_with_future_live_update_buffered() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+
+    let connection_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        current_seq: 501,
+    });
+    let fetch_id = state.active_fetch_id.unwrap();
+    assert!(
+        state
+            .transition(ClientEvent::SequencedUpdate {
+                lifecycle: state.lifecycle_id,
+                connection_id,
+                seq: 502,
+                update: make_update(doc_id, set_title("future-live")),
+            })
+            .is_empty()
+    );
+
+    let effects = state.transition(ClientEvent::CatchUpPageLoaded {
+        lifecycle: state.lifecycle_id,
+        fetch_id,
+        items: (1..=500)
+            .map(|seq| EncryptedUpdateMeta {
+                seq,
+                update: make_update(doc_id, set_title(&format!("s{seq}"))),
+            })
+            .collect(),
+    });
+    let first_token = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::PersistConfirmation { token, .. } => Some(token),
+            _ => None,
+        })
+        .expect("expected first confirmation");
+
+    let mut effects = confirm_persisted(&mut state, first_token);
+    while state.confirmed_seq() < 500 {
+        let token = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::PersistConfirmation { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("expected contiguous confirmation");
+        effects = confirm_persisted(&mut state, token);
+    }
+
+    assert_eq!(state.phase(), SessionPhase::CatchingUp);
+    assert_eq!(state.confirmed_seq(), 500);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::FetchUpdates {
+            purpose: FetchPurpose::BootstrapCatchUp,
+            after_seq: 500,
+            through_seq: 501,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn test_empty_catch_up_page_before_target_is_failure() {
     let doc_id = make_doc_id();
     let mut state = ClientState::new(doc_id);
@@ -461,6 +578,117 @@ fn test_empty_catch_up_page_before_target_is_failure() {
         items: vec![],
     });
     assert_eq!(state.phase(), SessionPhase::Error);
+}
+
+#[test]
+fn catch_up_http_failure_is_offline_retryable_and_reconnects() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 5);
+    let connection_id = state.active_connection_id().unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id(),
+        connection_id,
+        current_seq: 10,
+    });
+    let fetch_id = state.active_fetch_id().unwrap();
+
+    let effects = state.transition(ClientEvent::CatchUpFailed {
+        lifecycle: state.lifecycle_id(),
+        fetch_id,
+        reason: "network unavailable".into(),
+    });
+
+    assert_eq!(state.phase(), SessionPhase::Offline);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ScheduleReconnect { .. }))
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::DisconnectSocket))
+    );
+
+    let effects = state.transition(ClientEvent::RetrySync);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ConnectSocket { .. }))
+    );
+}
+
+#[test]
+fn sequenced_structural_noop_remains_visible_after_confirmation() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id().unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id(),
+        connection_id,
+        current_seq: 0,
+    });
+    let update = make_update(
+        doc_id,
+        DocumentOp::DeleteBlock {
+            block_id: BlockId::new_v4(),
+        },
+    );
+    let effects = state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id(),
+        connection_id,
+        seq: 1,
+        update,
+    });
+    let token = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::PersistConfirmation { token, .. } => Some(token),
+            _ => None,
+        })
+        .unwrap();
+
+    state.transition(ClientEvent::ConfirmationPersisted { token });
+
+    assert!(state.pending_conflicts().iter().any(|conflict| {
+        conflict.outcome == "No-op remote update" && conflict.reason.contains("not found")
+    }));
+    assert_eq!(state.phase(), SessionPhase::Live);
+}
+
+#[test]
+fn successful_reconnect_clears_stale_catch_up_error() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id().unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id(),
+        connection_id,
+        current_seq: 1,
+    });
+    let fetch_id = state.active_fetch_id().unwrap();
+    state.transition(ClientEvent::CatchUpFailed {
+        lifecycle: state.lifecycle_id(),
+        fetch_id,
+        reason: "temporary".into(),
+    });
+    state.transition(ClientEvent::RetrySync);
+    let reconnected = state.active_connection_id().unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id(),
+        connection_id: reconnected,
+        current_seq: 0,
+    });
+
+    assert!(
+        state
+            .errors()
+            .iter()
+            .all(|error| !error.starts_with("Catch-up failed:"))
+    );
 }
 
 // ── Spec item 6: live gap recovery ───────────────────────────────────────
@@ -969,6 +1197,30 @@ fn test_confirmation_failure_retries_exact_token() {
     assert!(has_retry);
     let _ok = confirm_persisted(&mut state, token);
     assert_eq!(state.confirmed_seq(), 11);
+}
+
+#[test]
+fn test_confirmation_failure_stops_after_three_retries() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 10);
+    let token = confirm_seq(&mut state, 11);
+
+    for _ in 0..3 {
+        assert!(
+            confirm_failed(&mut state, token)
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistConfirmation { .. }))
+        );
+    }
+    let final_effects = confirm_failed(&mut state, token);
+
+    assert_eq!(state.phase(), SessionPhase::Error);
+    assert!(
+        final_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyError(_)))
+    );
 }
 
 #[test]
@@ -1739,6 +1991,267 @@ fn test_local_update_persisted_does_not_install_stale_candidate() {
     assert_eq!(state.view_doc().title, "local-edit");
     assert_eq!(state.confirmed_doc().title, "seq11");
     assert_eq!(state.pending_local().len(), 1);
+}
+
+#[test]
+fn test_local_intent_is_rejected_in_every_non_editable_phase() {
+    let doc_id = make_doc_id();
+
+    for expected_phase in [
+        SessionPhase::Closed,
+        SessionPhase::HydratingLocal,
+        SessionPhase::Error,
+    ] {
+        let mut state = ClientState::new(doc_id);
+        state.phase = expected_phase;
+        let effects = state.transition(ClientEvent::LocalIntent {
+            op: set_title("invalid"),
+            update_id: UpdateId::new_v4(),
+            applied_at_ms: 1000,
+        });
+        assert_eq!(state.phase(), expected_phase);
+        assert!(!state.has_pending_intent());
+        assert!(state.intent_queue.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::NotifyError(_)]));
+    }
+}
+
+#[test]
+fn test_disconnect_invalidates_bootstrap_fetch_and_late_page() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        current_seq: 2,
+    });
+    let stale_fetch_id = state.active_fetch_id.unwrap();
+
+    state.transition(ClientEvent::SocketDisconnected {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+    });
+    assert_eq!(state.phase(), SessionPhase::Offline);
+    assert_eq!(state.active_fetch_id(), None);
+    assert_eq!(state.active_fetch_purpose(), None);
+    assert_eq!(state.ready_catchup_target(), None);
+
+    let effects = state.transition(ClientEvent::CatchUpPageLoaded {
+        lifecycle: state.lifecycle_id,
+        fetch_id: stale_fetch_id,
+        items: vec![EncryptedUpdateMeta {
+            seq: 1,
+            update: make_update(doc_id, set_title("late")),
+        }],
+    });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase(), SessionPhase::Offline);
+    assert_eq!(state.confirmed_seq(), 0);
+}
+
+#[test]
+fn test_bootstrap_page_in_wrong_phase_cannot_enter_live() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        current_seq: 1,
+    });
+    let fetch_id = state.active_fetch_id.unwrap();
+
+    state.phase = SessionPhase::Offline;
+    let effects = state.transition(ClientEvent::CatchUpPageLoaded {
+        lifecycle: state.lifecycle_id,
+        fetch_id,
+        items: vec![EncryptedUpdateMeta {
+            seq: 1,
+            update: make_update(doc_id, set_title("wrong-phase")),
+        }],
+    });
+
+    assert!(effects.is_empty());
+    assert_eq!(state.phase(), SessionPhase::Offline);
+    assert_eq!(state.confirmed_seq(), 0);
+    assert_eq!(state.active_fetch_id(), None);
+}
+
+#[test]
+fn test_websocket_reaching_ready_target_invalidates_bootstrap_fetch() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        current_seq: 2,
+    });
+    let stale_fetch_id = state.active_fetch_id.unwrap();
+
+    let effects = state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 1,
+        update: make_update(doc_id, set_title("one")),
+    });
+    let token_1 = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::PersistConfirmation { token, .. } => Some(token),
+            _ => None,
+        })
+        .unwrap();
+    state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 2,
+        update: make_update(doc_id, set_title("two")),
+    });
+    let token_2 = confirm_persisted(&mut state, token_1)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::PersistConfirmation { token, .. } => Some(token),
+            _ => None,
+        })
+        .unwrap();
+    confirm_persisted(&mut state, token_2);
+
+    assert_eq!(state.phase(), SessionPhase::Live);
+    assert_eq!(state.confirmed_seq(), 2);
+    assert_eq!(state.active_fetch_id(), None);
+    assert_eq!(state.ready_catchup_target(), None);
+
+    let effects = state.transition(ClientEvent::CatchUpPageLoaded {
+        lifecycle: state.lifecycle_id,
+        fetch_id: stale_fetch_id,
+        items: vec![],
+    });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase(), SessionPhase::Live);
+}
+
+#[test]
+fn test_holey_catch_up_page_is_rejected_without_partial_buffering() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 0);
+    let connection_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        current_seq: 3,
+    });
+    let fetch_id = state.active_fetch_id.unwrap();
+
+    state.transition(ClientEvent::CatchUpPageLoaded {
+        lifecycle: state.lifecycle_id,
+        fetch_id,
+        items: vec![
+            EncryptedUpdateMeta {
+                seq: 1,
+                update: make_update(doc_id, set_title("one")),
+            },
+            EncryptedUpdateMeta {
+                seq: 3,
+                update: make_update(doc_id, set_title("three")),
+            },
+        ],
+    });
+
+    assert_eq!(state.phase(), SessionPhase::Error);
+    assert!(state.inbox.is_empty());
+    assert!(state.pending_confirmation.is_none());
+    assert!(
+        state
+            .errors()
+            .iter()
+            .any(|error| error.contains("expected seq"))
+    );
+}
+
+#[test]
+fn test_old_sequenced_updates_are_ignored_but_known_seq_conflicts_are_fatal() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 10);
+    let connection_id = state.active_connection_id.unwrap();
+
+    let effects = state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 5,
+        update: make_update(doc_id, set_title("unknown-old")),
+    });
+    assert!(effects.is_empty());
+    assert!(state.inbox.is_empty());
+    assert_eq!(state.phase(), SessionPhase::Offline);
+
+    let update_11 = make_update(doc_id, set_title("eleven"));
+    let effects = state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 11,
+        update: update_11.clone(),
+    });
+    let token = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::PersistConfirmation { token, .. } => Some(token),
+            _ => None,
+        })
+        .unwrap();
+    confirm_persisted(&mut state, token);
+
+    let duplicate_effects = state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 11,
+        update: update_11,
+    });
+    assert!(duplicate_effects.is_empty());
+    assert_eq!(state.phase(), SessionPhase::Offline);
+
+    state.transition(ClientEvent::SequencedUpdate {
+        lifecycle: state.lifecycle_id,
+        connection_id,
+        seq: 11,
+        update: make_update(doc_id, set_title("conflict")),
+    });
+    assert_eq!(state.phase(), SessionPhase::Error);
+    assert!(
+        state
+            .errors()
+            .iter()
+            .any(|error| error.contains("already confirmed"))
+    );
+}
+
+#[test]
+fn test_confirmation_completion_guard_rejects_previous_document_lifecycle() {
+    let doc_id_a = make_doc_id();
+    let doc_id_b = make_doc_id();
+    let mut state = ClientState::new(doc_id_a);
+    hydrate(&mut state, 0);
+    let lifecycle_a = state.lifecycle_id;
+    let token_a = confirm_seq(&mut state, 1);
+    assert!(state.is_confirmation_completion_current(lifecycle_a, doc_id_a, token_a));
+
+    state.transition(ClientEvent::OpenDocument { doc_id: doc_id_b });
+    assert!(!state.is_confirmation_completion_current(lifecycle_a, doc_id_a, token_a));
+    let effects = confirm_persisted(&mut state, token_a);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase(), SessionPhase::HydratingLocal);
+    assert_eq!(state.confirmed_seq(), 0);
+
+    hydrate(&mut state, 0);
+    let token_b = confirm_seq(&mut state, 1);
+    assert!(state.is_confirmation_completion_current(state.lifecycle_id, doc_id_b, token_b));
+    assert!(!state.is_confirmation_completion_current(lifecycle_a, doc_id_a, token_b));
 }
 
 // ── Existing old test replaced: test_catch_up_rejects_beyond_boundary ────

@@ -26,6 +26,7 @@ pub struct SequencedInbox {
     /// Tracks update_id → seq for already-confirmed entries so we can detect
     /// duplicate update_id arriving at a different seq later in the same lifecycle.
     confirmed_history: HashMap<UpdateId, i64>,
+    confirmed_update_id_by_seq: HashMap<i64, UpdateId>,
 }
 
 impl SequencedInbox {
@@ -34,12 +35,32 @@ impl SequencedInbox {
             buffer: BTreeMap::new(),
             seq_by_update_id: HashMap::new(),
             confirmed_history: HashMap::new(),
+            confirmed_update_id_by_seq: HashMap::new(),
         }
     }
 
     /// Store a sequenced update.
     /// Returns `InboxFatal` on consistency violation.
-    pub fn store(&mut self, seq: i64, update: DocumentUpdate) -> Option<InboxFatal> {
+    pub fn store(
+        &mut self,
+        seq: i64,
+        update: DocumentUpdate,
+        confirmed_seq: i64,
+    ) -> Option<InboxFatal> {
+        if let Some(&confirmed_update_id) = self.confirmed_update_id_by_seq.get(&seq) {
+            if confirmed_update_id != update.update_id {
+                return Some(InboxFatal {
+                    message: format!(
+                        "Seq {} already confirmed with different update_id: {} vs {}",
+                        seq, confirmed_update_id, update.update_id
+                    ),
+                    seq,
+                    update_id: update.update_id,
+                });
+            }
+            return None;
+        }
+
         if let Some(&confirmed_seq) = self.confirmed_history.get(&update.update_id) {
             if confirmed_seq != seq {
                 return Some(InboxFatal {
@@ -51,6 +72,10 @@ impl SequencedInbox {
                     update_id: update.update_id,
                 });
             }
+            return None;
+        }
+
+        if seq <= confirmed_seq {
             return None;
         }
 
@@ -101,6 +126,8 @@ impl SequencedInbox {
         if let Some(update) = self.buffer.remove(&seq) {
             self.seq_by_update_id.remove(&update.update_id);
             self.confirmed_history.insert(update.update_id, seq);
+            self.confirmed_update_id_by_seq
+                .insert(seq, update.update_id);
         }
     }
 
@@ -126,6 +153,7 @@ impl SequencedInbox {
         self.buffer.clear();
         self.seq_by_update_id.clear();
         self.confirmed_history.clear();
+        self.confirmed_update_id_by_seq.clear();
     }
 }
 
@@ -153,7 +181,7 @@ mod tests {
         let mut inbox = SequencedInbox::new();
         let update = make_update(doc_id);
 
-        assert!(inbox.store(11, update.clone()).is_none());
+        assert!(inbox.store(11, update.clone(), 10).is_none());
         assert!(inbox.take(11).is_some());
         assert!(inbox.take(12).is_none());
     }
@@ -164,7 +192,7 @@ mod tests {
         let mut inbox = SequencedInbox::new();
         let update = make_update(doc_id);
 
-        inbox.store(11, update.clone());
+        inbox.store(11, update.clone(), 10);
         inbox.remove(11);
         assert!(inbox.take(11).is_none());
         assert!(inbox.is_empty());
@@ -178,8 +206,8 @@ mod tests {
         let u12 = make_update(doc_id);
         let u11 = make_update(doc_id);
 
-        inbox.store(12, u12.clone());
-        inbox.store(11, u11.clone());
+        inbox.store(12, u12.clone(), 10);
+        inbox.store(11, u11.clone(), 10);
 
         // 12 still available after 11 is taken and removed
         assert!(inbox.take(11).is_some());
@@ -195,8 +223,8 @@ mod tests {
         let u1 = make_update(doc_id);
         let u2 = make_update(doc_id); // different update_id
 
-        assert!(inbox.store(11, u1).is_none());
-        let fatal = inbox.store(11, u2);
+        assert!(inbox.store(11, u1, 10).is_none());
+        let fatal = inbox.store(11, u2, 10);
         assert!(fatal.is_some());
         assert!(fatal.unwrap().message.contains("different update_id"));
     }
@@ -212,8 +240,8 @@ mod tests {
             ..make_update(doc_id)
         };
 
-        assert!(inbox.store(11, update).is_none());
-        let fatal = inbox.store(12, update2);
+        assert!(inbox.store(11, update, 10).is_none());
+        let fatal = inbox.store(12, update2, 10);
         assert!(fatal.is_some());
         assert!(fatal.unwrap().message.contains("already stored at seq"));
     }
@@ -225,7 +253,7 @@ mod tests {
 
         assert!(!inbox.has_gap(0));
 
-        inbox.store(13, make_update(doc_id));
+        inbox.store(13, make_update(doc_id), 0);
         // Smallest is 13, external confirmed is 0
         assert!(inbox.has_gap(0));
         // Not a gap if external is 12
@@ -239,14 +267,14 @@ mod tests {
         let doc_id = DocId::new_v4();
         let mut inbox = SequencedInbox::new();
 
-        inbox.store(13, make_update(doc_id));
+        inbox.store(13, make_update(doc_id), 10);
         assert_eq!(inbox.len(), 1);
 
         // Simulate: confirmed_seq = 11, so take 12 would be null
         assert!(inbox.take(12).is_none());
 
-        inbox.store(11, make_update(doc_id));
-        inbox.store(12, make_update(doc_id));
+        inbox.store(11, make_update(doc_id), 10);
+        inbox.store(12, make_update(doc_id), 10);
 
         assert!(inbox.take(11).is_some());
         inbox.remove(11);
