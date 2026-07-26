@@ -1,6 +1,49 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Materialize the canonical document as portable Markdown.
+///
+/// Non-Markdown blocks use stable fenced representations so no canonical block
+/// silently disappears from an export. Derived indexes can be rebuilt by
+/// parsing the resulting Markdown blocks from the source document again.
+pub fn materialize_document_markdown(doc: &crate::document::InkstoneDocument) -> String {
+    use crate::document::BlockContent;
+
+    let mut output = String::new();
+    if !doc.title.is_empty() {
+        output.push_str("# ");
+        output.push_str(&doc.title);
+        output.push_str("\n\n");
+    }
+    for (index, block) in doc.blocks.iter().enumerate() {
+        if index > 0 && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        match &block.content {
+            BlockContent::Markdown { text } => output.push_str(text),
+            BlockContent::Math { source } => {
+                output.push_str("```math\n");
+                output.push_str(source);
+                output.push_str("\n```");
+            }
+            BlockContent::Ink { stonepen_json, .. } => {
+                output.push_str("```inkstone-ink\n");
+                output.push_str(stonepen_json);
+                output.push_str("\n```");
+            }
+            BlockContent::Divider => output.push_str("---"),
+        }
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    while output.ends_with("\n\n\n") {
+        output.pop();
+    }
+    output
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkdownIndex {
     pub wikilinks: Vec<WikiLink>,
@@ -325,6 +368,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_markdown_materializes_title_and_all_blocks_deterministically() {
+        use crate::document::{BlockContent, DocumentBlock, InkstoneDocument};
+        use crate::ids::{BlockId, DocId};
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.title = "Portable".into();
+        doc.blocks = vec![
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Markdown {
+                    text: "body".into(),
+                },
+            ),
+            DocumentBlock::new(
+                BlockId::new_v4(),
+                BlockContent::Math {
+                    source: "x^2".into(),
+                },
+            ),
+            DocumentBlock::new(BlockId::new_v4(), BlockContent::Divider),
+        ];
+        let first = materialize_document_markdown(&doc);
+        assert_eq!(first, materialize_document_markdown(&doc));
+        assert!(first.starts_with("# Portable\n\nbody"));
+        assert!(first.contains("```math\nx^2\n```"));
+        assert!(first.contains("---"));
+    }
+
+    #[test]
     fn test_parse_wikilinks() {
         let text = "Hello [[Page]] and [[Other Page|Alias]]";
         let idx = parse_markdown(text);
@@ -434,6 +505,7 @@ mod tests {
             BlockId::new_v4(),
             BlockContent::Ink {
                 stonepen_json: "{}".into(),
+                collaboration: None,
             },
         ));
 
@@ -527,6 +599,7 @@ mod tests {
             BlockId::new_v4(),
             BlockContent::Ink {
                 stonepen_json: "{}".into(),
+                collaboration: None,
             },
         ));
         doc.blocks
