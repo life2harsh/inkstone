@@ -33,8 +33,9 @@ pub struct Device {
 #[derive(Debug, Clone, FromRow)]
 pub struct Workspace {
     pub id: Uuid,
-    pub name: String,
-    pub description: Option<String>,
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_nonce: Vec<u8>,
+    pub metadata_version: i64,
     pub owner_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -52,8 +53,12 @@ pub struct WorkspaceMember {
 pub struct Doc {
     pub id: Uuid,
     pub workspace_id: Uuid,
-    pub encrypted_title: Vec<u8>,
-    pub title_nonce: Vec<u8>,
+    pub encrypted_title: Option<Vec<u8>>,
+    pub title_nonce: Option<Vec<u8>>,
+    pub title_projection_seq: i64,
+    pub encrypted_path: Vec<u8>,
+    pub path_nonce: Vec<u8>,
+    pub path_projection_version: i64,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -93,15 +98,15 @@ pub struct DocSnapshot {
 pub struct Asset {
     pub id: Uuid,
     pub workspace_id: Uuid,
-    pub doc_id: Option<Uuid>,
-    pub filename: String,
-    pub content_type: String,
-    pub file_size: i64,
-    pub storage_path: String,
-    pub encrypted_metadata: Option<Vec<u8>>,
-    pub metadata_nonce: Option<Vec<u8>>,
+    pub version: i64,
+    pub chunk_count: i32,
+    pub encrypted_size: i64,
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_nonce: Vec<u8>,
+    pub aad_version: i32,
     pub uploaded_by: Uuid,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -124,6 +129,7 @@ pub struct EncryptedWorkspaceKey {
     pub user_id: Uuid,
     pub encrypted_key: Vec<u8>,
     pub nonce: Vec<u8>,
+    pub aad_version: i32,
     pub created_at: DateTime<Utc>,
 }
 
