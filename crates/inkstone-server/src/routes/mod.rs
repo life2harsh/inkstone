@@ -1,4 +1,10 @@
+pub mod assets;
+pub mod auth;
+pub mod devices;
 pub mod docs;
 pub mod health;
+pub mod invitations;
+pub mod projections;
+pub mod recovery;
 pub mod sync;
 pub mod workspaces;
