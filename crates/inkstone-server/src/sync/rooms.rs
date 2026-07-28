@@ -2,14 +2,14 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::state::DocRoomRegistry;
-use inkstone_core::protocol::ServerWsMessage;
+use crate::sync::OutboundMessage;
 
 pub fn join_or_create(
     rooms: &DocRoomRegistry,
     doc_id: Uuid,
 ) -> (
-    broadcast::Sender<ServerWsMessage>,
-    broadcast::Receiver<ServerWsMessage>,
+    broadcast::Sender<OutboundMessage>,
+    broadcast::Receiver<OutboundMessage>,
 ) {
     let mut rooms = rooms.blocking_write();
     let tx = rooms
@@ -27,8 +27,8 @@ pub async fn join_or_create_async(
     rooms: &DocRoomRegistry,
     doc_id: Uuid,
 ) -> (
-    broadcast::Sender<ServerWsMessage>,
-    broadcast::Receiver<ServerWsMessage>,
+    broadcast::Sender<OutboundMessage>,
+    broadcast::Receiver<OutboundMessage>,
 ) {
     let mut rooms = rooms.write().await;
     let tx = rooms
