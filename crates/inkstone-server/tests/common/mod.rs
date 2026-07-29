@@ -1,5 +1,5 @@
 use base64::Engine;
-use inkstone_server::{app, config::Config, db, state::AppState};
+use inkstone_server::{app, config::Config, db, owner_setup, state::AppState};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -10,10 +10,52 @@ pub async fn setup() -> (String, PgPool) {
     (base_url, pool)
 }
 
+pub async fn setup_production() -> (String, PgPool) {
+    let pool = db::create_test_pool().await;
+    cleanup_tables(&pool).await;
+    let config = Config {
+        database_url: String::new(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev_auth: false,
+        public_base_url: "https://inkstone.test".into(),
+        resend_api_key: None,
+        resend_from_email: None,
+        allowed_origins: vec!["https://inkstone.test".into()],
+        session_ttl_hours: 24,
+        cookie_secure: true,
+        log_level: "off".into(),
+    };
+    let base_url = spawn_server_with_config(pool.clone(), config).await;
+    (base_url, pool)
+}
+
+pub async fn setup_production_with_state() -> (String, PgPool, AppState) {
+    let pool = db::create_test_pool().await;
+    cleanup_tables(&pool).await;
+    let config = Config {
+        database_url: String::new(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev_auth: false,
+        public_base_url: "https://inkstone.test".into(),
+        resend_api_key: None,
+        resend_from_email: None,
+        allowed_origins: vec!["https://inkstone.test".into()],
+        session_ttl_hours: 24,
+        cookie_secure: true,
+        log_level: "off".into(),
+    };
+    let state = AppState::new(pool.clone(), config);
+    let base_url = spawn_server_with_state(state.clone()).await;
+    (base_url, pool, state)
+}
+
 async fn cleanup_tables(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE TABLE
-         audit_events, invitations, comments, assets,
+         audit_events, owner_setup, auth_tokens, rate_limits, auth_sessions,
+         invitation_key_requests, invitations, account_recovery_envelopes, comments, assets,
          doc_snapshots, doc_updates, doc_update_counters, docs,
          encrypted_workspace_keys, workspace_members, workspaces,
          devices, identities, users
@@ -35,12 +77,23 @@ async fn spawn_server(pool: PgPool) -> String {
         host: "127.0.0.1".into(),
         port: 0,
         dev_auth: true,
-        oidc_issuer: None,
-        oidc_client_id: None,
-        oidc_client_secret: None,
+        public_base_url: "http://localhost:8080".into(),
+        resend_api_key: None,
+        resend_from_email: None,
+        allowed_origins: Vec::new(),
+        session_ttl_hours: 24,
+        cookie_secure: false,
         log_level: "off".into(),
     };
+    spawn_server_with_config(pool, config).await
+}
+
+async fn spawn_server_with_config(pool: PgPool, config: Config) -> String {
     let state = AppState::new(pool, config);
+    spawn_server_with_state(state).await
+}
+
+async fn spawn_server_with_state(state: AppState) -> String {
     let router = app::create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -66,6 +119,13 @@ pub fn other_user_id() -> Uuid {
 
 pub fn client() -> reqwest::Client {
     reqwest::Client::new()
+}
+
+pub async fn issue_owner_setup(pool: &PgPool, email: &str) -> String {
+    owner_setup::issue(pool, email, owner_setup::DEFAULT_EXPIRY_HOURS)
+        .await
+        .unwrap()
+        .token
 }
 
 pub fn dev_headers() -> reqwest::header::HeaderMap {
