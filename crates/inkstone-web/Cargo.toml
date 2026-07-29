@@ -6,6 +6,9 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+serverless-local = []
+
 [dependencies]
 inkstone-client = { path = "../inkstone-client" }
 inkstone-core = { path = "../inkstone-core" }
@@ -23,6 +26,13 @@ futures-channel = "0.3"
 async-trait = "0.1"
 comrak = "0.29"
 regex = "1"
+argon2 = "0.5"
+async-lock = "3"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dependencies.web-sys]
 version = "0.3"
@@ -52,5 +62,23 @@ features = [
     "IdbVersionChangeEvent",
     "DomStringList",
     "HtmlAnchorElement",
+    "HtmlSelectElement",
+    "Blob",
+    "BlobPropertyBag",
+    "File",
+    "FileList",
+    "Url",
     "Text",
+    "NodeList",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "Response",
+    "Headers",
+    "WebSocket",
+    "MessageEvent",
+    "ErrorEvent",
+    "CloseEvent",
+    "Location",
+    "History",
 ]
