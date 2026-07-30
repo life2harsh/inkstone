@@ -1,4 +1,6 @@
+use async_lock::Mutex;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -7,6 +9,10 @@ use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransaction, IdbTran
 #[derive(Clone)]
 pub struct IndexedDb {
     db: IdbDatabase,
+}
+
+thread_local! {
+    static DOCUMENT_LOCKS: RefCell<HashMap<String, Rc<Mutex<()>>>> = RefCell::new(HashMap::new());
 }
 
 async fn wait_for_request(request: IdbRequest) -> Result<JsValue, JsValue> {
@@ -187,5 +193,39 @@ impl IndexedDb {
         wait_for_request(request).await?;
         wait_for_transaction(tx).await?;
         Ok(())
+    }
+
+    pub async fn update_document_record<F>(&self, doc_id: &str, update: F) -> Result<(), JsValue>
+    where
+        F: FnOnce(Option<String>) -> Result<String, JsValue>,
+    {
+        let lock = DOCUMENT_LOCKS.with(|locks| {
+            locks
+                .borrow_mut()
+                .entry(doc_id.to_string())
+                .or_insert_with(|| Rc::new(Mutex::new(())))
+                .clone()
+        });
+        let _guard = lock.lock().await;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store("documents")?;
+        let current = wait_for_request(store.get(&JsValue::from_str(doc_id))?).await?;
+        let current = if current.is_undefined() || current.is_null() {
+            None
+        } else {
+            Some(
+                current
+                    .as_string()
+                    .ok_or_else(|| JsValue::from_str("Expected string value in IndexedDB"))?,
+            )
+        };
+        let next = update(current)?;
+        wait_for_request(
+            store.put_with_key(&JsValue::from_str(&next), &JsValue::from_str(doc_id))?,
+        )
+        .await?;
+        wait_for_transaction(tx).await
     }
 }
