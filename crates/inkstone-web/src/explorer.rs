@@ -40,7 +40,18 @@ fn insert_entry(
     };
     let is_leaf = segments.len() == 1;
 
-    if is_leaf {
+    if is_leaf && entry.kind == WorkspaceEntryKind::Folder {
+        if !nodes.iter().any(|node| node.name == name && node.is_folder) {
+            nodes.push(TreeNode {
+                name,
+                path: current_path,
+                is_folder: true,
+                depth,
+                children: Vec::new(),
+                entry: Some(entry.clone()),
+            });
+        }
+    } else if is_leaf {
         nodes.push(TreeNode {
             name,
             path: current_path,
@@ -108,7 +119,7 @@ fn flatten_tree(
                 is_folder: true,
                 depth,
                 is_expanded,
-                kind: WorkspaceEntryKind::Markdown,
+                kind: WorkspaceEntryKind::Folder,
                 size_bytes: 0,
             });
             if is_expanded {
