@@ -13,6 +13,12 @@ impl WorkspacePath {
             ));
         }
 
+        if s.len() > 1024 {
+            return Err(WorkspaceStoreError::InvalidPath(
+                "path exceeds 1024 bytes".into(),
+            ));
+        }
+
         if s.starts_with('/') {
             return Err(WorkspaceStoreError::InvalidPath(
                 "path must not be absolute (no leading slash)".into(),
@@ -40,6 +46,11 @@ impl WorkspacePath {
         }
 
         for segment in s.split('/') {
+            if segment.len() > 255 {
+                return Err(WorkspaceStoreError::InvalidPath(
+                    "path segment exceeds 255 bytes".into(),
+                ));
+            }
             if segment.is_empty() {
                 return Err(WorkspaceStoreError::InvalidPath(
                     "path must not contain empty segments (e.g. trailing slash or //)".into(),

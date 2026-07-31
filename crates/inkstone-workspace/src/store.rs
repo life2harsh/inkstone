@@ -2,6 +2,7 @@ use crate::path::WorkspacePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEntryKind {
+    Folder,
     Markdown,
     Asset,
     Internal,
@@ -15,6 +16,13 @@ pub struct WorkspaceEntry {
 }
 
 impl WorkspaceEntry {
+    pub fn folder(path: &WorkspacePath) -> Self {
+        Self {
+            path: path.clone(),
+            kind: WorkspaceEntryKind::Folder,
+            size_bytes: 0,
+        }
+    }
     pub fn classify(path: &WorkspacePath, size_bytes: u64) -> Self {
         let kind = if path.is_internal() {
             WorkspaceEntryKind::Internal
@@ -78,6 +86,30 @@ pub trait WorkspaceStore {
         src: &WorkspacePath,
         dst: &WorkspacePath,
     ) -> Result<(), WorkspaceStoreError>;
+
+    async fn create_folder(&self, path: &WorkspacePath) -> Result<(), WorkspaceStoreError> {
+        Err(WorkspaceStoreError::Backend(format!(
+            "folders are not supported by this backend: {}",
+            path.as_str()
+        )))
+    }
+    async fn rename_tree(
+        &self,
+        src: &WorkspacePath,
+        dst: &WorkspacePath,
+    ) -> Result<(), WorkspaceStoreError> {
+        let _ = dst;
+        Err(WorkspaceStoreError::Backend(format!(
+            "folder moves are not supported by this backend: {}",
+            src.as_str()
+        )))
+    }
+    async fn delete_tree(&self, path: &WorkspacePath) -> Result<(), WorkspaceStoreError> {
+        Err(WorkspaceStoreError::Backend(format!(
+            "folder deletion is not supported by this backend: {}",
+            path.as_str()
+        )))
+    }
 }
 
 #[cfg(test)]

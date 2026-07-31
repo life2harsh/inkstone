@@ -9,12 +9,14 @@ use crate::store::{WorkspaceEntry, WorkspaceStore, WorkspaceStoreError};
 
 pub struct MemoryWorkspaceStore {
     files: RefCell<BTreeMap<String, Vec<u8>>>,
+    folders: RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl MemoryWorkspaceStore {
     pub fn new() -> Self {
         MemoryWorkspaceStore {
             files: RefCell::new(BTreeMap::new()),
+            folders: RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -65,6 +67,9 @@ impl WorkspaceStore for MemoryWorkspaceStore {
                 WorkspaceEntry::classify(&path, size)
             })
             .collect();
+        entries.extend(self.folders.borrow().iter().map(|key| {
+            WorkspaceEntry::folder(&WorkspacePath::new(key).expect("stored paths are valid"))
+        }));
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -115,6 +120,104 @@ impl WorkspaceStore for MemoryWorkspaceStore {
         self.files
             .borrow_mut()
             .insert(dst.as_str().to_string(), data);
+        Ok(())
+    }
+
+    async fn create_folder(&self, path: &WorkspacePath) -> Result<(), WorkspaceStoreError> {
+        if path.is_internal()
+            || self.files.borrow().contains_key(path.as_str())
+            || !self.folders.borrow_mut().insert(path.as_str().to_string())
+        {
+            return Err(WorkspaceStoreError::AlreadyExists(path.as_str().into()));
+        }
+        Ok(())
+    }
+
+    async fn rename_tree(
+        &self,
+        src: &WorkspacePath,
+        dst: &WorkspacePath,
+    ) -> Result<(), WorkspaceStoreError> {
+        let prefix = format!("{}/", src.as_str());
+        let destination_prefix = format!("{}/", dst.as_str());
+        if dst.as_str().starts_with(&prefix) {
+            return Err(WorkspaceStoreError::InvalidPath(
+                "folder cannot be moved into itself".into(),
+            ));
+        }
+        let folders = self.folders.borrow();
+        if !folders.contains(src.as_str()) {
+            return Err(WorkspaceStoreError::NotFound(src.as_str().into()));
+        }
+        let folder_moves = folders
+            .iter()
+            .filter(|path| *path == src.as_str() || path.starts_with(&prefix))
+            .map(|path| {
+                (
+                    path.clone(),
+                    if path == src.as_str() {
+                        dst.as_str().to_string()
+                    } else {
+                        format!("{}{}", destination_prefix, &path[prefix.len()..])
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let files = self.files.borrow();
+        let file_moves = files
+            .keys()
+            .filter(|path| path.starts_with(&prefix))
+            .map(|path| {
+                (
+                    path.clone(),
+                    format!("{}{}", destination_prefix, &path[prefix.len()..]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let moving_folders = folder_moves
+            .iter()
+            .map(|(old, _)| old)
+            .collect::<std::collections::BTreeSet<_>>();
+        let moving_files = file_moves
+            .iter()
+            .map(|(old, _)| old)
+            .collect::<std::collections::BTreeSet<_>>();
+        if folder_moves.iter().any(|(_, new)| {
+            (folders.contains(new) && !moving_folders.contains(new))
+                || (files.contains_key(new) && !moving_files.contains(new))
+        }) || file_moves.iter().any(|(_, new)| {
+            (files.contains_key(new) && !moving_files.contains(new))
+                || (folders.contains(new) && !moving_folders.contains(new))
+        }) {
+            return Err(WorkspaceStoreError::AlreadyExists(dst.as_str().into()));
+        }
+        drop(files);
+        drop(folders);
+        let mut files = self.files.borrow_mut();
+        let moved_files = file_moves
+            .iter()
+            .map(|(old, new)| (new.clone(), files.remove(old).unwrap()))
+            .collect::<Vec<_>>();
+        files.extend(moved_files);
+        let mut folders = self.folders.borrow_mut();
+        for (old, _) in &folder_moves {
+            folders.remove(old);
+        }
+        folders.extend(folder_moves.into_iter().map(|(_, new)| new));
+        Ok(())
+    }
+
+    async fn delete_tree(&self, path: &WorkspacePath) -> Result<(), WorkspaceStoreError> {
+        let prefix = format!("{}/", path.as_str());
+        if !self.folders.borrow().contains(path.as_str()) {
+            return Err(WorkspaceStoreError::NotFound(path.as_str().into()));
+        }
+        self.files
+            .borrow_mut()
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.folders
+            .borrow_mut()
+            .retain(|key| key != path.as_str() && !key.starts_with(&prefix));
         Ok(())
     }
 }
@@ -305,5 +408,107 @@ mod tests {
         store.write_file(&path, &data).await.unwrap();
         let read_back = store.read_file(&path).await.unwrap().unwrap();
         assert_eq!(read_back, data);
+    }
+
+    #[tokio::test]
+    async fn empty_folder_is_real_and_tree_move_is_atomic() {
+        let store = MemoryWorkspaceStore::new();
+        let source = WorkspacePath::new("Source").unwrap();
+        store.create_folder(&source).await.unwrap();
+        store
+            .create_folder(&WorkspacePath::new("Source/Empty").unwrap())
+            .await
+            .unwrap();
+        store
+            .write_file(&WorkspacePath::new("Source/Note.md").unwrap(), b"note")
+            .await
+            .unwrap();
+        store
+            .rename_tree(&source, &WorkspacePath::new("Moved").unwrap())
+            .await
+            .unwrap();
+        let paths = store
+            .list_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["Moved", "Moved/Empty", "Moved/Note.md"]);
+    }
+
+    #[tokio::test]
+    async fn folder_collision_rolls_back_the_entire_tree() {
+        let store = MemoryWorkspaceStore::new();
+        store
+            .create_folder(&WorkspacePath::new("A").unwrap())
+            .await
+            .unwrap();
+        store
+            .write_file(&WorkspacePath::new("A/One.md").unwrap(), b"one")
+            .await
+            .unwrap();
+        store
+            .create_folder(&WorkspacePath::new("B").unwrap())
+            .await
+            .unwrap();
+        let error = store
+            .rename_tree(
+                &WorkspacePath::new("A").unwrap(),
+                &WorkspacePath::new("B").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkspaceStoreError::AlreadyExists(_)));
+        assert_eq!(
+            store
+                .read_file(&WorkspacePath::new("A/One.md").unwrap())
+                .await
+                .unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert!(
+            store
+                .list_entries()
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path.as_str() == "A")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_folder_removes_its_tree_only() {
+        let store = MemoryWorkspaceStore::new();
+        store
+            .create_folder(&WorkspacePath::new("A").unwrap())
+            .await
+            .unwrap();
+        store
+            .write_file(&WorkspacePath::new("A/One.md").unwrap(), b"one")
+            .await
+            .unwrap();
+        store
+            .write_file(&WorkspacePath::new("Other.md").unwrap(), b"other")
+            .await
+            .unwrap();
+        store
+            .delete_tree(&WorkspacePath::new("A").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_file(&WorkspacePath::new("A/One.md").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_file(&WorkspacePath::new("Other.md").unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
