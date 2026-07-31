@@ -1,20 +1,31 @@
 use std::collections::HashMap;
 
+use inkstone_core::document::InkCollaborationState;
 use inkstone_core::ids::{BlockId, DocId};
 use stonepen_wasm::{StonepenHandle, mount_stonepen};
+use uuid::Uuid;
 use wasm_bindgen::JsValue;
 
-pub struct InkSnapshot {
+pub struct InkUpdate {
     pub doc_id: DocId,
     pub block_id: BlockId,
-    pub stonepen_json: String,
+    pub stream_epoch: Uuid,
+    pub update: Vec<u8>,
+    pub bootstrap_snapshot: Option<Vec<u8>>,
+}
+
+pub struct InkPreview {
+    pub doc_id: DocId,
+    pub block_id: BlockId,
+    pub stream_epoch: Uuid,
+    pub preview: Vec<u8>,
 }
 
 struct MountedInk {
     doc_id: DocId,
     block_id: BlockId,
+    stream_epoch: Uuid,
     handle: StonepenHandle,
-    last_exported_json: String,
 }
 
 #[derive(Default)]
@@ -23,25 +34,38 @@ pub struct InkRuntimeRegistry {
 }
 
 impl InkRuntimeRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn mount(
         &mut self,
         doc_id: DocId,
         block_id: BlockId,
         canvas_id: &str,
+        actor: [u8; 16],
         stored_json: &str,
+        collaboration: Option<&InkCollaborationState>,
         tool: &str,
         brush_width: f32,
         brush_color: (u8, u8, u8),
         read_only: bool,
-    ) -> Result<Option<InkSnapshot>, JsValue> {
+    ) -> Result<Option<InkUpdate>, JsValue> {
         if let Some(mut mounted) = self.handles.remove(&block_id) {
             mounted.handle.destroy();
         }
 
         let mut handle = mount_stonepen(canvas_id)?;
-        if !stored_json.is_empty() {
-            handle.load_json(stored_json)?;
-        }
+        handle.set_collaboration_actor(&actor)?;
+        let (stream_epoch, bootstrap_snapshot) = if let Some(state) = collaboration {
+            handle.load_collaboration_snapshot(&state.snapshot)?;
+            (state.stream_epoch, None)
+        } else {
+            if !stored_json.is_empty() {
+                handle.load_json(stored_json)?;
+            }
+            let snapshot = (!read_only)
+                .then(|| handle.collaboration_snapshot())
+                .transpose()?;
+            (Uuid::new_v4(), snapshot)
+        };
         handle.set_read_only(read_only);
         if !read_only {
             handle.set_tool(tool);
@@ -50,78 +74,137 @@ impl InkRuntimeRegistry {
         }
         handle.resize();
 
-        let exported = handle.export_json()?;
-        let initial_snapshot = (!read_only && stored_json.is_empty()).then(|| InkSnapshot {
-            doc_id,
-            block_id,
-            stonepen_json: exported.clone(),
-        });
-        let last_exported_json = if stored_json.is_empty() {
-            exported
-        } else {
-            stored_json.to_string()
-        };
-
         self.handles.insert(
             block_id,
             MountedInk {
                 doc_id,
                 block_id,
+                stream_epoch,
                 handle,
-                last_exported_json,
             },
         );
 
-        Ok(initial_snapshot)
-    }
-
-    pub fn export_changed(&mut self, block_id: BlockId) -> Result<Option<InkSnapshot>, JsValue> {
-        let Some(mounted) = self.handles.get_mut(&block_id) else {
-            return Ok(None);
-        };
-        if !mounted.handle.is_dirty() {
-            return Ok(None);
-        }
-
-        let stonepen_json = mounted.handle.export_json()?;
-        if stonepen_json == mounted.last_exported_json {
-            return Ok(None);
-        }
-        mounted.last_exported_json = stonepen_json.clone();
-        Ok(Some(InkSnapshot {
-            doc_id: mounted.doc_id,
-            block_id: mounted.block_id,
-            stonepen_json,
+        Ok(bootstrap_snapshot.map(|snapshot| InkUpdate {
+            doc_id,
+            block_id,
+            stream_epoch,
+            update: Vec::new(),
+            bootstrap_snapshot: Some(snapshot),
         }))
     }
 
-    pub fn export_all_changed(&mut self) -> Result<Vec<InkSnapshot>, JsValue> {
-        let block_ids = self.handles.keys().copied().collect::<Vec<_>>();
-        let mut snapshots = Vec::new();
-        for block_id in block_ids {
-            if let Some(snapshot) = self.export_changed(block_id)? {
-                snapshots.push(snapshot);
-            }
+    pub fn take_local_update(&mut self, block_id: BlockId) -> Result<Option<InkUpdate>, JsValue> {
+        let Some(mounted) = self.handles.get_mut(&block_id) else {
+            return Ok(None);
+        };
+        let update = mounted.handle.take_local_update()?;
+        if update.is_empty() {
+            return Ok(None);
         }
-        Ok(snapshots)
+        Ok(Some(InkUpdate {
+            doc_id: mounted.doc_id,
+            block_id: mounted.block_id,
+            stream_epoch: mounted.stream_epoch,
+            update,
+            bootstrap_snapshot: None,
+        }))
     }
 
-    pub fn destroy_all(&mut self) -> Result<Vec<InkSnapshot>, JsValue> {
-        let mut snapshots = Vec::new();
+    pub fn take_all_local_updates(&mut self) -> Result<Vec<InkUpdate>, JsValue> {
+        let block_ids = self.handles.keys().copied().collect::<Vec<_>>();
+        let mut updates = Vec::new();
+        for block_id in block_ids {
+            if let Some(update) = self.take_local_update(block_id)? {
+                updates.push(update);
+            }
+        }
+        Ok(updates)
+    }
+
+    pub fn take_local_preview(&mut self, block_id: BlockId) -> Result<Option<InkPreview>, JsValue> {
+        let Some(mounted) = self.handles.get_mut(&block_id) else {
+            return Ok(None);
+        };
+        let preview = mounted.handle.take_local_preview()?;
+        if preview.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(InkPreview {
+            doc_id: mounted.doc_id,
+            block_id,
+            stream_epoch: mounted.stream_epoch,
+            preview,
+        }))
+    }
+
+    pub fn take_all_local_previews(&mut self) -> Result<Vec<InkPreview>, JsValue> {
+        let block_ids = self.handles.keys().copied().collect::<Vec<_>>();
+        let mut previews = Vec::new();
+        for block_id in block_ids {
+            if let Some(preview) = self.take_local_preview(block_id)? {
+                previews.push(preview);
+            }
+        }
+        Ok(previews)
+    }
+
+    pub fn apply_remote_preview(
+        &mut self,
+        participant: Uuid,
+        payload: &inkstone_core::InkPresencePayload,
+        now_ms: f64,
+    ) -> Result<bool, JsValue> {
+        let block_id = BlockId(payload.block_id);
+        let Some(mounted) = self.handles.get_mut(&block_id) else {
+            return Ok(false);
+        };
+        if mounted.stream_epoch != payload.stream_epoch {
+            return Ok(false);
+        }
+        mounted.handle.apply_remote_preview(
+            participant.as_bytes(),
+            payload.stream_epoch.as_bytes(),
+            &payload.stonepen_preview,
+            now_ms,
+        )
+    }
+
+    pub fn remove_remote_participant(&mut self, participant: Uuid) {
+        for mounted in self.handles.values_mut() {
+            mounted
+                .handle
+                .remove_remote_preview(participant.as_bytes(), mounted.stream_epoch.as_bytes());
+        }
+    }
+
+    pub fn expire_remote_previews(&mut self, now_ms: f64, ttl_ms: f64) {
+        for mounted in self.handles.values_mut() {
+            mounted.handle.expire_remote_previews(now_ms, ttl_ms);
+        }
+    }
+
+    pub fn clear_remote_previews(&mut self) {
+        for mounted in self.handles.values_mut() {
+            mounted.handle.clear_remote_previews();
+        }
+    }
+
+    pub fn destroy_all(&mut self) -> Result<Vec<InkUpdate>, JsValue> {
+        let mut updates = Vec::new();
         for (_, mut mounted) in self.handles.drain() {
-            if mounted.handle.is_dirty() {
-                let stonepen_json = mounted.handle.export_json()?;
-                if stonepen_json != mounted.last_exported_json {
-                    snapshots.push(InkSnapshot {
-                        doc_id: mounted.doc_id,
-                        block_id: mounted.block_id,
-                        stonepen_json,
-                    });
-                }
+            let update = mounted.handle.take_local_update()?;
+            if !update.is_empty() {
+                updates.push(InkUpdate {
+                    doc_id: mounted.doc_id,
+                    block_id: mounted.block_id,
+                    stream_epoch: mounted.stream_epoch,
+                    update,
+                    bootstrap_snapshot: None,
+                });
             }
             mounted.handle.destroy();
         }
-        Ok(snapshots)
+        Ok(updates)
     }
 
     pub fn set_tool(&mut self, block_id: BlockId, tool: &str) {
@@ -148,18 +231,18 @@ impl InkRuntimeRegistry {
         }
     }
 
-    pub fn undo(&mut self, block_id: BlockId) -> Result<Option<InkSnapshot>, JsValue> {
+    pub fn undo(&mut self, block_id: BlockId) -> Result<Option<InkUpdate>, JsValue> {
         if let Some(mounted) = self.handles.get_mut(&block_id) {
             mounted.handle.undo();
         }
-        self.export_changed(block_id)
+        self.take_local_update(block_id)
     }
 
-    pub fn redo(&mut self, block_id: BlockId) -> Result<Option<InkSnapshot>, JsValue> {
+    pub fn redo(&mut self, block_id: BlockId) -> Result<Option<InkUpdate>, JsValue> {
         if let Some(mounted) = self.handles.get_mut(&block_id) {
             mounted.handle.redo();
         }
-        self.export_changed(block_id)
+        self.take_local_update(block_id)
     }
 }
 
