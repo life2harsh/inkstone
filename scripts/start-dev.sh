@@ -14,4 +14,5 @@ done
 echo "Postgres is ready."
 
 # Run the server
+export DATABASE_URL="postgres://inkstone:inkstone@localhost:5432/inkstone"
 cargo run -p inkstone-server
