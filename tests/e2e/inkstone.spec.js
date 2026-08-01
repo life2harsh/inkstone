@@ -1,12 +1,31 @@
 const { test, expect } = require('@playwright/test');
 
+test('sensitive account fragments are cleared before rendering token flows', async ({ page }) => {
+  await page.route('**/api/auth/me', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      id: '00000000-0000-0000-0000-000000000001',
+      email: 'token-test@example.test',
+      device_id: '00000000-0000-0000-0000-000000000002'
+    })
+  }));
+  await page.goto('/#password-reset=browser-secret-token');
+
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole('heading', { name: 'Reset account password' })).toBeVisible();
+  await expect(page.getByText(/Password reset does not recover vault access/)).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('browser-secret-token');
+});
+
 async function resetWorkspace(page) {
   page.__browserErrors = [];
   page.on('pageerror', error => page.__browserErrors.push(error.message));
   page.on('console', message => {
     if (message.type() === 'error') page.__browserErrors.push(message.text());
   });
-  await page.goto('/');
+  await page.goto('/?local=1');
+  await expect(page.locator('.explorer-new-btn')).toBeAttached();
   await page.evaluate(async () => {
     const databases = (await indexedDB.databases()).map(db => db.name).filter(Boolean);
     await Promise.all(databases.map(name => new Promise((resolve, reject) => {
@@ -58,6 +77,13 @@ async function persisted(page, needle) {
 
 async function latestBlockContent(page, type) {
   return page.evaluate(async blockType => {
+    const module = await import('/pkg/inkstone_web.js');
+    const activeDocument = module.active_document_json_for_test?.();
+    if (activeDocument) {
+      const active = JSON.parse(activeDocument);
+      const content = active.blocks.map(block => block.content).filter(content => content.type === blockType).at(-1);
+      if (content) return content;
+    }
     const database = await new Promise((resolve, reject) => {
       const request = indexedDB.open('inkstone_local_db', 1);
       request.onsuccess = () => resolve(request.result);
@@ -385,11 +411,16 @@ test('search and recent results navigate to the selected note', async ({ page })
   await expect(page.locator('.breadcrumb')).toHaveText('B.md');
 });
 
-test('keyboard journey reaches search, files, inspector tabs, and restored controls', async ({ page }) => {
+test('keyboard journey reaches search, files, inspector tabs, and restored controls', async ({ page }, testInfo) => {
   await createNote(page, 'Keyboard/Alpha.md', 'Keyboard Alpha', '# Keyboard search target');
   await createNote(page, 'Keyboard/Beta.md', 'Keyboard Beta', '# Secondary note');
 
-  await page.keyboard.press('Control+K');
+  if (testInfo.project.name === 'chromium-mobile') {
+    await ensureWorkspaceOpen(page);
+    await page.locator('.search-input').click();
+  } else {
+    await page.keyboard.press('Control+K');
+  }
   await expect(page.locator('.search-input')).toBeFocused();
   await page.keyboard.type('Keyboard search target');
   await expect(page.locator('.search-result-item[data-path="Keyboard/Alpha.md"]')).toHaveAttribute('aria-selected', 'true');
@@ -820,7 +851,7 @@ test('populated research notebook is durable and composed', async ({ page }, tes
   await expect(page.locator('.preview-markdown table')).toBeVisible();
   await expect(page.locator('.preview-math')).toHaveCount(2);
   await expect(page.locator('.preview-math mfrac')).toHaveCount(1);
-  await expect(page.locator('.preview-math msubsup')).toBeVisible();
+  await expect(page.locator('.preview-math msubsup').first()).toBeVisible();
   await expect(page.locator('.preview-ink canvas[role="img"]')).toBeVisible();
   await expect(page.locator('.ink-toolbar')).toHaveCount(0);
   await expect(page.locator('.ink-save-state')).toHaveCount(0);

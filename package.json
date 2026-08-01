@@ -2,7 +2,9 @@
   "name": "inkstone-browser-tests",
   "private": true,
   "scripts": {
-    "test:e2e": "playwright test"
+    "test:e2e": "npm run test:e2e:local",
+    "test:e2e:local": "playwright test tests/e2e/inkstone.spec.js",
+    "test:e2e:sync": "if test -n \"${PLAYWRIGHT_BASE_URL:-}\" && test \"${INKSTONE_LIVE_E2E:-}\" = 1 && test \"${INKSTONE_LIVE_E2E_DESTRUCTIVE_ACK:-}\" = DELETE_TEST_DATA; then playwright test tests/e2e/live-sync.spec.js --project=chromium-desktop; else printf '%s\\n' 'Refusing destructive live E2E: set PLAYWRIGHT_BASE_URL, INKSTONE_LIVE_E2E=1, and INKSTONE_LIVE_E2E_DESTRUCTIVE_ACK=DELETE_TEST_DATA' >&2; exit 1; fi"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1"
