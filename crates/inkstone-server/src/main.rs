@@ -1,6 +1,6 @@
 use tracing_subscriber::EnvFilter;
 
-use inkstone_server::{app, config, db, owner_setup, state};
+use inkstone_server::{app, config, db, email, owner_setup, state};
 
 struct OwnerSetupIssueArgs {
     email: String,
@@ -29,10 +29,8 @@ async fn main() {
             eprintln!("{message}");
             std::process::exit(2);
         });
-        if issue_args.send
-            && (config.resend_api_key.is_none() || config.resend_from_email.is_none())
-        {
-            eprintln!("RESEND_API_KEY and RESEND_FROM_EMAIL are required with --send");
+        if issue_args.send && !email::is_configured(&config) {
+            eprintln!("an email provider (RESEND or SMTP) is required with --send");
             std::process::exit(2);
         }
         let setup = owner_setup::issue(&pool, &issue_args.email, issue_args.expires_in_hours)
