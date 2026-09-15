@@ -24,6 +24,12 @@ pub struct BlockId(pub Uuid);
 #[serde(transparent)]
 pub struct UpdateId(pub Uuid);
 
+/// A group of strokes in a document's page ink layer that moves as one unit.
+/// Its id is also the Stonepen frame id the strokes are parented to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InkGroupId(pub Uuid);
+
 impl DocId {
     pub fn new_v4() -> Self {
         DocId(Uuid::new_v4())
@@ -42,6 +48,12 @@ impl UpdateId {
     }
 }
 
+impl InkGroupId {
+    pub fn new_v4() -> Self {
+        InkGroupId(Uuid::new_v4())
+    }
+}
+
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -49,6 +61,12 @@ impl fmt::Display for DocId {
 }
 
 impl fmt::Display for BlockId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for InkGroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
