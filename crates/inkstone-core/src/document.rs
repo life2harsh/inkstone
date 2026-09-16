@@ -2,10 +2,20 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BlockId, DocId};
+use crate::ids::{BlockId, DocId, InkGroupId};
+use crate::text_crdt::RelativePosition;
 
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
 pub const INK_COLLABORATION_VERSION: u32 = 1;
+pub const PAGE_INK_LAYER_VERSION: u32 = 1;
+
+/// Design width of the page column in CSS pixels. Ink is stored in page
+/// units, and the column never reflows horizontally (narrow viewports scale
+/// it instead), so only text edits — never window size — move ink.
+pub const PAGE_WIDTH: f32 = 760.0;
+
+/// Minimum height of a freshly inserted writing space.
+pub const DEFAULT_SPACE_HEIGHT: f32 = 160.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InkstoneDocument {
@@ -14,6 +24,59 @@ pub struct InkstoneDocument {
     pub title: String,
     pub blocks: Vec<DocumentBlock>,
     pub metadata: BTreeMap<String, String>,
+    /// One ink layer over the whole page. Strokes live here, not in blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ink: Option<PageInkLayer>,
+}
+
+/// The document-wide ink layer.
+///
+/// Stonepen owns the strokes (opaque snapshot). Inkstone owns only the
+/// anchors: where each stroke group is pinned in the text flow. Pixel
+/// positions are never stored; they are derived from layout, so reflowing
+/// text moves ink without producing edits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageInkLayer {
+    pub version: u32,
+    pub collaboration: InkCollaborationState,
+    #[serde(default)]
+    pub anchors: BTreeMap<InkGroupId, InkAnchor>,
+}
+
+/// Where an ink group is pinned, plus its offset from that point in page
+/// units.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InkAnchor {
+    pub target: AnchorTarget,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnchorTarget {
+    /// A character position inside a Markdown block; survives concurrent
+    /// edits and follows the rendered element that contains it.
+    Text { position: RelativePosition },
+    /// The top-left corner of a block.
+    Block { block_id: BlockId },
+    /// The top-left corner of the page.
+    Page,
+}
+
+impl AnchorTarget {
+    /// The block this target lives in, if any.
+    pub fn block_id(&self) -> Option<BlockId> {
+        match self {
+            AnchorTarget::Text { position } => match position.target {
+                crate::text_crdt::TextTarget::Markdown(id)
+                | crate::text_crdt::TextTarget::Math(id) => Some(id),
+                crate::text_crdt::TextTarget::Title => None,
+            },
+            AnchorTarget::Block { block_id } => Some(*block_id),
+            AnchorTarget::Page => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +92,17 @@ pub struct InkCollaborationState {
     pub version: u32,
     pub stream_epoch: uuid::Uuid,
     /// Stonepen-owned opaque collaboration snapshot.
-    pub snapshot: Vec<u8>,
+    pub snapshot: crate::InkSnapshot,
+}
+
+impl PageInkLayer {
+    pub fn stonepen_json(&self) -> String {
+        self.collaboration
+            .snapshot
+            .projection()
+            .map(str::to_owned)
+            .unwrap_or_default()
+    }
 }
 
 impl DocumentBlock {
@@ -65,6 +138,44 @@ pub enum BlockContent {
     },
     #[serde(rename = "divider")]
     Divider,
+    /// Room reserved in the text flow for writing. Holds no strokes itself:
+    /// ink drawn here is anchored to it and its rendered height grows to fit.
+    #[serde(rename = "space")]
+    Space { min_height: f32 },
+}
+
+/// Creates an empty page ink layer with a fresh collaboration stream.
+pub fn new_page_ink_layer(stream_epoch: uuid::Uuid) -> Result<PageInkLayer, String> {
+    let (snapshot, _) = stonepen_core::new_opaque_document(PAGE_WIDTH, PAGE_WIDTH)
+        .map_err(|error| error.to_string())?;
+    Ok(PageInkLayer {
+        version: PAGE_INK_LAYER_VERSION,
+        collaboration: InkCollaborationState {
+            version: INK_COLLABORATION_VERSION,
+            stream_epoch,
+            snapshot: snapshot.into(),
+        },
+        anchors: BTreeMap::new(),
+    })
+}
+
+pub fn first_page_ink_layer(doc_id: DocId) -> Result<PageInkLayer, String> {
+    let seed = *doc_id.0.as_bytes();
+    let mut epoch = seed;
+    for byte in &mut epoch {
+        *byte ^= 0x3c;
+    }
+    let (snapshot, _) = stonepen_core::new_seeded_opaque_document(PAGE_WIDTH, PAGE_WIDTH, seed)
+        .map_err(|error| error.to_string())?;
+    Ok(PageInkLayer {
+        version: PAGE_INK_LAYER_VERSION,
+        collaboration: InkCollaborationState {
+            version: INK_COLLABORATION_VERSION,
+            stream_epoch: uuid::Uuid::from_bytes(epoch),
+            snapshot: snapshot.into(),
+        },
+        anchors: BTreeMap::new(),
+    })
 }
 
 pub fn new_opaque_ink_content(
@@ -79,7 +190,7 @@ pub fn new_opaque_ink_content(
         collaboration: Some(InkCollaborationState {
             version: INK_COLLABORATION_VERSION,
             stream_epoch,
-            snapshot,
+            snapshot: snapshot.into(),
         }),
     })
 }
@@ -92,6 +203,7 @@ impl InkstoneDocument {
             title: String::new(),
             blocks: Vec::new(),
             metadata: BTreeMap::new(),
+            ink: None,
         }
     }
 
