@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    BlockContent, DocumentBlock, INK_COLLABORATION_VERSION, InkCollaborationState, InkstoneDocument,
+    AnchorTarget, BlockContent, DocumentBlock, INK_COLLABORATION_VERSION, InkAnchor,
+    InkCollaborationState, InkstoneDocument, PAGE_INK_LAYER_VERSION, PageInkLayer,
 };
-use crate::ids::{BlockId, DocId, UpdateId};
-use crate::text_crdt::CollaborativeTextUpdate;
+use crate::ids::{BlockId, DocId, InkGroupId, UpdateId};
+use crate::text_crdt::{CollaborativeTextUpdate, TextTarget};
 
 pub const DOCUMENT_UPDATE_VERSION: u32 = 1;
 pub const DOCUMENT_UPDATE_V2_VERSION: u32 = 2;
@@ -16,10 +17,40 @@ pub struct CollaborativeInkUpdate {
     pub block_id: BlockId,
     pub stream_epoch: uuid::Uuid,
     /// Stonepen-owned opaque incremental update bytes.
+    #[serde(with = "crate::ink_snapshot::opaque_bytes")]
     pub update: Vec<u8>,
     /// Present only while migrating a legacy JSON block or initializing a new stream.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::ink_snapshot::opaque_bytes_option"
+    )]
     pub bootstrap_snapshot: Option<Vec<u8>>,
+}
+
+/// Incremental update to the document's page ink layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageInkUpdate {
+    pub version: u32,
+    pub stream_epoch: uuid::Uuid,
+    /// Stonepen-owned opaque incremental update bytes.
+    #[serde(with = "crate::ink_snapshot::opaque_bytes")]
+    pub update: Vec<u8>,
+    /// Present only when this update creates the layer.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::ink_snapshot::opaque_bytes_option"
+    )]
+    pub bootstrap_snapshot: Option<Vec<u8>>,
+}
+
+/// One legacy Ink block folded into the page ink layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InkBlockConversion {
+    pub block_id: BlockId,
+    pub group: InkGroupId,
+    pub min_height: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +88,44 @@ pub enum DocumentOp {
 
     #[serde(rename = "apply_ink_update_v2")]
     ApplyInkUpdateV2 { payload: CollaborativeInkUpdate },
+
+    /// Stonepen update for the page ink layer (creates it when bootstrapping).
+    #[serde(rename = "apply_page_ink_update")]
+    ApplyPageInkUpdate { payload: PageInkUpdate },
+
+    /// Pins (or re-pins) an ink group in the text flow.
+    #[serde(rename = "set_ink_anchor")]
+    SetInkAnchor {
+        group: InkGroupId,
+        anchor: InkAnchor,
+    },
+
+    #[serde(rename = "remove_ink_anchors")]
+    RemoveInkAnchors { groups: Vec<InkGroupId> },
+
+    /// Replaces legacy Ink blocks with Space blocks and moves their strokes
+    /// into a new page ink layer, one group per block.
+    #[serde(rename = "migrate_ink_blocks")]
+    MigrateInkBlocks {
+        stream_epoch: uuid::Uuid,
+        snapshot: Vec<u8>,
+        conversions: Vec<InkBlockConversion>,
+    },
+}
+
+impl DocumentOp {
+    /// The update envelope version this op travels in.
+    pub fn update_version(&self) -> u32 {
+        match self {
+            DocumentOp::ApplyTextUpdateV2 { .. }
+            | DocumentOp::ApplyInkUpdateV2 { .. }
+            | DocumentOp::ApplyPageInkUpdate { .. }
+            | DocumentOp::SetInkAnchor { .. }
+            | DocumentOp::RemoveInkAnchors { .. }
+            | DocumentOp::MigrateInkBlocks { .. } => DOCUMENT_UPDATE_V2_VERSION,
+            _ => DOCUMENT_UPDATE_VERSION,
+        }
+    }
 }
 
 // ── Strict local-intent errors ──────────────────────────────────────────────
@@ -98,6 +167,18 @@ pub enum ApplyError {
 
     #[error("Stonepen collaboration update failed: {0}")]
     StonepenCollaboration(String),
+
+    #[error("document has no page ink layer")]
+    InkLayerMissing,
+
+    #[error("document already has a page ink layer")]
+    InkLayerExists,
+
+    #[error("page ink stream epoch does not match")]
+    PageInkStreamEpochMismatch,
+
+    #[error("invalid ink anchor: {0}")]
+    InvalidInkAnchor(String),
 }
 
 /// Strict local-intent application.
@@ -120,6 +201,7 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
             let pos = doc
                 .block_index(block_id)
                 .ok_or(ApplyError::BlockNotFound(block_id))?;
+            reanchor_removed_block(doc, pos);
             doc.blocks.remove(pos);
         }
 
@@ -140,6 +222,7 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
                 .ok_or(ApplyError::BlockNotFound(block_id))?;
             block.content = content;
             block.updated_at_ms = update.applied_at_ms;
+            demote_stale_text_anchors(doc, block_id);
         }
 
         DocumentOp::SetTitle { title } => {
@@ -152,9 +235,200 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
         DocumentOp::ApplyInkUpdateV2 { payload } => {
             apply_ink_update(doc, payload, update.applied_at_ms)?;
         }
+        DocumentOp::ApplyPageInkUpdate { payload } => {
+            apply_page_ink_update(doc, payload)?;
+        }
+        DocumentOp::SetInkAnchor { group, anchor } => {
+            validate_anchor(doc, &anchor)?;
+            doc.ink
+                .as_mut()
+                .ok_or(ApplyError::InkLayerMissing)?
+                .anchors
+                .insert(group, anchor);
+        }
+        DocumentOp::RemoveInkAnchors { groups } => {
+            let layer = doc.ink.as_mut().ok_or(ApplyError::InkLayerMissing)?;
+            for group in groups {
+                layer.anchors.remove(&group);
+            }
+        }
+        DocumentOp::MigrateInkBlocks {
+            stream_epoch,
+            snapshot,
+            conversions,
+        } => {
+            if doc.ink.is_some() {
+                return Err(ApplyError::InkLayerExists);
+            }
+            for conversion in &conversions {
+                match doc.get_block(conversion.block_id).map(|b| &b.content) {
+                    Some(BlockContent::Ink { .. }) => {}
+                    Some(_) => return Err(ApplyError::NotInkBlock(conversion.block_id)),
+                    None => return Err(ApplyError::BlockNotFound(conversion.block_id)),
+                }
+            }
+            migrate_ink_blocks(
+                doc,
+                stream_epoch,
+                snapshot,
+                &conversions,
+                update.applied_at_ms,
+            )?;
+        }
     }
 
     Ok(())
+}
+
+/// Before removing the block at `pos`, moves every anchor inside it to the
+/// next block (or the previous one, or the page). Offsets are kept.
+fn reanchor_removed_block(doc: &mut InkstoneDocument, pos: usize) {
+    let removed = doc.blocks[pos].id;
+    let fallback = doc
+        .blocks
+        .get(pos + 1)
+        .or_else(|| pos.checked_sub(1).and_then(|prev| doc.blocks.get(prev)))
+        .map(|block| AnchorTarget::Block { block_id: block.id })
+        .unwrap_or(AnchorTarget::Page);
+    if let Some(layer) = doc.ink.as_mut() {
+        for anchor in layer.anchors.values_mut() {
+            if anchor.target.block_id() == Some(removed) {
+                anchor.target = fallback.clone();
+            }
+        }
+    }
+}
+
+/// Text anchors into a block that is no longer Markdown fall back to the
+/// block itself.
+fn demote_stale_text_anchors(doc: &mut InkstoneDocument, block_id: BlockId) {
+    let is_markdown = matches!(
+        doc.get_block(block_id).map(|b| &b.content),
+        Some(BlockContent::Markdown { .. })
+    );
+    if is_markdown {
+        return;
+    }
+    if let Some(layer) = doc.ink.as_mut() {
+        for anchor in layer.anchors.values_mut() {
+            if matches!(&anchor.target, AnchorTarget::Text { .. })
+                && anchor.target.block_id() == Some(block_id)
+            {
+                anchor.target = AnchorTarget::Block { block_id };
+            }
+        }
+    }
+}
+
+fn validate_anchor(doc: &InkstoneDocument, anchor: &InkAnchor) -> Result<(), ApplyError> {
+    if !anchor.dx.is_finite() || !anchor.dy.is_finite() {
+        return Err(ApplyError::InvalidInkAnchor("non-finite offset".into()));
+    }
+    match &anchor.target {
+        AnchorTarget::Page => Ok(()),
+        AnchorTarget::Block { block_id } => doc
+            .get_block(*block_id)
+            .map(|_| ())
+            .ok_or(ApplyError::BlockNotFound(*block_id)),
+        AnchorTarget::Text { position } => match position.target {
+            TextTarget::Markdown(block_id) => match doc.get_block(block_id).map(|b| &b.content) {
+                Some(BlockContent::Markdown { .. }) => Ok(()),
+                Some(_) => Err(ApplyError::InvalidInkAnchor(format!(
+                    "block {block_id} is not Markdown"
+                ))),
+                None => Err(ApplyError::BlockNotFound(block_id)),
+            },
+            _ => Err(ApplyError::InvalidInkAnchor(
+                "text anchors must target a Markdown block".into(),
+            )),
+        },
+    }
+}
+
+fn apply_page_ink_update(
+    doc: &mut InkstoneDocument,
+    payload: PageInkUpdate,
+) -> Result<(), ApplyError> {
+    if payload.version != INK_UPDATE_PAYLOAD_VERSION {
+        return Err(ApplyError::UnsupportedInkUpdateVersion(payload.version));
+    }
+    match doc.ink.as_mut() {
+        Some(layer) if layer.collaboration.stream_epoch != payload.stream_epoch => {
+            Err(ApplyError::PageInkStreamEpochMismatch)
+        }
+        Some(layer) => layer
+            .collaboration
+            .snapshot
+            .apply(&payload.update)
+            .map_err(ApplyError::StonepenCollaboration),
+        None => {
+            let mut snapshot = crate::InkSnapshot::from_bytes(
+                payload
+                    .bootstrap_snapshot
+                    .ok_or(ApplyError::InkLayerMissing)?,
+            );
+            snapshot
+                .apply(&payload.update)
+                .map_err(ApplyError::StonepenCollaboration)?;
+            doc.ink = Some(PageInkLayer {
+                version: PAGE_INK_LAYER_VERSION,
+                collaboration: InkCollaborationState {
+                    version: INK_COLLABORATION_VERSION,
+                    stream_epoch: payload.stream_epoch,
+                    snapshot,
+                },
+                anchors: Default::default(),
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Converts the listed blocks that are still Ink. Callers decide how strict
+/// to be about blocks that are not.
+fn migrate_ink_blocks(
+    doc: &mut InkstoneDocument,
+    stream_epoch: uuid::Uuid,
+    snapshot: Vec<u8>,
+    conversions: &[InkBlockConversion],
+    applied_at_ms: i64,
+) -> Result<usize, ApplyError> {
+    let snapshot = crate::InkSnapshot::from_bytes(snapshot);
+    snapshot.doc().map_err(ApplyError::StonepenCollaboration)?;
+    let mut anchors = std::collections::BTreeMap::new();
+    for conversion in conversions {
+        let Some(block) = doc.get_block_mut(conversion.block_id) else {
+            continue;
+        };
+        if !matches!(block.content, BlockContent::Ink { .. }) {
+            continue;
+        }
+        block.content = BlockContent::Space {
+            min_height: conversion.min_height,
+        };
+        block.updated_at_ms = applied_at_ms;
+        anchors.insert(
+            conversion.group,
+            InkAnchor {
+                target: AnchorTarget::Block {
+                    block_id: conversion.block_id,
+                },
+                dx: 0.0,
+                dy: 0.0,
+            },
+        );
+    }
+    let converted = anchors.len();
+    doc.ink = Some(PageInkLayer {
+        version: PAGE_INK_LAYER_VERSION,
+        collaboration: InkCollaborationState {
+            version: INK_COLLABORATION_VERSION,
+            stream_epoch,
+            snapshot,
+        },
+        anchors,
+    });
+    Ok(converted)
 }
 
 fn validate_update(doc: &InkstoneDocument, update: &DocumentUpdate) -> Result<(), ApplyError> {
@@ -163,12 +437,7 @@ fn validate_update(doc: &InkstoneDocument, update: &DocumentUpdate) -> Result<()
             doc.schema_version,
         ));
     }
-    let expected_version = match &update.op {
-        DocumentOp::ApplyTextUpdateV2 { .. } | DocumentOp::ApplyInkUpdateV2 { .. } => {
-            DOCUMENT_UPDATE_V2_VERSION
-        }
-        _ => DOCUMENT_UPDATE_VERSION,
-    };
+    let expected_version = update.op.update_version();
     if update.version != expected_version {
         return Err(ApplyError::UnsupportedUpdateVersion(update.version));
     }
@@ -204,15 +473,21 @@ fn apply_ink_update(
         Some(state) if state.stream_epoch != payload.stream_epoch => {
             return Err(ApplyError::InkStreamEpochMismatch(payload.block_id));
         }
-        Some(state) => state.snapshot.as_slice(),
-        None => payload
-            .bootstrap_snapshot
-            .as_deref()
-            .ok_or(ApplyError::InkBootstrapRequired(payload.block_id))?,
+        Some(state) => state.snapshot.clone(),
+        None => crate::InkSnapshot::from_bytes(
+            payload
+                .bootstrap_snapshot
+                .ok_or(ApplyError::InkBootstrapRequired(payload.block_id))?,
+        ),
     };
-    let (snapshot, projection) = stonepen_core::apply_opaque_update(snapshot, &payload.update)
-        .map_err(|error| ApplyError::StonepenCollaboration(error.to_string()))?;
-    *stonepen_json = projection;
+    let mut snapshot = snapshot;
+    snapshot
+        .apply(&payload.update)
+        .map_err(ApplyError::StonepenCollaboration)?;
+    *stonepen_json = snapshot
+        .projection()
+        .map_err(ApplyError::StonepenCollaboration)?
+        .to_owned();
     *collaboration = Some(InkCollaborationState {
         version: INK_COLLABORATION_VERSION,
         stream_epoch: payload.stream_epoch,
@@ -289,6 +564,7 @@ pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> R
                     };
                 }
             };
+            reanchor_removed_block(doc, pos);
             doc.blocks.remove(pos);
             ReplayOutcome::Applied
         }
@@ -321,6 +597,7 @@ pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> R
                 Some(block) => {
                     block.content = content;
                     block.updated_at_ms = update.applied_at_ms;
+                    demote_stale_text_anchors(doc, block_id);
                     ReplayOutcome::Applied
                 }
                 None => ReplayOutcome::NoOp {
@@ -347,6 +624,68 @@ pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> R
                 },
                 Err(ApplyError::InkStreamEpochMismatch(block_id)) => ReplayOutcome::NoOp {
                     conflict: format!("ink stream epoch for block {} is stale", block_id),
+                },
+                Err(error) => ReplayOutcome::Fatal {
+                    reason: error.to_string(),
+                },
+            }
+        }
+        DocumentOp::ApplyPageInkUpdate { payload } => match apply_page_ink_update(doc, payload) {
+            Ok(()) => ReplayOutcome::Applied,
+            Err(ApplyError::PageInkStreamEpochMismatch) => ReplayOutcome::NoOp {
+                conflict: "page ink stream epoch is stale".into(),
+            },
+            Err(ApplyError::InkLayerMissing) => ReplayOutcome::NoOp {
+                conflict: "page ink update without a layer or bootstrap".into(),
+            },
+            Err(error) => ReplayOutcome::Fatal {
+                reason: error.to_string(),
+            },
+        },
+        DocumentOp::SetInkAnchor { group, anchor } => {
+            if !anchor.dx.is_finite() || !anchor.dy.is_finite() {
+                return ReplayOutcome::NoOp {
+                    conflict: "non-finite ink anchor offset".into(),
+                };
+            }
+            let Some(layer) = doc.ink.as_mut() else {
+                return ReplayOutcome::NoOp {
+                    conflict: "ink anchor without a page ink layer".into(),
+                };
+            };
+            // A concurrently deleted target is kept; layout falls back to
+            // the page origin for targets it cannot find.
+            layer.anchors.insert(group, anchor);
+            ReplayOutcome::Applied
+        }
+        DocumentOp::RemoveInkAnchors { groups } => {
+            if let Some(layer) = doc.ink.as_mut() {
+                for group in groups {
+                    layer.anchors.remove(&group);
+                }
+            }
+            ReplayOutcome::Applied
+        }
+        DocumentOp::MigrateInkBlocks {
+            stream_epoch,
+            snapshot,
+            conversions,
+        } => {
+            if doc.ink.is_some() {
+                return ReplayOutcome::NoOp {
+                    conflict: "page ink layer already exists".into(),
+                };
+            }
+            match migrate_ink_blocks(
+                doc,
+                stream_epoch,
+                snapshot,
+                &conversions,
+                update.applied_at_ms,
+            ) {
+                Ok(converted) if converted == conversions.len() => ReplayOutcome::Applied,
+                Ok(converted) => ReplayOutcome::Adjusted {
+                    reason: format!("migrated {converted} of {} Ink blocks", conversions.len()),
                 },
                 Err(error) => ReplayOutcome::Fatal {
                     reason: error.to_string(),
@@ -445,7 +784,7 @@ mod tests {
         assert_eq!(state.stream_epoch, epoch);
         assert!(!state.snapshot.is_empty());
         assert_eq!(
-            stonepen_core::project_opaque_snapshot(&state.snapshot).unwrap(),
+            stonepen_core::project_opaque_snapshot(state.snapshot.bytes().unwrap()).unwrap(),
             *stonepen_json
         );
     }
@@ -1229,5 +1568,522 @@ mod tests {
         assert_eq!(doc_a.blocks.len(), 2);
         // After delete of c, blocks: [c, a, b] -> delete c -> [a, b], then a updated to "A"
         assert_eq!(doc_a.blocks[0].id, b_a_id);
+    }
+}
+
+#[cfg(test)]
+mod page_ink_tests {
+    use super::*;
+    use crate::document::{DEFAULT_SPACE_HEIGHT, new_page_ink_layer};
+    use crate::markdown::materialize_document_markdown;
+    use crate::page_ink::plan_ink_block_migration;
+    use crate::text_crdt::{CollaborativeTextState, TextAssociation, TextReplicaId};
+    use stonepen_core::{
+        ActorId, Brush, CollaborationDoc, InkPoint, InkStroke, ItemId, PointerKind,
+    };
+
+    fn update(doc_id: DocId, op: DocumentOp) -> DocumentUpdate {
+        DocumentUpdate {
+            version: op.update_version(),
+            update_id: UpdateId::new_v4(),
+            doc_id,
+            applied_at_ms: 1_000,
+            op,
+        }
+    }
+
+    fn apply(doc: &mut InkstoneDocument, op: DocumentOp) -> Result<(), ApplyError> {
+        let update = update(doc.id, op);
+        apply_update(doc, update)
+    }
+
+    fn replay(doc: &mut InkstoneDocument, op: DocumentOp) -> ReplayOutcome {
+        let update = update(doc.id, op);
+        sequenced_replay(doc, update)
+    }
+
+    fn markdown_block(text: &str) -> DocumentBlock {
+        DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Markdown { text: text.into() },
+        )
+    }
+
+    fn framed_stroke(frame: InkGroupId, y: f32) -> InkStroke {
+        let brush = Brush::default_pen();
+        let pts = [0.0_f32, 30.0]
+            .into_iter()
+            .map(|x| InkPoint {
+                x,
+                y,
+                t_ms: 0.0,
+                press: 1.0,
+                tilt_x: 0.0,
+                tilt_y: 0.0,
+                twist: 0.0,
+                pointer_type: PointerKind::Pen,
+            })
+            .collect::<Vec<_>>();
+        let bbox = stonepen_core::compute_conservative_stroke_bbox(&pts, &brush).unwrap();
+        InkStroke {
+            id: ItemId::new(),
+            parent_id: Some(ItemId(frame.0)),
+            brush,
+            raw_pts: pts.clone(),
+            pts,
+            local_bbox: bbox,
+            world_bbox: bbox,
+            xform: stonepen_core::Xform2D::identity(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            geom_rev: 0,
+        }
+    }
+
+    /// A doc with a page layer created through a bootstrap update.
+    fn doc_with_layer(blocks: Vec<DocumentBlock>) -> (InkstoneDocument, uuid::Uuid) {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks = blocks;
+        let epoch = uuid::Uuid::new_v4();
+        let layer = new_page_ink_layer(epoch).unwrap();
+        apply(
+            &mut doc,
+            DocumentOp::ApplyPageInkUpdate {
+                payload: PageInkUpdate {
+                    version: INK_UPDATE_PAYLOAD_VERSION,
+                    stream_epoch: epoch,
+                    update: Vec::new(),
+                    bootstrap_snapshot: Some(
+                        layer.collaboration.snapshot.bytes().unwrap().to_vec(),
+                    ),
+                },
+            },
+        )
+        .unwrap();
+        (doc, epoch)
+    }
+
+    fn block_anchor(block_id: BlockId) -> InkAnchor {
+        InkAnchor {
+            target: AnchorTarget::Block { block_id },
+            dx: 12.0,
+            dy: 34.0,
+        }
+    }
+
+    #[test]
+    fn page_ink_update_bootstraps_and_applies_framed_strokes() {
+        let (mut doc, epoch) = doc_with_layer(vec![markdown_block("hello")]);
+        let layer = doc.ink.as_ref().unwrap();
+        let mut replica = CollaborationDoc::from_snapshot(
+            ActorId::from_bytes([7; 16]),
+            layer.collaboration.snapshot.bytes().unwrap(),
+        )
+        .unwrap();
+        let group = InkGroupId::new_v4();
+        let layer_id = replica.document().active_layer_id;
+        replica
+            .add_stroke(layer_id, None, framed_stroke(group, 5.0))
+            .unwrap();
+        let bytes = replica.take_local_update().unwrap();
+
+        apply(
+            &mut doc,
+            DocumentOp::ApplyPageInkUpdate {
+                payload: PageInkUpdate {
+                    version: INK_UPDATE_PAYLOAD_VERSION,
+                    stream_epoch: epoch,
+                    update: bytes,
+                    bootstrap_snapshot: None,
+                },
+            },
+        )
+        .unwrap();
+
+        let projected = CollaborationDoc::from_snapshot(
+            ActorId::from_bytes([8; 16]),
+            doc.ink
+                .as_ref()
+                .unwrap()
+                .collaboration
+                .snapshot
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let bounds = projected.document().frame_bounds();
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].0.0, group.0);
+    }
+
+    #[test]
+    fn two_devices_starting_page_ink_at_once_both_keep_their_strokes() {
+        let doc_id = DocId::new_v4();
+        let first_stroke = |actor: u8, y: f32| {
+            let layer = crate::document::first_page_ink_layer(doc_id).unwrap();
+            let mut replica = CollaborationDoc::from_snapshot(
+                ActorId::from_bytes([actor; 16]),
+                layer.collaboration.snapshot.bytes().unwrap(),
+            )
+            .unwrap();
+            let layer_id = replica.document().active_layer_id;
+            replica
+                .add_stroke(layer_id, None, framed_stroke(InkGroupId::new_v4(), y))
+                .unwrap();
+            DocumentOp::ApplyPageInkUpdate {
+                payload: PageInkUpdate {
+                    version: INK_UPDATE_PAYLOAD_VERSION,
+                    stream_epoch: layer.collaboration.stream_epoch,
+                    update: replica.take_local_update().unwrap(),
+                    bootstrap_snapshot: Some(
+                        layer.collaboration.snapshot.bytes().unwrap().to_vec(),
+                    ),
+                },
+            }
+        };
+        let laptop = first_stroke(1, 5.0);
+        let phone = first_stroke(2, 50.0);
+        let mut doc = InkstoneDocument::new(doc_id);
+        assert!(matches!(replay(&mut doc, laptop), ReplayOutcome::Applied));
+        assert!(matches!(replay(&mut doc, phone), ReplayOutcome::Applied));
+        let projected = CollaborationDoc::from_snapshot(
+            ActorId::from_bytes([9; 16]),
+            doc.ink
+                .as_ref()
+                .unwrap()
+                .collaboration
+                .snapshot
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected.document().frame_bounds().len(), 2);
+    }
+
+    #[test]
+    fn page_ink_update_requires_layer_or_bootstrap_and_matching_epoch() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let payload = PageInkUpdate {
+            version: INK_UPDATE_PAYLOAD_VERSION,
+            stream_epoch: uuid::Uuid::new_v4(),
+            update: Vec::new(),
+            bootstrap_snapshot: None,
+        };
+        let op = DocumentOp::ApplyPageInkUpdate {
+            payload: payload.clone(),
+        };
+        assert!(matches!(
+            apply(&mut doc, op.clone()),
+            Err(ApplyError::InkLayerMissing)
+        ));
+        assert!(matches!(replay(&mut doc, op), ReplayOutcome::NoOp { .. }));
+
+        let (mut doc, _) = doc_with_layer(Vec::new());
+        let stale = DocumentOp::ApplyPageInkUpdate { payload };
+        assert!(matches!(
+            apply(&mut doc, stale.clone()),
+            Err(ApplyError::PageInkStreamEpochMismatch)
+        ));
+        assert!(matches!(
+            replay(&mut doc, stale),
+            ReplayOutcome::NoOp { .. }
+        ));
+    }
+
+    #[test]
+    fn anchors_are_validated_set_and_removed() {
+        let block = markdown_block("text");
+        let block_id = block.id;
+        let (mut doc, _) = doc_with_layer(vec![block]);
+        let group = InkGroupId::new_v4();
+
+        assert!(matches!(
+            apply(
+                &mut doc,
+                DocumentOp::SetInkAnchor {
+                    group,
+                    anchor: block_anchor(BlockId::new_v4()),
+                },
+            ),
+            Err(ApplyError::BlockNotFound(_))
+        ));
+        let nan = InkAnchor {
+            dx: f32::NAN,
+            ..block_anchor(block_id)
+        };
+        assert!(matches!(
+            apply(&mut doc, DocumentOp::SetInkAnchor { group, anchor: nan },),
+            Err(ApplyError::InvalidInkAnchor(_))
+        ));
+
+        apply(
+            &mut doc,
+            DocumentOp::SetInkAnchor {
+                group,
+                anchor: block_anchor(block_id),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            doc.ink.as_ref().unwrap().anchors.get(&group),
+            Some(&block_anchor(block_id))
+        );
+
+        apply(
+            &mut doc,
+            DocumentOp::RemoveInkAnchors {
+                groups: vec![group],
+            },
+        )
+        .unwrap();
+        assert!(doc.ink.as_ref().unwrap().anchors.is_empty());
+    }
+
+    #[test]
+    fn anchor_without_layer_is_rejected_locally_and_ignored_in_replay() {
+        let block = markdown_block("text");
+        let block_id = block.id;
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(block);
+        let op = DocumentOp::SetInkAnchor {
+            group: InkGroupId::new_v4(),
+            anchor: block_anchor(block_id),
+        };
+        assert!(matches!(
+            apply(&mut doc, op.clone()),
+            Err(ApplyError::InkLayerMissing)
+        ));
+        assert!(matches!(replay(&mut doc, op), ReplayOutcome::NoOp { .. }));
+    }
+
+    #[test]
+    fn text_anchor_follows_concurrent_prefix_insert() {
+        let block = markdown_block("first paragraph\n\nsecond paragraph");
+        let block_id = block.id;
+        let (mut doc, _) = doc_with_layer(vec![block]);
+        let mut text =
+            CollaborativeTextState::from_legacy(TextReplicaId::new(1).unwrap(), &doc).unwrap();
+        let position = text
+            .relative_position(
+                &doc,
+                TextTarget::Markdown(block_id),
+                17,
+                TextAssociation::After,
+            )
+            .unwrap();
+        let group = InkGroupId::new_v4();
+        apply(
+            &mut doc,
+            DocumentOp::SetInkAnchor {
+                group,
+                anchor: InkAnchor {
+                    target: AnchorTarget::Text {
+                        position: position.clone(),
+                    },
+                    dx: 0.0,
+                    dy: 0.0,
+                },
+            },
+        )
+        .unwrap();
+
+        text.local_edit(
+            &mut doc,
+            TextTarget::Markdown(block_id),
+            crate::text_crdt::TextEdit {
+                start_utf16: 0,
+                end_utf16: 0,
+                replacement: "intro\n\n".into(),
+            },
+        )
+        .unwrap();
+
+        let AnchorTarget::Text { position } = &doc.ink.as_ref().unwrap().anchors[&group].target
+        else {
+            panic!("expected text anchor");
+        };
+        assert_eq!(text.resolve_relative_position(position).unwrap(), 24);
+    }
+
+    #[test]
+    fn deleting_a_block_moves_its_anchors_to_a_neighbour_or_the_page() {
+        let first = markdown_block("a");
+        let second = markdown_block("b");
+        let (first_id, second_id) = (first.id, second.id);
+        let (mut doc, _) = doc_with_layer(vec![first, second]);
+        let group = InkGroupId::new_v4();
+        apply(
+            &mut doc,
+            DocumentOp::SetInkAnchor {
+                group,
+                anchor: block_anchor(first_id),
+            },
+        )
+        .unwrap();
+
+        apply(&mut doc, DocumentOp::DeleteBlock { block_id: first_id }).unwrap();
+        let anchor = &doc.ink.as_ref().unwrap().anchors[&group];
+        assert_eq!(
+            anchor.target,
+            AnchorTarget::Block {
+                block_id: second_id
+            }
+        );
+        assert_eq!((anchor.dx, anchor.dy), (12.0, 34.0));
+
+        assert_eq!(
+            replay(
+                &mut doc,
+                DocumentOp::DeleteBlock {
+                    block_id: second_id
+                },
+            ),
+            ReplayOutcome::Applied
+        );
+        assert_eq!(
+            doc.ink.as_ref().unwrap().anchors[&group].target,
+            AnchorTarget::Page
+        );
+    }
+
+    #[test]
+    fn replacing_markdown_demotes_text_anchors_to_the_block() {
+        let block = markdown_block("text");
+        let block_id = block.id;
+        let (mut doc, _) = doc_with_layer(vec![block]);
+        let mut text =
+            CollaborativeTextState::from_legacy(TextReplicaId::new(1).unwrap(), &doc).unwrap();
+        let position = text
+            .relative_position(
+                &doc,
+                TextTarget::Markdown(block_id),
+                2,
+                TextAssociation::After,
+            )
+            .unwrap();
+        let group = InkGroupId::new_v4();
+        doc.ink.as_mut().unwrap().anchors.insert(
+            group,
+            InkAnchor {
+                target: AnchorTarget::Text { position },
+                dx: 1.0,
+                dy: 2.0,
+            },
+        );
+
+        apply(
+            &mut doc,
+            DocumentOp::ReplaceBlockContent {
+                block_id,
+                content: BlockContent::Divider,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            doc.ink.as_ref().unwrap().anchors[&group].target,
+            AnchorTarget::Block { block_id }
+        );
+    }
+
+    fn doc_with_legacy_ink() -> (InkstoneDocument, BlockId) {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(markdown_block("before"));
+        let mut legacy = CollaborationDoc::new(
+            ActorId::from_bytes([3; 16]),
+            stonepen_core::InkDoc::new(640.0, 480.0),
+        )
+        .unwrap();
+        let layer_id = legacy.document().active_layer_id;
+        let mut stroke = framed_stroke(InkGroupId::new_v4(), 300.0);
+        stroke.parent_id = None;
+        legacy.add_stroke(layer_id, None, stroke).unwrap();
+        let snapshot = legacy.snapshot().unwrap();
+        let ink = DocumentBlock::new(
+            BlockId::new_v4(),
+            BlockContent::Ink {
+                stonepen_json: stonepen_core::project_opaque_snapshot(&snapshot).unwrap(),
+                collaboration: Some(InkCollaborationState {
+                    version: INK_COLLABORATION_VERSION,
+                    stream_epoch: uuid::Uuid::new_v4(),
+                    snapshot: snapshot.into(),
+                }),
+            },
+        );
+        let ink_id = ink.id;
+        doc.blocks.push(ink);
+        doc.blocks.push(markdown_block("after"));
+        (doc, ink_id)
+    }
+
+    #[test]
+    fn migration_replaces_ink_blocks_with_anchored_spaces() {
+        let (mut doc, ink_id) = doc_with_legacy_ink();
+        let op = plan_ink_block_migration(&doc).unwrap().unwrap();
+        apply(&mut doc, op).unwrap();
+
+        let Some(BlockContent::Space { min_height }) =
+            doc.get_block(ink_id).map(|block| block.content.clone())
+        else {
+            panic!("expected Space block");
+        };
+        assert!(min_height >= 300.0 && min_height > DEFAULT_SPACE_HEIGHT);
+        let layer = doc.ink.as_ref().unwrap();
+        assert_eq!(layer.anchors.len(), 1);
+        let (group, anchor) = layer.anchors.iter().next().unwrap();
+        assert_eq!(anchor.target, AnchorTarget::Block { block_id: ink_id });
+        let projected = CollaborationDoc::from_snapshot(
+            ActorId::from_bytes([9; 16]),
+            layer.collaboration.snapshot.bytes().unwrap(),
+        )
+        .unwrap();
+        let bounds = projected.document().frame_bounds();
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].0.0, group.0);
+        assert!(plan_ink_block_migration(&doc).unwrap().is_none());
+    }
+
+    #[test]
+    fn second_migration_is_rejected_locally_and_ignored_in_replay() {
+        let (mut doc, _) = doc_with_legacy_ink();
+        let first = plan_ink_block_migration(&doc).unwrap().unwrap();
+        let second = plan_ink_block_migration(&doc).unwrap().unwrap();
+        assert_eq!(replay(&mut doc, first), ReplayOutcome::Applied);
+        let before = serde_json::to_vec(&doc).unwrap();
+        assert!(matches!(
+            apply(&mut doc, second.clone()),
+            Err(ApplyError::InkLayerExists)
+        ));
+        assert!(matches!(
+            replay(&mut doc, second),
+            ReplayOutcome::NoOp { .. }
+        ));
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn document_with_layer_roundtrips_and_exports() {
+        let (mut doc, ink_id) = doc_with_legacy_ink();
+        let op = plan_ink_block_migration(&doc).unwrap().unwrap();
+        apply(&mut doc, op).unwrap();
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: InkstoneDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.ink.as_ref().unwrap().anchors,
+            doc.ink.as_ref().unwrap().anchors
+        );
+
+        let markdown = materialize_document_markdown(&doc);
+        assert!(markdown.contains(&format!("<!-- inkstone-space block={ink_id}")));
+        assert!(markdown.contains("```inkstone-page-ink\n"));
+        assert!(markdown.starts_with("before"));
+    }
+
+    #[test]
+    fn documents_without_layer_keep_their_serialized_shape() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        doc.blocks.push(markdown_block("x"));
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("\"ink\""));
     }
 }
