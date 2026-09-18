@@ -32,11 +32,29 @@ pub fn materialize_document_markdown(doc: &crate::document::InkstoneDocument) ->
                 output.push_str("\n```");
             }
             BlockContent::Divider => output.push_str("---"),
+            BlockContent::Space { min_height } => {
+                output.push_str(&format!(
+                    "<!-- inkstone-space block={} min-height={} -->",
+                    block.id, min_height
+                ));
+            }
         }
         if !output.ends_with('\n') {
             output.push('\n');
         }
         output.push('\n');
+    }
+    if let Some(layer) = doc.ink.as_ref().filter(|layer| !layer.anchors.is_empty()) {
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        let payload = serde_json::json!({
+            "anchors": layer.anchors,
+            "stonepen": layer.stonepen_json(),
+        });
+        output.push_str("```inkstone-page-ink\n");
+        output.push_str(&payload.to_string());
+        output.push_str("\n```\n");
     }
     while output.ends_with("\n\n\n") {
         output.pop();
