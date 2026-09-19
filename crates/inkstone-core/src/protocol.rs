@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::ids::UpdateId;
 
-pub const INK_PRESENCE_VERSION: u32 = 1;
+pub const INK_PRESENCE_VERSION: u32 = 2;
 pub const ASSET_AAD_VERSION: i32 = 1;
 pub const ASSET_CHUNK_SIZE: usize = 1024 * 1024;
 pub const MAX_ASSET_CHUNKS: u32 = 256;
@@ -17,7 +17,27 @@ pub struct InkPresencePayload {
     pub version: u32,
     pub block_id: Uuid,
     pub stream_epoch: Uuid,
+    #[serde(with = "base64_bytes")]
     pub stonepen_preview: Vec<u8>,
+}
+
+/// Bytes as one base64 string rather than a JSON array of numbers, which
+/// would be several times larger on every live stroke update.
+mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +265,8 @@ pub struct BootstrapRequest {
 #[serde(deny_unknown_fields)]
 pub struct OwnerSetupRequest {
     pub token: String,
+    #[serde(default)]
+    pub email: Option<String>,
     pub password: String,
     pub device_id: Uuid,
     pub device_name: Option<String>,
@@ -371,6 +393,14 @@ pub struct WorkspaceMemberResponse {
     pub email: String,
     pub role: String,
     pub joined_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_name: Option<EncryptedGuestName>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptedGuestName {
+    pub ciphertext_b64: String,
+    pub nonce_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,7 +416,16 @@ pub struct ConsumeEmailVerificationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumePasswordResetRequest {
     pub token: String,
+    #[serde(default)]
+    pub email: Option<String>,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+    pub passphrase_envelope: RecoveryEnvelopeRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +478,8 @@ pub struct PutWorkspaceKeyEnvelopeRequest {
     pub encrypted_key_b64: String,
     pub nonce_b64: String,
     pub aad_version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +489,12 @@ pub struct WorkspaceKeyEnvelopeResponse {
     pub encrypted_key_b64: String,
     pub nonce_b64: String,
     pub aad_version: i32,
+    #[serde(default = "first_version")]
+    pub version: i64,
+}
+
+fn first_version() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +553,8 @@ pub struct DocResponse {
     pub created_by: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +566,47 @@ pub struct WorkspaceResponse {
     pub owner_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub member_count: i64,
+    #[serde(default)]
+    pub public_link: bool,
+    #[serde(default)]
+    pub public_link_editable: bool,
+    #[serde(default)]
+    pub guest_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicLinkRequest {
+    pub token: String,
+    #[serde(default)]
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicLinkAccessRequest {
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicLinkResponse {
+    pub workspace: WorkspaceResponse,
+    pub user_id: Uuid,
+    pub device_id: Uuid,
+    #[serde(default)]
+    pub guest: Option<EncryptedGuestName>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestJoinRequest {
+    pub name: EncryptedGuestName,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestJoinResponse {
+    pub token: String,
+    pub user_id: Uuid,
+    pub device_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +645,7 @@ mod tests {
             encrypted_key_b64: "opaque-ciphertext".into(),
             nonce_b64: "opaque-nonce".into(),
             aad_version: 1,
+            replace_version: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: PutWorkspaceKeyEnvelopeRequest = serde_json::from_str(&encoded).unwrap();
@@ -642,20 +733,24 @@ mod tests {
             stream_epoch: Uuid::new_v4(),
             stonepen_preview: vec![0, 255, 17],
         };
-        let roundtrip: InkPresencePayload =
-            serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["stonepen_preview"], "AP8R");
+        let roundtrip: InkPresencePayload = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, payload);
     }
 
     #[test]
-    fn owner_setup_request_cannot_supply_an_email() {
-        let request = serde_json::json!({
+    fn owner_setup_request_email_is_a_confirmation_and_nothing_else_is_accepted() {
+        let mut request = serde_json::json!({
             "token": "secret",
-            "email": "attacker@example.com",
+            "email": "owner@example.com",
             "password": "correct horse battery staple",
             "device_id": Uuid::new_v4(),
             "device_name": null
         });
+        let parsed = serde_json::from_value::<OwnerSetupRequest>(request.clone()).unwrap();
+        assert_eq!(parsed.email.as_deref(), Some("owner@example.com"));
+        request["role"] = serde_json::json!("admin");
         assert!(serde_json::from_value::<OwnerSetupRequest>(request).is_err());
     }
 }
