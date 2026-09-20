@@ -312,6 +312,8 @@ fn test_three_rapid_local_intents_do_not_overwrite() {
         uid1
     );
     assert!(state.view_doc().title.is_empty());
+    // Queued intents are shown before they persist.
+    assert_eq!(state.effective_view_doc().title, "third");
 
     persist_local(&mut state, uid1);
     assert_eq!(state.view_doc().title, "first");
@@ -329,6 +331,7 @@ fn test_three_rapid_local_intents_do_not_overwrite() {
     assert_eq!(state.view_doc().title, "third");
     assert!(!state.has_pending_intent());
     assert_eq!(state.intent_queue_len(), 0);
+    assert_eq!(state.effective_view_doc().title, "third");
 }
 
 #[test]
@@ -2262,4 +2265,101 @@ fn markdown_block(text: &str) -> DocumentBlock {
         BlockId::new_v4(),
         BlockContent::Markdown { text: text.into() },
     )
+}
+
+#[test]
+fn local_edits_persisted_while_a_confirmation_is_saving_are_kept() {
+    let doc_id = make_doc_id();
+    let mut state = ClientState::new(doc_id);
+    hydrate(&mut state, 10);
+    let conn_id = state.active_connection_id.unwrap();
+    state.transition(ClientEvent::Ready {
+        lifecycle: state.lifecycle_id,
+        connection_id: conn_id,
+        current_seq: 10,
+    });
+    let block = |text: &str| DocumentBlock {
+        id: BlockId::new_v4(),
+        created_at_ms: 1000,
+        updated_at_ms: 1000,
+        content: BlockContent::Markdown { text: text.into() },
+    };
+
+    let first = local_intent(
+        &mut state,
+        DocumentOp::InsertBlock {
+            idx: 0,
+            block: block("first"),
+        },
+    );
+    persist_local(&mut state, first);
+    let token = confirm_seq(&mut state, 11);
+
+    let second = local_intent(
+        &mut state,
+        DocumentOp::InsertBlock {
+            idx: 1,
+            block: block("second"),
+        },
+    );
+    state.transition(ClientEvent::LocalIntent {
+        op: DocumentOp::InsertBlock {
+            idx: 2,
+            block: block("third"),
+        },
+        update_id: UpdateId::new_v4(),
+        applied_at_ms: 1000,
+    });
+    persist_local(&mut state, second);
+    confirm_persisted(&mut state, token);
+    let third = state.pending_intent.as_ref().unwrap().update.update_id;
+    persist_local(&mut state, third);
+
+    assert!(state.errors().is_empty(), "{:?}", state.errors());
+    assert_eq!(state.pending_local().len(), 3);
+    let texts: Vec<_> = state
+        .view_doc()
+        .blocks
+        .iter()
+        .map(|block| match &block.content {
+            BlockContent::Markdown { text } => text.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(texts, ["first", "second", "third"]);
+}
+
+#[test]
+fn growing_the_view_one_update_at_a_time_matches_a_full_rebuild() {
+    let mut state = ClientState::new(make_doc_id());
+    hydrate(&mut state, 0);
+    let mut previous = None;
+    for index in 0..6 {
+        let id = BlockId::new_v4();
+        let op = DocumentOp::InsertBlock {
+            idx: 0,
+            block: DocumentBlock {
+                id,
+                content: BlockContent::Markdown {
+                    text: format!("block {index}"),
+                },
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            },
+        };
+        let update_id = local_intent(&mut state, op);
+        persist_local(&mut state, update_id);
+        if let Some(previous) = previous {
+            let update_id =
+                local_intent(&mut state, DocumentOp::DeleteBlock { block_id: previous });
+            persist_local(&mut state, update_id);
+        }
+        previous = Some(id);
+        let update_id = local_intent(&mut state, set_title(&format!("title {index}")));
+        persist_local(&mut state, update_id);
+    }
+    let grown = serde_json::to_value(state.view_doc()).unwrap();
+    state.rebuild_view();
+    assert_eq!(grown, serde_json::to_value(state.view_doc()).unwrap());
+    assert_eq!(state.view_doc().blocks.len(), 1);
 }
