@@ -42,6 +42,8 @@ pub struct ExportManifest {
     pub documents: Vec<ManifestDocument>,
     pub assets: Vec<ManifestAsset>,
     pub empty_folders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ink_images: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +76,46 @@ pub fn build_vault_archive(export: &VaultExport) -> Result<Vec<u8>, WorkspaceSto
     assets.sort_by(|a, b| a.path.cmp(&b.path));
     let mut folders = export.empty_folders.clone();
     folders.sort();
+
+    let mut taken: BTreeSet<String> = documents
+        .iter()
+        .map(|document| document.path.as_str().to_string())
+        .chain(assets.iter().map(|asset| asset.path.as_str().to_string()))
+        .collect();
+    let mut rendered = Vec::new();
+    for document in &documents {
+        let path = document.path.as_str();
+        let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+        let stem = file.strip_suffix(".md").unwrap_or(file);
+        let mut image_dir = "_ink".to_string();
+        let mut note =
+            inkstone_core::export::portable_markdown(&document.document, &image_dir, stem);
+        let located = |image_dir: &str, name: &str| {
+            if dir.is_empty() {
+                format!("{image_dir}/{name}")
+            } else {
+                format!("{dir}/{image_dir}/{name}")
+            }
+        };
+        if note
+            .images
+            .iter()
+            .any(|image| taken.contains(&located(&image_dir, &image.file_name)))
+        {
+            image_dir = format!("_ink-{}", document.document.id);
+            note = inkstone_core::export::portable_markdown(&document.document, &image_dir, stem);
+        }
+        let images = note
+            .images
+            .into_iter()
+            .map(|image| {
+                let path = located(&image_dir, &image.file_name);
+                taken.insert(path.clone());
+                (path, image.svg)
+            })
+            .collect::<Vec<_>>();
+        rendered.push((note.markdown, images));
+    }
 
     let manifest = ExportManifest {
         format: "inkstone-vault".into(),
@@ -113,6 +155,10 @@ pub fn build_vault_archive(export: &VaultExport) -> Result<Vec<u8>, WorkspaceSto
             .iter()
             .map(|folder| folder.as_str().into())
             .collect(),
+        ink_images: rendered
+            .iter()
+            .flat_map(|(_, images)| images.iter().map(|(path, _)| path.clone()))
+            .collect(),
     };
     let cursor = Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
@@ -130,16 +176,17 @@ pub fn build_vault_archive(export: &VaultExport) -> Result<Vec<u8>, WorkspaceSto
             .add_directory(format!("{}/", folder.as_str()), options)
             .map_err(zip_error)?;
     }
-    for document in documents {
+    for (document, (markdown, images)) in documents.into_iter().zip(rendered) {
         archive
             .start_file(document.path.as_str(), options)
             .map_err(zip_error)?;
         archive
-            .write_all(
-                inkstone_core::markdown::materialize_document_markdown(&document.document)
-                    .as_bytes(),
-            )
+            .write_all(markdown.as_bytes())
             .map_err(backend_error)?;
+        for (path, svg) in images {
+            archive.start_file(path, options).map_err(zip_error)?;
+            archive.write_all(svg.as_bytes()).map_err(backend_error)?;
+        }
         if let Some(backup) = document.encrypted_crdt_backup {
             archive
                 .start_file(
@@ -155,6 +202,24 @@ pub fn build_vault_archive(export: &VaultExport) -> Result<Vec<u8>, WorkspaceSto
             .start_file(asset.path.as_str(), options)
             .map_err(zip_error)?;
         archive.write_all(&asset.bytes).map_err(backend_error)?;
+    }
+    Ok(archive.finish().map_err(zip_error)?.into_inner())
+}
+
+pub fn build_file_archive(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, WorkspaceStoreError> {
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default());
+    let mut seen = BTreeSet::new();
+    for (path, bytes) in files {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        archive
+            .start_file(path.as_str(), options)
+            .map_err(zip_error)?;
+        archive.write_all(bytes).map_err(backend_error)?;
     }
     Ok(archive.finish().map_err(zip_error)?.into_inner())
 }
@@ -261,6 +326,16 @@ pub fn read_vault_archive(bytes: &[u8]) -> Result<ImportedVault, WorkspaceStoreE
         }
         files.insert(path, value);
     }
+    for image in &manifest.ink_images {
+        if !image.ends_with(".svg")
+            || !expected.insert(image.clone())
+            || raw.remove(image).is_none()
+        {
+            return Err(WorkspaceStoreError::Serialization(format!(
+                "invalid rendered ink image: {image}"
+            )));
+        }
+    }
     for folder in &manifest.empty_folders {
         let path = WorkspacePath::new(folder)?;
         if path.is_internal() || !expected.insert(format!("{folder}/")) {
@@ -361,7 +436,7 @@ mod tests {
             .unwrap()
             .read_to_string(&mut markdown)
             .unwrap();
-        assert_eq!(markdown, "# Title\n\nBody\n\n");
+        assert_eq!(markdown, "# Title\n\nBody\n");
         let imported = read_vault_archive(&build_vault_archive(&fixture()).unwrap()).unwrap();
         assert_eq!(imported.manifest.version, 2);
         assert_eq!(
