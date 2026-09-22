@@ -1,4 +1,9 @@
 pub fn render_mathml(source: &str) -> String {
+    render_mathml_styled(source, true)
+}
+
+/// MathML for `source`, as a display block or inline with the text.
+pub fn render_mathml_styled(source: &str, display: bool) -> String {
     let source = source.trim();
     if source.is_empty() {
         return "<span class=\"math-empty\">No equation provided</span>".to_string();
@@ -7,7 +12,8 @@ pub fn render_mathml(source: &str) -> String {
     let mut parser = Parser::new(source);
     let body = parser.parse_row(None);
     format!(
-        "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" display=\"block\" aria-label=\"{}\"><mrow>{}</mrow></math>",
+        "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" display=\"{}\" aria-label=\"{}\"><mrow>{}</mrow></math>",
+        if display { "block" } else { "inline" },
         escape(source),
         body
     )
