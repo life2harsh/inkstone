@@ -5,6 +5,8 @@ pub enum ThemePreference {
     System,
     Light,
     Dark,
+    Paper,
+    Midnight,
 }
 
 impl ThemePreference {
@@ -12,6 +14,8 @@ impl ThemePreference {
         match value {
             "light" => Self::Light,
             "dark" => Self::Dark,
+            "paper" => Self::Paper,
+            "midnight" => Self::Midnight,
             _ => Self::System,
         }
     }
@@ -21,6 +25,8 @@ impl ThemePreference {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Paper => "paper",
+            Self::Midnight => "midnight",
         }
     }
 }
@@ -61,6 +67,8 @@ pub fn render_control(document: &web_sys::Document, class_name: &str) -> web_sys
         (ThemePreference::System, "System"),
         (ThemePreference::Light, "Light"),
         (ThemePreference::Dark, "Dark"),
+        (ThemePreference::Paper, "Paper"),
+        (ThemePreference::Midnight, "Midnight"),
     ] {
         let button = document.create_element("button").unwrap();
         button.set_class_name("theme-choice");
@@ -94,5 +102,7 @@ mod tests {
         assert_eq!(ThemePreference::parse("system"), ThemePreference::System);
         assert_eq!(ThemePreference::parse("unknown"), ThemePreference::System);
         assert_eq!(ThemePreference::Dark.as_str(), "dark");
+        assert_eq!(ThemePreference::parse("paper"), ThemePreference::Paper);
+        assert_eq!(ThemePreference::Midnight.as_str(), "midnight");
     }
 }
