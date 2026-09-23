@@ -46,6 +46,7 @@ pub fn render_with_knowledge(
     options.extension.tasklist = true;
     options.extension.tagfilter = true;
     options.extension.wikilinks_title_after_pipe = true;
+    options.extension.math_dollars = true;
     options.render.escaped_char_spans = true;
 
     let html = markdown_to_preview_html(text, &options);
@@ -66,6 +67,7 @@ pub fn render_with_knowledge_and_counts(
     options.extension.tasklist = true;
     options.extension.tagfilter = true;
     options.extension.wikilinks_title_after_pipe = true;
+    options.extension.math_dollars = true;
     options.render.escaped_char_spans = true;
 
     let html = markdown_to_preview_html(text, &options);
@@ -74,6 +76,48 @@ pub fn render_with_knowledge_and_counts(
         current_path,
         Some(knowledge),
         heading_counts,
+    )
+}
+
+/// Renders one page block with `data-sourcepos` on block elements, so the
+/// page surface can map text positions to rendered elements.
+pub fn render_page_block(
+    text: &str,
+    current_path: &str,
+    knowledge: &crate::knowledge::KnowledgeIndex,
+    heading_counts: &mut HashMap<String, usize>,
+) -> String {
+    let mut options = Options::default();
+    options.render.unsafe_ = false;
+    options.render.sourcepos = true;
+    options.extension.strikethrough = true;
+    options.extension.table = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.tagfilter = true;
+    options.extension.wikilinks_title_after_pipe = true;
+    options.extension.math_dollars = true;
+    options.render.escaped_char_spans = true;
+
+    let html = markdown_to_preview_html(text, &options);
+    process_html_with_counts(
+        &process_obsidian_html(&html),
+        current_path,
+        Some(knowledge),
+        heading_counts,
+    )
+}
+
+/// Lets a page's task checkboxes be clicked; the page turns a click into a
+/// text edit.
+pub fn enable_task_toggles(html: &str) -> String {
+    html.replace(
+        "<input type=\"checkbox\" checked=\"\" disabled=\"\" />",
+        "<input type=\"checkbox\" class=\"task-toggle\" checked=\"\" />",
+    )
+    .replace(
+        "<input type=\"checkbox\" disabled=\"\" />",
+        "<input type=\"checkbox\" class=\"task-toggle\" />",
     )
 }
 
@@ -87,7 +131,37 @@ fn markdown_to_preview_html(text: &str, options: &Options<'_>) -> String {
 }
 
 fn process_obsidian_html(html: &str) -> String {
-    strip_escaped_char_spans(&render_highlights(&render_colors(&render_callouts(html))))
+    render_math_spans(&strip_escaped_char_spans(&render_highlights(
+        &render_colors(&render_callouts(html)),
+    )))
+}
+
+fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Turns comrak's `$...$` / `$$...$$` spans into MathML.
+fn render_math_spans(html: &str) -> String {
+    static MATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<span([^>]*?)\sdata-math-style="(inline|display)"([^>]*)>([\s\S]*?)</span>"#)
+            .expect("math span regex")
+    });
+    MATH.replace_all(html, |caps: &regex::Captures| {
+        let display = &caps[2] == "display";
+        let source = unescape_html(&caps[4]);
+        format!(
+            "<span{}{} class=\"math-{}\">{}</span>",
+            &caps[1],
+            &caps[3],
+            &caps[2],
+            crate::math_render::render_mathml_styled(&source, display)
+        )
+    })
+    .into_owned()
 }
 
 fn color_class(attribute: &str, color: &str) -> Option<&'static str> {
@@ -595,6 +669,35 @@ fn parent_folder(path: &str) -> Option<String> {
     }
 }
 
+pub fn relative_href(note_path: &str, target: &str) -> String {
+    let parent = parent_folder(note_path).unwrap_or_default();
+    let base: Vec<&str> = parent.split('/').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = target.split('/').collect();
+    let shared = base
+        .iter()
+        .zip(parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut href = vec![".."; base.len() - shared];
+    href.extend(&parts[shared..]);
+    href.join("/")
+}
+
+pub fn embed_markdown(note_path: &str, target: &str, name: &str, image: bool) -> String {
+    let label: String = name
+        .chars()
+        .filter(|character| !matches!(character, '[' | ']' | '<' | '>' | '\\' | '\n'))
+        .collect();
+    let href = relative_href(note_path, target)
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('(', "%28")
+        .replace(')', "%29");
+    format!("{}[{label}]({href})", if image { "!" } else { "" })
+}
+
 fn process_html(
     html_input: &str,
     current_path: &str,
@@ -773,6 +876,36 @@ mod tests {
     use super::*;
 
     // ── Basic rendering smoke tests ─────────────────────
+
+    #[test]
+    fn page_tasks_are_clickable() {
+        let html = render_page_block(
+            "- [ ] one\n- [x] two",
+            "note.md",
+            &crate::knowledge::KnowledgeIndex::default(),
+            &mut HashMap::new(),
+        );
+        let html = enable_task_toggles(&html);
+        assert!(!html.contains("disabled"), "{html}");
+        assert_eq!(html.matches("class=\"task-toggle\"").count(), 2, "{html}");
+        assert!(html.contains("data-sourcepos=\"2:1-2:9\""), "{html}");
+    }
+
+    #[test]
+    fn dollar_math_renders_as_mathml() {
+        let html = render_page_block(
+            "Energy $E = mc^2$ and $$a < b$$, but $5 and $10 stay text.",
+            "note.md",
+            &crate::knowledge::KnowledgeIndex::default(),
+            &mut HashMap::new(),
+        );
+        assert!(html.contains("class=\"math-inline\""), "{html}");
+        assert!(html.contains("display=\"inline\""), "{html}");
+        assert!(html.contains("<msup>"), "{html}");
+        assert!(html.contains("class=\"math-display\""), "{html}");
+        assert!(html.contains("$5 and $10"), "{html}");
+        assert!(!html.contains("data-math-style=\"inline\">E"), "{html}");
+    }
 
     #[test]
     fn test_render_heading() {
@@ -1265,6 +1398,27 @@ mod tests {
     }
 
     #[test]
+    fn embedded_files_resolve_back_to_their_vault_path() {
+        for (note, target) in [
+            ("Note.md", "Assets/Pasted image 2026-10-17.png"),
+            ("Notes/One.md", "Assets/a (2).png"),
+            ("Notes/Deep/Two.md", "Notes/Assets/b.png"),
+            ("Assets/Inside.md", "Assets/c.png"),
+        ] {
+            let markdown = embed_markdown(note, target, "pic", true);
+            let html = render_to_html(&markdown, note);
+            assert!(
+                html.contains(&format!("data-asset-path=\"{target}\"")),
+                "{markdown} -> {html}"
+            );
+        }
+        assert_eq!(
+            embed_markdown("Notes/One.md", "Assets/report.pdf", "re[port]", false),
+            "[report](../Assets/report.pdf)"
+        );
+    }
+
+    #[test]
     fn relative_image_uses_validated_asset_path_without_plaintext_src() {
         let html = process_html(
             "<img src=\"../Assets/private.png\" alt=\"x\">",
@@ -1412,5 +1566,21 @@ mod tests {
     fn test_ancestor_folders_one_level() {
         let result = ancestor_folders("A/Note.md");
         assert_eq!(result, vec!["A"]);
+    }
+
+    #[test]
+    fn page_blocks_carry_source_positions() {
+        let knowledge = crate::knowledge::KnowledgeIndex::default();
+        let mut counts = HashMap::new();
+        let html = render_page_block(
+            "# Title\n\nFirst paragraph\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n",
+            "note.md",
+            &knowledge,
+            &mut counts,
+        );
+        assert!(html.contains(r#"data-sourcepos="1:1-1:7""#), "{html}");
+        assert!(html.contains(r#"data-sourcepos="3:1-3:15""#), "{html}");
+        assert!(html.contains(r#"data-sourcepos="5:1-5:5""#), "{html}");
+        assert!(html.contains(r#"id="title""#), "{html}");
     }
 }
