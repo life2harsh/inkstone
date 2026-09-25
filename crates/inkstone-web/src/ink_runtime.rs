@@ -31,6 +31,8 @@ struct MountedInk {
 #[derive(Default)]
 pub struct InkRuntimeRegistry {
     handles: HashMap<BlockId, MountedInk>,
+    /// The page ink layer. Unlike block runtimes it survives re-renders.
+    pub page: Option<crate::page_surface::PageSurface>,
 }
 
 impl InkRuntimeRegistry {
@@ -55,7 +57,12 @@ impl InkRuntimeRegistry {
         let mut handle = mount_stonepen(canvas_id)?;
         handle.set_collaboration_actor(&actor)?;
         let (stream_epoch, bootstrap_snapshot) = if let Some(state) = collaboration {
-            handle.load_collaboration_snapshot(&state.snapshot)?;
+            handle.load_collaboration_snapshot(
+                state
+                    .snapshot
+                    .bytes()
+                    .map_err(|error| JsValue::from_str(&error))?,
+            )?;
             (state.stream_epoch, None)
         } else {
             if !stored_json.is_empty() {
@@ -154,6 +161,15 @@ impl InkRuntimeRegistry {
         payload: &inkstone_core::InkPresencePayload,
         now_ms: f64,
     ) -> Result<bool, JsValue> {
+        if payload.block_id == crate::page_surface::PAGE_PRESENCE_BLOCK {
+            if let Some(page) = self.page.as_mut() {
+                if page.stream_epoch() == payload.stream_epoch {
+                    page.apply_remote_preview(participant, &payload.stonepen_preview, now_ms);
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         let block_id = BlockId(payload.block_id);
         let Some(mounted) = self.handles.get_mut(&block_id) else {
             return Ok(false);
@@ -170,6 +186,9 @@ impl InkRuntimeRegistry {
     }
 
     pub fn remove_remote_participant(&mut self, participant: Uuid) {
+        if let Some(page) = self.page.as_mut() {
+            page.remove_remote_participant(participant);
+        }
         for mounted in self.handles.values_mut() {
             mounted
                 .handle
@@ -178,6 +197,9 @@ impl InkRuntimeRegistry {
     }
 
     pub fn expire_remote_previews(&mut self, now_ms: f64, ttl_ms: f64) {
+        if let Some(page) = self.page.as_mut() {
+            page.expire_remote_previews(now_ms, ttl_ms);
+        }
         for mounted in self.handles.values_mut() {
             mounted.handle.expire_remote_previews(now_ms, ttl_ms);
         }
