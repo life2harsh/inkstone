@@ -166,6 +166,13 @@ async fn complete_owner_setup(
             "Invalid or expired owner setup link".into(),
         ));
     }
+    if let Some(supplied) = &req.email {
+        if auth::normalize_email(supplied)? != email {
+            return Err(AppError::BadRequest(
+                "This setup link was issued for a different email".into(),
+            ));
+        }
+    }
 
     let password_hash = auth::hash_password(&state, req.password).await?;
     let user_id = Uuid::new_v4();
@@ -405,7 +412,7 @@ async fn request_account_token(
             (
                 "Reset your Inkstone account password",
                 "password-reset",
-                "This resets only your account password. It does not recover or decrypt your vault.",
+                "After resetting, you'll need your recovery key to unlock your notes.",
             )
         } else {
             (
@@ -415,8 +422,12 @@ async fn request_account_token(
             )
         };
         let link = format!(
-            "{}/#{fragment}={token}",
-            state.config.public_base_url.trim_end_matches('/')
+            "{}/#{fragment}={token}&email={}",
+            state.config.public_base_url.trim_end_matches('/'),
+            email
+                .replace('%', "%25")
+                .replace('&', "%26")
+                .replace('#', "%23")
         );
         if let Err(error) = crate::email::send(
             &state.config,
@@ -469,18 +480,26 @@ async fn consume_password_reset(
 ) -> AppResult<Json<GenericMessageResponse>> {
     auth::validate_password(&req.password)?;
     let token_hash = auth::validate_secret_token(&req.token, "password reset")?;
-    let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM auth_tokens WHERE token_hash = $1 AND purpose = 'password_reset'
-         AND consumed_at IS NULL AND expires_at > NOW()",
+    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT t.user_id, u.email FROM auth_tokens t JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = $1 AND t.purpose = 'password_reset'
+         AND t.consumed_at IS NULL AND t.expires_at > NOW()",
     )
     .bind(&token_hash)
     .fetch_optional(&state.db)
     .await?;
-    let Some(user_id) = user_id else {
+    let Some((user_id, account_email)) = row else {
         return Err(AppError::BadRequest(
             "Invalid or expired password reset token".into(),
         ));
     };
+    if let Some(supplied) = &req.email {
+        if Some(auth::normalize_email(supplied)?) != account_email.map(|e| e.to_lowercase()) {
+            return Err(AppError::BadRequest(
+                "This reset link was issued for a different email".into(),
+            ));
+        }
+    }
     let password_hash = auth::hash_password(&state, req.password).await?;
     let mut tx = state.db.begin().await?;
     let consumed: Option<Uuid> = sqlx::query_scalar(
@@ -513,7 +532,7 @@ async fn consume_password_reset(
         let _ = state.session_revocations.send(hash);
     }
     Ok(Json(GenericMessageResponse {
-        message: "Account password reset. This does not recover or decrypt your vault.".into(),
+        message: "Password reset. Sign in, then use your recovery key to unlock your notes.".into(),
     }))
 }
 

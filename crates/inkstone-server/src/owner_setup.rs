@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -20,9 +19,13 @@ pub struct IssuedOwnerSetup {
 impl IssuedOwnerSetup {
     pub fn link(&self, config: &Config) -> String {
         format!(
-            "{}/#owner-setup={}",
+            "{}/#owner-setup={}&email={}",
             config.public_base_url.trim_end_matches('/'),
-            self.token
+            self.token,
+            self.email
+                .replace('%', "%25")
+                .replace('&', "%26")
+                .replace('#', "%23")
         )
     }
 }
@@ -92,51 +95,25 @@ pub async fn issue(
     })
 }
 
-#[derive(Serialize)]
-struct ResendEmail<'a> {
-    from: &'a str,
-    to: [&'a str; 1],
-    subject: &'a str,
-    text: String,
-}
-
 pub async fn send(pool: &PgPool, config: &Config, setup: &IssuedOwnerSetup) -> AppResult<()> {
-    let api_key = config
-        .resend_api_key
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("RESEND_API_KEY is required with --send".into()))?;
-    let from = config
-        .resend_from_email
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("RESEND_FROM_EMAIL is required with --send".into()))?;
+    if !crate::email::is_configured(config) {
+        return Err(AppError::BadRequest(
+            "an email provider (RESEND or SMTP) is required with --send".into(),
+        ));
+    }
     let link = setup.link(config);
-    let body = ResendEmail {
-        from,
-        to: [&setup.email],
-        subject: "Complete your Inkstone owner setup",
+    crate::email::send(
+        config,
+        &setup.email,
+        "Complete your Inkstone owner setup",
         // Text-only mail prevents open pixels and link rewriting by tracking systems.
-        text: format!(
+        &format!(
             "Complete your Inkstone owner setup:\n\n{link}\n\nThis one-time link expires at {}.",
             setup.expires_at.to_rfc3339()
         ),
-    };
-    let response = reqwest::Client::new()
-        .post("https://api.resend.com/emails")
-        .bearer_auth(api_key)
-        .header(
-            "Idempotency-Key",
-            setup.delivery_idempotency_key.to_string(),
-        )
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| AppError::External(format!("Resend request failed: {error}")))?;
-    if !response.status().is_success() {
-        return Err(AppError::External(format!(
-            "Resend rejected the message with status {}",
-            response.status()
-        )));
-    }
+        setup.delivery_idempotency_key,
+    )
+    .await?;
     sqlx::query(
         "UPDATE owner_setup SET delivered_at = NOW()
          WHERE singleton = TRUE AND delivery_idempotency_key = $1 AND completed_at IS NULL",
