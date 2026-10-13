@@ -31,6 +31,14 @@ pub async fn create_test_pool() -> PgPool {
         .connect(&database_url)
         .await
         .expect("Failed to connect to test database. Is the test Postgres running on port 5433?");
+    for extension in ["uuid-ossp", "pgcrypto"] {
+        sqlx::query(&format!(
+            "CREATE EXTENSION IF NOT EXISTS \"{extension}\" WITH SCHEMA public"
+        ))
+        .execute(&bootstrap)
+        .await
+        .expect("Failed to install extensions in the test database");
+    }
     let schema = format!("test_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE SCHEMA {schema}"))
         .execute(&bootstrap)
