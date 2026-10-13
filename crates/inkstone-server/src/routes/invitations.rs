@@ -5,7 +5,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use inkstone_core::protocol::{
     ApproveInvitationKeyRequest, CreateInvitationRequest, CreateInvitationResponse,
-    GenericMessageResponse, InvitationKeyRequestResponse, InvitationResponse,
+    EncryptedGuestName, GenericMessageResponse, InvitationKeyRequestResponse, InvitationResponse,
     OutgoingInvitationResponse, PaginatedResponse, SubmitInvitationKeyRequest,
     TransferOwnershipRequest, UpdateMemberRoleRequest, WorkspaceMemberResponse,
 };
@@ -96,7 +96,7 @@ async fn create_invitation(
         email,
         role: req.role,
         expires_at,
-        token: if state.config.dev_auth || state.config.resend_api_key.is_none() {
+        token: if state.config.dev_auth || !crate::email::is_configured(&state.config) {
             token
         } else {
             String::new()
@@ -367,6 +367,7 @@ async fn approve(
         email: row.2,
         role: row.1,
         joined_at,
+        guest_name: None,
     }))
 }
 
@@ -376,9 +377,27 @@ async fn list_members(
     Path(workspace_id): Path<Uuid>,
 ) -> AppResult<Json<PaginatedResponse<WorkspaceMemberResponse>>> {
     db::verify_workspace_access(&state.db, workspace_id, user.user_id).await?;
-    let rows=sqlx::query_as::<_,(Uuid,String,String,chrono::DateTime<chrono::Utc>)>(
-        "SELECT wm.user_id,COALESCE(u.email,''),wm.role,wm.joined_at FROM workspace_members wm JOIN users u ON u.id=wm.user_id WHERE wm.workspace_id=$1 ORDER BY wm.joined_at",
-    ).bind(workspace_id).fetch_all(&state.db).await?;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        ),
+    >(
+        "SELECT wm.user_id, COALESCE(u.email, ''), wm.role, wm.joined_at,
+                u.encrypted_guest_name, u.guest_name_nonce
+         FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+         WHERE wm.workspace_id = $1 AND u.public_link_workspace_id IS NULL
+         ORDER BY wm.joined_at",
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.db)
+    .await?;
+    let engine = base64::engine::general_purpose::STANDARD;
     let items = rows
         .into_iter()
         .map(|r| WorkspaceMemberResponse {
@@ -386,6 +405,10 @@ async fn list_members(
             email: r.1,
             role: r.2,
             joined_at: r.3,
+            guest_name: r.4.zip(r.5).map(|(name, nonce)| EncryptedGuestName {
+                ciphertext_b64: engine.encode(name),
+                nonce_b64: engine.encode(nonce),
+            }),
         })
         .collect::<Vec<_>>();
     Ok(Json(PaginatedResponse {
@@ -464,7 +487,27 @@ async fn remove_member(
         .bind(member_id)
         .execute(&mut *tx)
         .await?;
+    let guest_sessions: Vec<Vec<u8>> = sqlx::query_scalar(
+        "DELETE FROM auth_sessions s USING users u
+         WHERE s.user_id = u.id AND u.id = $1 AND u.guest_workspace_id = $2
+         RETURNING s.token_hash",
+    )
+    .bind(member_id)
+    .bind(workspace_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE devices d SET revoked_at = NOW() FROM users u
+         WHERE d.user_id = u.id AND u.id = $1 AND u.guest_workspace_id = $2",
+    )
+    .bind(member_id)
+    .bind(workspace_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
+    for hash in guest_sessions {
+        let _ = state.session_revocations.send(hash);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

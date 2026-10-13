@@ -22,6 +22,8 @@ pub struct AuthUser {
     pub device_id: Option<DeviceId>,
     pub session_hash: Option<Vec<u8>>,
     pub session_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub public_link: Option<Uuid>,
+    pub guest: Option<Uuid>,
 }
 
 pub struct Auth(pub AuthUser);
@@ -68,12 +70,87 @@ impl FromRequestParts<AppState> for Auth {
                     device_id,
                     session_hash: None,
                     session_expires_at: None,
+                    public_link: None,
+                    guest: None,
                 }));
             }
         }
 
-        Ok(Auth(authenticate_session(&parts.headers, state).await?))
+        let user = authenticate_session(&parts.headers, state).await?;
+        if let Some(workspace_id) = user.public_link {
+            if !public_link_may_request(&parts.method, parts.uri.path(), workspace_id) {
+                return Err(AppError::Forbidden("Public links are read-only".into()));
+            }
+        }
+        if let Some(workspace_id) = user.guest {
+            if !guest_may_request(&parts.method, parts.uri.path(), workspace_id) {
+                return Err(AppError::Forbidden(
+                    "Guests can only work in the vault they joined".into(),
+                ));
+            }
+        }
+        Ok(Auth(user))
     }
+}
+
+/// A public link reads one vault's notes and files, and nothing else.
+pub fn public_link_may_request(
+    method: &axum::http::Method,
+    path: &str,
+    workspace_id: Uuid,
+) -> bool {
+    if method == axum::http::Method::POST {
+        return path == "/api/public-link/guests";
+    }
+    if method != axum::http::Method::GET {
+        return false;
+    }
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let own = |id: &str| Uuid::parse_str(id).is_ok_and(|id| id == workspace_id);
+    match segments.as_slice() {
+        ["api", "public-link"] => true,
+        [
+            "api",
+            "workspaces",
+            id,
+            "docs" | "path-projections" | "assets",
+        ] => own(id),
+        ["api", "docs", _] | ["api", "docs", _, "updates" | "snapshot"] => true,
+        ["api", "assets", _] | ["api", "assets", _, "versions", _, "chunks", _] => true,
+        _ => false,
+    }
+}
+
+pub fn guest_may_request(method: &axum::http::Method, path: &str, workspace_id: Uuid) -> bool {
+    use axum::http::Method;
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let own = |id: &str| Uuid::parse_str(id).is_ok_and(|id| id == workspace_id);
+    match segments.as_slice() {
+        ["api", "public-link"] => method == Method::GET,
+        ["api", "workspaces", id, "docs" | "assets"] => {
+            own(id) && (method == Method::GET || method == Method::POST)
+        }
+        ["api", "workspaces", id, "path-projections"] => own(id) && method == Method::GET,
+        ["api", "workspaces", id, "path-projections", _] => {
+            own(id) && (method == Method::PUT || method == Method::DELETE)
+        }
+        ["api", "workspaces", id, "tree-mutations"] => own(id) && method == Method::POST,
+        ["api", "docs", _]
+        | ["api", "docs", _, "title" | "updates" | "snapshot"]
+        | ["api", "assets", _]
+        | ["api", "assets", _, "versions", _, "chunks", _] => true,
+        _ => false,
+    }
+}
+
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 pub async fn authenticate_session(
@@ -83,11 +160,24 @@ pub async fn authenticate_session(
     sqlx::query("DELETE FROM auth_sessions WHERE expires_at <= NOW()")
         .execute(&state.db)
         .await?;
-    let token = cookie_value(headers, SESSION_COOKIE)
+    let bearer = bearer_token(headers);
+    let token = bearer
+        .or_else(|| cookie_value(headers, SESSION_COOKIE))
         .ok_or_else(|| AppError::Unauthorized("Authentication required".into()))?;
     let token_hash = hash_secret(token.as_bytes());
-    let row = sqlx::query_as::<_, (Uuid, String, Uuid, chrono::DateTime<chrono::Utc>)>(
-        "SELECT s.user_id, u.email, s.device_id, s.expires_at
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<String>,
+            Uuid,
+            chrono::DateTime<chrono::Utc>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ),
+    >(
+        "SELECT s.user_id, u.email, s.device_id, s.expires_at, u.public_link_workspace_id,
+                u.guest_workspace_id
              FROM auth_sessions s
              JOIN users u ON u.id = s.user_id
              JOIN devices d ON d.id = s.device_id AND d.user_id = s.user_id
@@ -97,6 +187,9 @@ pub async fn authenticate_session(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::Unauthorized("Invalid or expired session".into()))?;
+    if bearer.is_some() != (row.4.is_some() || row.5.is_some()) {
+        return Err(AppError::Unauthorized("Invalid or expired session".into()));
+    }
 
     sqlx::query("UPDATE devices SET last_seen_at = NOW() WHERE id = $1")
         .bind(row.2)
@@ -105,10 +198,12 @@ pub async fn authenticate_session(
 
     Ok(AuthUser {
         user_id: row.0,
-        email: Some(row.1),
+        email: row.1,
         device_id: Some(row.2),
         session_hash: Some(token_hash),
         session_expires_at: Some(row.3),
+        public_link: row.4,
+        guest: row.5,
     })
 }
 
@@ -314,6 +409,12 @@ mod tests {
                 public_base_url: "http://localhost:8080".into(),
                 resend_api_key: None,
                 resend_from_email: None,
+                smtp_host: None,
+                smtp_port: None,
+                smtp_username: None,
+                smtp_password: None,
+                smtp_from_email: None,
+                email_optional: false,
                 allowed_origins: Vec::new(),
                 session_ttl_hours: 24,
                 cookie_secure: false,
