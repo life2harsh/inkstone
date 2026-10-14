@@ -17,9 +17,10 @@ use crate::sync::rooms;
 use crate::sync::{EncryptedPresenceFrame, OutboundMessage};
 use inkstone_core::protocol::{ClientWsMessage, ServerWsMessage};
 
-const MAX_UPDATE_BYTES: usize = 1024 * 1024;
+const MAX_UPDATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PRESENCE_BYTES: usize = 16 * 1024;
-const MAX_TEXT_BYTES: usize = 1400 * 1024;
+const MAX_TEXT_BYTES: usize = MAX_UPDATE_BYTES * 4 / 3 + 64 * 1024;
+const MAX_SOCKET_MESSAGE_BYTES: usize = MAX_TEXT_BYTES + 1024 * 1024;
 const DIRECT_CHANNEL_CAPACITY: usize = 32;
 const WS_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -28,6 +29,7 @@ pub struct WsAuthParams {
     pub device_id: Option<Uuid>,
     pub dev_user_id: Option<Uuid>,
     pub dev_device_id: Option<Uuid>,
+    pub link: Option<String>,
 }
 
 pub async fn ws_handler(
@@ -38,7 +40,11 @@ pub async fn ws_handler(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     validate_origin(&state, &headers)?;
-    let (user_id, device_id, session_hash, session_expires_at) = if state.config.dev_auth {
+    // Dev mode takes identities from the query, or a real session when none
+    // is given, so the actual sign-in flow also works against a dev server.
+    let dev_identity =
+        state.config.dev_auth && (params.dev_user_id.is_some() || params.dev_device_id.is_some());
+    let (user_id, device_id, session_hash, session_expires_at, read_only) = if dev_identity {
         let user_id = params
             .dev_user_id
             .ok_or_else(|| AppError::Unauthorized("dev_user_id is required in dev mode".into()))?;
@@ -58,15 +64,25 @@ pub async fn ws_handler(
         .execute(&state.db)
         .await?;
         db::verify_device_owner(&state.db, device_id, user_id).await?;
-        (user_id, device_id, None, None)
+        (user_id, device_id, None, None, false)
     } else {
+        let mut headers = headers.clone();
+        if let Some(link) = params.link.as_deref() {
+            let value = format!("Bearer {link}")
+                .parse()
+                .map_err(|_| AppError::Unauthorized("Invalid public link".into()))?;
+            headers.insert(axum::http::header::AUTHORIZATION, value);
+        }
         let session = auth::authenticate_session(&headers, &state).await?;
         let session_device = session
             .device_id
             .ok_or_else(|| AppError::Unauthorized("Session has no device".into()))?;
-        let device_id = params
-            .device_id
-            .ok_or_else(|| AppError::BadRequest("device_id query parameter is required".into()))?;
+        let device_id = match session.public_link.or(session.guest) {
+            Some(_) => session_device,
+            None => params.device_id.ok_or_else(|| {
+                AppError::BadRequest("device_id query parameter is required".into())
+            })?,
+        };
         if device_id != session_device {
             return Err(AppError::Forbidden(
                 "device_id does not match the authenticated session".into(),
@@ -77,6 +93,7 @@ pub async fn ws_handler(
             device_id,
             session.session_hash,
             session.session_expires_at,
+            session.public_link.is_some(),
         )
     };
 
@@ -85,8 +102,8 @@ pub async fn ws_handler(
         .ok_or_else(|| AppError::Forbidden("Document access denied".into()))?;
     let session_revocations = state.session_revocations.subscribe();
     Ok(ws
-        .max_message_size(MAX_TEXT_BYTES)
-        .max_frame_size(MAX_TEXT_BYTES)
+        .max_message_size(MAX_SOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_SOCKET_MESSAGE_BYTES)
         .on_upgrade(move |socket| {
             handle_socket(
                 socket,
@@ -97,6 +114,7 @@ pub async fn ws_handler(
                 session_hash,
                 session_expires_at,
                 session_revocations,
+                read_only,
             )
         }))
 }
@@ -131,6 +149,7 @@ async fn handle_socket(
     session_hash: Option<Vec<u8>>,
     session_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     session_revocations: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    read_only: bool,
 ) {
     let (broadcast_tx, mut broadcast_rx) =
         rooms::join_or_create_async(&state.doc_rooms, doc_id).await;
@@ -186,7 +205,13 @@ async fn handle_socket(
         loop {
             let (message, revalidate) = tokio::select! {
                 result = broadcast_rx.recv() => match result {
-                    Ok(message) => (message, true),
+                    // Presence is ephemeral, already encrypted, and sent many
+                    // times a second; the periodic check and session
+                    // revocation cover it without a query per frame.
+                    Ok(message) => {
+                        let durable = !matches!(message, OutboundMessage::EncryptedPresence(_));
+                        (message, durable)
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         tracing::warn!(count, "WebSocket receiver lagged; closing");
                         break;
@@ -222,7 +247,13 @@ async fn handle_socket(
         let mut presence_count = 0_u32;
         let mut last_presence_counter = 0_u64;
         while let Some(result) = ws_receiver.next().await {
-            let Ok(message) = result else { break };
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::warn!(%doc_id, %device_id, %error, "WebSocket receive failed; closing");
+                    break;
+                }
+            };
             if message_window_started.elapsed() >= std::time::Duration::from_secs(1) {
                 message_window_started = std::time::Instant::now();
                 durable_count = 0;
@@ -231,10 +262,16 @@ async fn handle_socket(
             match message {
                 Message::Text(text) => {
                     if text.len() > MAX_TEXT_BYTES {
+                        tracing::warn!(%doc_id, %device_id, bytes = text.len(), "WebSocket message exceeds size limit");
                         send_error(&direct_tx, "WebSocket message exceeds size limit").await;
                         continue;
                     }
-                    match serde_json::from_str::<ClientWsMessage>(&text) {
+                    let message = serde_json::from_str::<ClientWsMessage>(&text);
+                    if read_only && !matches!(message, Ok(ClientWsMessage::Ping)) {
+                        send_error(&direct_tx, "Public links are read-only").await;
+                        continue;
+                    }
+                    match message {
                         Ok(ClientWsMessage::EncryptedUpdate {
                             doc_id: message_doc_id,
                             update_id,
@@ -243,7 +280,7 @@ async fn handle_socket(
                             aad_version,
                         }) => {
                             durable_count += 1;
-                            if durable_count > 30 {
+                            if durable_count > 120 {
                                 send_error(&direct_tx, "Durable update rate limit exceeded").await;
                                 continue;
                             }
@@ -353,18 +390,6 @@ async fn handle_socket(
                                 continue;
                             }
                             last_presence_counter = counter;
-                            if websocket_role(
-                                &db,
-                                doc_id,
-                                user_id,
-                                device_id,
-                                recv_session_hash.as_deref(),
-                            )
-                            .await
-                            .is_none()
-                            {
-                                break;
-                            }
                             let _ = broadcast_tx.send(OutboundMessage::EncryptedPresence(
                                 EncryptedPresenceFrame {
                                     message_type: "encrypted_presence",
@@ -586,6 +611,12 @@ mod tests {
                 },
                 resend_api_key: None,
                 resend_from_email: None,
+                smtp_host: None,
+                smtp_port: None,
+                smtp_username: None,
+                smtp_password: None,
+                smtp_from_email: None,
+                email_optional: false,
                 allowed_origins: vec!["https://inkstone.example".into()],
                 session_ttl_hours: 24,
                 cookie_secure: true,

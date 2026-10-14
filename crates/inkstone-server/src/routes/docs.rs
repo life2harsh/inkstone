@@ -41,6 +41,8 @@ struct DocRow {
     created_by: Uuid,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(default)]
+    current_seq: Option<i64>,
 }
 
 async fn create_doc(
@@ -115,7 +117,9 @@ async fn list_docs(
     let rows = sqlx::query_as::<_, DocRow>(
         "SELECT id, workspace_id, encrypted_title, title_nonce, title_projection_seq,
                 encrypted_path, path_nonce, path_projection_version,
-                created_by, created_at, updated_at
+                created_by, created_at, updated_at,
+                COALESCE((SELECT c.current_seq FROM doc_update_counters c WHERE c.doc_id = docs.id), 0)
+                    AS current_seq
          FROM docs WHERE workspace_id = $1 ORDER BY updated_at DESC",
     )
     .bind(workspace_id)
@@ -479,6 +483,7 @@ fn doc_response(row: DocRow) -> DocResponse {
         created_by: row.created_by,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        current_seq: row.current_seq,
     }
 }
 
