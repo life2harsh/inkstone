@@ -9,6 +9,14 @@ pub struct Config {
     pub public_base_url: String,
     pub resend_api_key: Option<String>,
     pub resend_from_email: Option<String>,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from_email: Option<String>,
+    /// Lets production run without an email provider. Invitation links are
+    /// then returned to the inviter to share by hand.
+    pub email_optional: bool,
     pub allowed_origins: Vec<String>,
     pub session_ttl_hours: i64,
     pub cookie_secure: bool,
@@ -28,6 +36,15 @@ impl fmt::Debug for Config {
                 &self.resend_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("resend_from_email", &self.resend_from_email)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_username", &self.smtp_username)
+            .field(
+                "smtp_password",
+                &self.smtp_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("smtp_from_email", &self.smtp_from_email)
+            .field("email_optional", &self.email_optional)
             .field("allowed_origins", &self.allowed_origins)
             .field("session_ttl_hours", &self.session_ttl_hours)
             .field("cookie_secure", &self.cookie_secure)
@@ -58,6 +75,17 @@ impl Config {
             }),
             resend_api_key: optional_env("RESEND_API_KEY")?,
             resend_from_email: optional_env("RESEND_FROM_EMAIL")?,
+            smtp_host: optional_env("SMTP_HOST")?,
+            smtp_port: std::env::var("SMTP_PORT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|_| "SMTP_PORT must be a valid u16".to_string())?,
+            smtp_username: optional_env("SMTP_USERNAME")?,
+            smtp_password: optional_env("SMTP_PASSWORD")?,
+            smtp_from_email: optional_env("SMTP_FROM_EMAIL")?,
+            email_optional: parse_bool("EMAIL_OPTIONAL", false)?,
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -114,8 +142,23 @@ impl Config {
         if self.resend_api_key.is_some() != self.resend_from_email.is_some() {
             return Err("RESEND_API_KEY and RESEND_FROM_EMAIL must be configured together".into());
         }
-        if !self.dev_auth && self.resend_api_key.is_none() {
-            return Err("RESEND_API_KEY and RESEND_FROM_EMAIL are required in production".into());
+        let smtp_host_set = self
+            .smtp_host
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if smtp_host_set != self.smtp_from_email.is_some() {
+            return Err("SMTP_HOST and SMTP_FROM_EMAIL must be configured together".into());
+        }
+        if smtp_host_set && self.smtp_port.is_some_and(|port| port == 0) {
+            return Err("SMTP_PORT must be between 1 and 65535".into());
+        }
+        let resend_configured = self.resend_api_key.is_some() && self.resend_from_email.is_some();
+        let smtp_configured = smtp_host_set && self.smtp_from_email.is_some();
+        if !self.dev_auth && !self.email_optional && !resend_configured && !smtp_configured {
+            return Err(
+                "an email provider is required in production (RESEND_API_KEY or SMTP_HOST)".into(),
+            );
         }
         if self.allowed_origins.iter().any(|origin| {
             !(origin.starts_with("https://")
@@ -193,6 +236,12 @@ mod tests {
             public_base_url: "https://inkstone.example".into(),
             resend_api_key: Some("re_secret".into()),
             resend_from_email: Some("Inkstone <setup@inkstone.example>".into()),
+            smtp_host: None,
+            smtp_port: None,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_email: None,
+            email_optional: false,
             allowed_origins: vec!["https://inkstone.example".into()],
             session_ttl_hours: 24,
             cookie_secure: true,
@@ -221,6 +270,46 @@ mod tests {
         assert!(config.validate().is_err());
         config.resend_from_email = None;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn smtp_provider_satisfies_production_email_requirement() {
+        let mut config = production_config();
+        config.resend_api_key = None;
+        config.resend_from_email = None;
+        assert!(config.validate().is_err());
+
+        config.smtp_host = Some("smtp.example.com".into());
+        config.smtp_from_email = Some("Inkstone <setup@inkstone.example>".into());
+        config.smtp_port = Some(587);
+        assert!(config.validate().is_ok());
+
+        config.smtp_from_email = None;
+        assert!(config.validate().is_err());
+        config.smtp_from_email = Some("Inkstone <setup@inkstone.example>".into());
+        config.smtp_port = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn production_may_opt_out_of_email() {
+        let mut config = production_config();
+        config.resend_api_key = None;
+        config.resend_from_email = None;
+        assert!(config.validate().is_err());
+        config.email_optional = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn smtp_credentials_are_redacted_in_debug_output() {
+        let mut config = production_config();
+        config.smtp_password = Some("smtp-secret".into());
+        config.smtp_host = Some("smtp.example.com".into());
+        config.smtp_from_email = Some("Inkstone <setup@inkstone.example>".into());
+        let output = format!("{:?}", config);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("smtp-secret"));
     }
 
     #[test]
