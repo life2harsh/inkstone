@@ -9,6 +9,16 @@ use web_sys::{Request, RequestCredentials, RequestInit, Response};
 
 thread_local! {
     static UNAUTHORIZED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
+    static LINK_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Reading through a public link sends its token instead of any session cookie.
+pub fn set_link_token(token: Option<String>) {
+    LINK_TOKEN.with(|current| *current.borrow_mut() = token);
+}
+
+pub fn link_token() -> Option<String> {
+    LINK_TOKEN.with(|current| current.borrow().clone())
 }
 
 pub fn set_unauthorized_handler(handler: Rc<dyn Fn()>) {
@@ -55,7 +65,12 @@ async fn request<B: Serialize>(
 ) -> Result<Response, ApiError> {
     let options = RequestInit::new();
     options.set_method(method);
-    options.set_credentials(RequestCredentials::Include);
+    let link = link_token();
+    options.set_credentials(if link.is_some() {
+        RequestCredentials::Omit
+    } else {
+        RequestCredentials::Include
+    });
     if let Some(body) = body {
         let json = serde_json::to_string(body).map_err(|error| ApiError {
             status: 0,
@@ -72,6 +87,12 @@ async fn request<B: Serialize>(
         request
             .headers()
             .set("Content-Type", "application/json")
+            .map_err(js_error)?;
+    }
+    if let Some(link) = link {
+        request
+            .headers()
+            .set("Authorization", &format!("Bearer {link}"))
             .map_err(js_error)?;
     }
     let window = web_sys::window().ok_or_else(|| ApiError {

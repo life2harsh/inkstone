@@ -2,7 +2,7 @@ use inkstone_client::ConfirmationPayload;
 use inkstone_core::CollaborativeTextSnapshot;
 use inkstone_core::doc_ops::DocumentUpdate;
 use inkstone_core::document::{BlockContent, InkstoneDocument};
-use inkstone_core::ids::DocId;
+use inkstone_core::ids::{DocId, UpdateId};
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_DOCUMENT_RECORD_VERSION: u32 = 4;
@@ -28,6 +28,8 @@ pub struct LocalDocumentRecord {
     pub text_snapshot: Option<CollaborativeTextSnapshot>,
     #[serde(default)]
     pub text_projection: Option<InkstoneDocument>,
+    #[serde(default)]
+    pub edited_at_ms: i64,
 }
 
 const fn legacy_record_version() -> u32 {
@@ -43,14 +45,22 @@ pub fn new_record(doc_id: DocId) -> LocalDocumentRecord {
         pending_updates: Vec::new(),
         text_snapshot: None,
         text_projection: None,
+        edited_at_ms: 0,
     }
 }
 
+pub fn note_edit(record: &mut LocalDocumentRecord, at_ms: i64) {
+    record.edited_at_ms = record.edited_at_ms.max(at_ms);
+}
+
+/// Stores the text state and its pending updates: `added` joins them and
+/// `confirmed`, now part of the snapshot's confirmed history, leaves them.
 pub fn apply_text_checkpoint(
     record: &mut LocalDocumentRecord,
     document: InkstoneDocument,
     snapshot: CollaborativeTextSnapshot,
-    pending_updates: Vec<DocumentUpdate>,
+    added: Vec<DocumentUpdate>,
+    confirmed: Option<UpdateId>,
 ) {
     if document.id != record.doc_id {
         return;
@@ -59,23 +69,19 @@ pub fn apply_text_checkpoint(
     preserve_collaborative_text(&mut record.confirmed_doc, &document);
     record.text_projection = Some(document);
     record.text_snapshot = Some(snapshot);
-    let mut merged = record
-        .pending_updates
-        .iter()
-        .filter(|update| {
-            !matches!(
-                update.op,
-                inkstone_core::DocumentOp::ApplyTextUpdateV2 { .. }
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    merged.extend(pending_updates);
-    record.pending_updates = merged;
+    for update in &added {
+        note_edit(record, update.applied_at_ms);
+    }
+    record.pending_updates.retain(|update| {
+        Some(update.update_id) != confirmed
+            && !added.iter().any(|new| new.update_id == update.update_id)
+    });
+    record.pending_updates.extend(added);
 }
 
 pub fn append_pending_update(record: &mut LocalDocumentRecord, update: DocumentUpdate) {
     record.version = LOCAL_DOCUMENT_RECORD_VERSION;
+    note_edit(record, update.applied_at_ms);
     if !record
         .pending_updates
         .iter()
