@@ -26,6 +26,10 @@ pub fn workspace_metadata_aad(workspace_id: Uuid) -> Vec<u8> {
     format!("inkstone:v1:workspace-metadata:{workspace_id}").into_bytes()
 }
 
+pub fn guest_name_aad(workspace_id: Uuid) -> Vec<u8> {
+    format!("inkstone:v1:guest-name:{workspace_id}").into_bytes()
+}
+
 pub fn account_vault_aad(user_id: Uuid, kind: &str) -> Vec<u8> {
     format!("inkstone:v1:account-vault:{user_id}:{kind}").into_bytes()
 }
@@ -58,9 +62,41 @@ pub fn snapshot_aad(workspace_id: Uuid, doc_id: Uuid, base_seq: i64) -> Vec<u8> 
     format!("inkstone:v1:snapshot:{workspace_id}:{doc_id}:{base_seq}").into_bytes()
 }
 
+pub const MIN_PASSWORD_BYTES: usize = 12;
+
+pub fn check_new_password(password: &str) -> Result<(), String> {
+    if password.len() < MIN_PASSWORD_BYTES {
+        return Err(format!(
+            "Use at least {MIN_PASSWORD_BYTES} characters for your password"
+        ));
+    }
+    if password.len() > 1024 {
+        return Err("Password must be at most 1024 bytes".into());
+    }
+    Ok(())
+}
+
+/// What the server sees instead of the password. The vault key is derived
+/// from the password separately, so the server can't unlock anything.
+pub fn login_secret(password: &str, email: &str) -> Result<String, String> {
+    if password.is_empty() || password.len() > 1024 {
+        return Err("Password must be between 1 and 1024 bytes".into());
+    }
+    let mut salt_hash = Sha256::new();
+    salt_hash.update(b"inkstone:v1:login-salt:");
+    salt_hash.update(email.trim().to_lowercase().as_bytes());
+    let salt = salt_hash.finalize();
+    let params = Params::new(19 * 1024, 2, 1, Some(32)).map_err(|e| e.to_string())?;
+    let mut secret = [0_u8; 32];
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(password.as_bytes(), &salt[..16], &mut secret)
+        .map_err(|e| e.to_string())?;
+    Ok(secret.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 pub fn derive_account_kek(passphrase: &str, user_id: Uuid) -> Result<[u8; 32], String> {
     if passphrase.is_empty() || passphrase.len() > 1024 {
-        return Err("Vault passphrase must be between 1 and 1024 bytes".into());
+        return Err("Password must be between 1 and 1024 bytes".into());
     }
     let mut salt_hash = Sha256::new();
     salt_hash.update(b"inkstone:v1:account-kek-salt:");
@@ -214,6 +250,26 @@ pub fn decrypt(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_secret_ignores_email_case_and_differs_from_the_vault_key() {
+        let user = Uuid::from_u128(7);
+        let secret = login_secret("correct horse battery", " Owner@Example.test ").unwrap();
+        assert_eq!(secret.len(), 64);
+        assert_eq!(
+            secret,
+            login_secret("correct horse battery", "owner@example.test").unwrap()
+        );
+        assert_ne!(
+            secret,
+            login_secret("correct horse battery", "other@example.test").unwrap()
+        );
+        let kek = derive_account_kek("correct horse battery", user).unwrap();
+        let kek_hex: String = kek.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_ne!(secret, kek_hex);
+        assert!(check_new_password("short").is_err());
+        assert!(check_new_password("long enough now").is_ok());
+    }
+
     use super::*;
     use inkstone_core::{
         CollaborativeTextUpdate, DOCUMENT_UPDATE_V2_VERSION, DocId, DocumentOp, DocumentUpdate,
