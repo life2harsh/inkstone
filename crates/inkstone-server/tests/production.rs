@@ -6,14 +6,15 @@ use futures_util::{SinkExt, StreamExt};
 use inkstone_core::UpdateId;
 use inkstone_core::protocol::{
     AcceptInvitationRequest, AcceptInvitationResponse, ApproveInvitationKeyRequest,
-    AuthUserResponse, ClientWsMessage, ConsumeEmailVerificationRequest,
+    AuthUserResponse, ChangePasswordRequest, ClientWsMessage, ConsumeEmailVerificationRequest,
     ConsumePasswordResetRequest, CreateDocRequest, CreateInvitationRequest,
-    CreateInvitationResponse, CreateWorkspaceRequest, InvitationKeyRequestResponse,
-    InvitationRegisterRequest, LoginRequest, OwnerSetupRequest, PostUpdateRequest,
-    PutWorkspaceKeyEnvelopeRequest, RecoveryEnvelopeRequest, RecoveryEnvelopeResponse,
-    RegisterRequest, ServerWsMessage, SubmitInvitationKeyRequest, TransferOwnershipRequest,
-    UpdateDocPathProjectionRequest, UpdateMemberRoleRequest, WorkspaceKeyEnvelopeResponse,
-    WorkspaceResponse,
+    CreateInvitationResponse, CreateWorkspaceRequest, EncryptedGuestName, GuestJoinRequest,
+    GuestJoinResponse, InvitationKeyRequestResponse, InvitationRegisterRequest, LoginRequest,
+    OwnerSetupRequest, PostUpdateRequest, PublicLinkAccessRequest, PublicLinkRequest,
+    PublicLinkResponse, PutWorkspaceKeyEnvelopeRequest, RecoveryEnvelopeRequest,
+    RecoveryEnvelopeResponse, RegisterRequest, ServerWsMessage, SubmitInvitationKeyRequest,
+    TransferOwnershipRequest, UpdateDocPathProjectionRequest, UpdateMemberRoleRequest,
+    WorkspaceKeyEnvelopeResponse, WorkspaceResponse,
 };
 use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
 use serde_json::Value;
@@ -217,6 +218,7 @@ async fn owner_setup_register(
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token,
+            email: Some(email.to_uppercase()),
             password: PASSWORD.into(),
             device_id,
             device_name: Some("test device".into()),
@@ -266,6 +268,7 @@ async fn owner_setup_sessions_login_logout_and_fail_closed_dev_auth() {
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token: inkstone_server::auth::new_secret(),
+            email: None,
             password: PASSWORD.into(),
             device_id,
             device_name: None,
@@ -287,6 +290,7 @@ async fn owner_setup_sessions_login_logout_and_fail_closed_dev_auth() {
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token: expired_token,
+            email: None,
             password: PASSWORD.into(),
             device_id,
             device_name: None,
@@ -301,6 +305,7 @@ async fn owner_setup_sessions_login_logout_and_fail_closed_dev_auth() {
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token: first_token,
+            email: None,
             password: PASSWORD.into(),
             device_id,
             device_name: None,
@@ -322,12 +327,13 @@ async fn owner_setup_sessions_login_logout_and_fail_closed_dev_auth() {
         .send()
         .await
         .unwrap();
-    assert_eq!(email_override.status(), 422);
+    assert_eq!(email_override.status(), 400);
 
     let response = client()
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token: token.clone(),
+            email: None,
             password: PASSWORD.into(),
             device_id,
             device_name: Some("test device".into()),
@@ -366,6 +372,7 @@ async fn owner_setup_sessions_login_logout_and_fail_closed_dev_auth() {
         .post(format!("{base}/api/auth/owner-setup"))
         .json(&OwnerSetupRequest {
             token,
+            email: None,
             password: PASSWORD.into(),
             device_id: Uuid::new_v4(),
             device_name: None,
@@ -426,6 +433,7 @@ async fn owner_setup_completion_is_atomic() {
     let (base, pool) = setup_production().await;
     let token = issue_owner_setup(&pool, "owner@example.com").await;
     let request = |device_id| OwnerSetupRequest {
+        email: None,
         token: token.clone(),
         password: PASSWORD.into(),
         device_id,
@@ -885,6 +893,81 @@ async fn websocket_rechecks_membership_before_broadcast_delivery() {
     assert_socket_closes(&mut socket).await;
 }
 
+#[tokio::test]
+async fn members_rewrap_their_own_key_envelope_only_at_the_version_they_read() {
+    let (base, pool) = setup_production().await;
+    let (_owner, owner_cookie) =
+        owner_setup_register(&base, &pool, "owner@example.com", Uuid::new_v4()).await;
+    let (member, member_cookie) =
+        invite_and_register(&base, &owner_cookie, "member@example.com", Uuid::new_v4()).await;
+    let workspace: WorkspaceResponse = client()
+        .post(format!("{base}/api/workspaces"))
+        .header(COOKIE, &owner_cookie)
+        .json(&workspace_request())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'editor')",
+    )
+    .bind(workspace.id)
+    .bind(member.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO encrypted_workspace_keys (workspace_id, user_id, encrypted_key, nonce, aad_version, version)
+         VALUES ($1, $2, $3, $4, 1, 1)",
+    )
+    .bind(workspace.id)
+    .bind(member.id)
+    .bind(b"sealed-to-one-device".to_vec())
+    .bind(b"123456789012".to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let endpoint = format!("{base}/api/workspaces/{}/key-envelope", workspace.id);
+    let put = |cookie: &str, replace_version: Option<i64>| {
+        client()
+            .put(&endpoint)
+            .header(COOKIE, cookie)
+            .json(&PutWorkspaceKeyEnvelopeRequest {
+                encrypted_key_b64: b64_encode(b"wrapped-for-the-account"),
+                nonce_b64: b64_encode(b"abcdefghijkl"),
+                aad_version: 1,
+                replace_version,
+            })
+            .send()
+    };
+
+    assert_eq!(put(&member_cookie, None).await.unwrap().status(), 403);
+    assert_eq!(put(&member_cookie, Some(7)).await.unwrap().status(), 409);
+    let replaced = put(&member_cookie, Some(1)).await.unwrap();
+    assert_eq!(replaced.status(), 200);
+    let replaced: WorkspaceKeyEnvelopeResponse = replaced.json().await.unwrap();
+    assert_eq!(replaced.version, 2);
+    assert_eq!(put(&member_cookie, Some(1)).await.unwrap().status(), 409);
+
+    let stored: WorkspaceKeyEnvelopeResponse = client()
+        .get(&endpoint)
+        .header(COOKIE, &member_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored.user_id, member.id);
+    assert_eq!(stored.version, 2);
+    assert_eq!(
+        stored.encrypted_key_b64,
+        b64_encode(b"wrapped-for-the-account")
+    );
+}
+
 #[allow(dead_code)]
 async fn workspace_key_envelopes_are_validated_upserted_and_user_isolated() {
     let (base, pool) = setup_production().await;
@@ -930,6 +1013,7 @@ async fn workspace_key_envelopes_are_validated_upserted_and_user_isolated() {
             encrypted_key_b64: b64_encode(owner_ciphertext),
             nonce_b64: b64_encode(b"123456789012"),
             aad_version: 1,
+            replace_version: None,
         })
         .send()
         .await
@@ -950,6 +1034,7 @@ async fn workspace_key_envelopes_are_validated_upserted_and_user_isolated() {
             encrypted_key_b64: b64_encode(member_ciphertext),
             nonce_b64: b64_encode(b"abcdefghijkl"),
             aad_version: 1,
+            replace_version: None,
         })
         .send()
         .await
@@ -1032,6 +1117,7 @@ async fn workspace_key_envelopes_are_validated_upserted_and_user_isolated() {
             encrypted_key_b64: b64_encode(replacement),
             nonce_b64: b64_encode(b"210987654321"),
             aad_version: 1,
+            replace_version: None,
         })
         .send()
         .await
@@ -1060,21 +1146,25 @@ async fn workspace_key_envelopes_are_validated_upserted_and_user_isolated() {
             encrypted_key_b64: b64_encode(b"valid-encrypted-key"),
             nonce_b64: b64_encode(b"short-nonce"),
             aad_version: 1,
+            replace_version: None,
         },
         PutWorkspaceKeyEnvelopeRequest {
             encrypted_key_b64: b64_encode(b"valid-encrypted-key"),
             nonce_b64: b64_encode(b"123456789012"),
             aad_version: 2,
+            replace_version: None,
         },
         PutWorkspaceKeyEnvelopeRequest {
             encrypted_key_b64: b64_encode(b"too-short"),
             nonce_b64: b64_encode(b"123456789012"),
             aad_version: 1,
+            replace_version: None,
         },
         PutWorkspaceKeyEnvelopeRequest {
             encrypted_key_b64: b64_encode(&vec![0_u8; 65_537]),
             nonce_b64: b64_encode(b"123456789012"),
             aad_version: 1,
+            replace_version: None,
         },
     ] {
         let response = client()
@@ -1623,10 +1713,22 @@ async fn verification_and_reset_tokens_are_expiring_single_use_and_non_enumerati
         "1 hour",
     )
     .await;
+    let wrong_email = client()
+        .post(format!("{base}/api/auth/password-reset/consume"))
+        .json(&ConsumePasswordResetRequest {
+            token: reset.clone(),
+            email: Some("someone-else@example.com".into()),
+            password: "replacement horse battery staple".into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_email.status(), 400);
     let reset_response = client()
         .post(format!("{base}/api/auth/password-reset/consume"))
         .json(&ConsumePasswordResetRequest {
             token: reset.clone(),
+            email: None,
             password: "replacement horse battery staple".into(),
         })
         .send()
@@ -1638,12 +1740,13 @@ async fn verification_and_reset_tokens_are_expiring_single_use_and_non_enumerati
             .text()
             .await
             .unwrap()
-            .contains("does not recover")
+            .contains("recovery key")
     );
     let replay = client()
         .post(format!("{base}/api/auth/password-reset/consume"))
         .json(&ConsumePasswordResetRequest {
             token: reset,
+            email: None,
             password: "another replacement password".into(),
         })
         .send()
@@ -1657,4 +1760,499 @@ async fn verification_and_reset_tokens_are_expiring_single_use_and_non_enumerati
         .await
         .unwrap();
     assert_eq!(old_session.status(), 401);
+}
+
+#[tokio::test]
+async fn password_changes_only_with_the_current_password_and_rewraps_the_vault() {
+    let (base, pool) = setup_production().await;
+    let device_id = Uuid::new_v4();
+    let (_, cookie) = owner_setup_register(&base, &pool, "owner@example.com", device_id).await;
+    let envelope = |version, text: &[u8]| RecoveryEnvelopeRequest {
+        kind: "passphrase".into(),
+        expected_version: version,
+        ciphertext_b64: b64_encode(text),
+        nonce_b64: b64_encode(b"123456789012"),
+        aad_version: 1,
+        wrapping_version: 1,
+    };
+    let put = client()
+        .put(format!("{base}/api/auth/recovery-envelopes"))
+        .header(COOKIE, &cookie)
+        .json(&envelope(None, b"vault key wrapped by the old one"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let change = |current: &str, version| {
+        client()
+            .post(format!("{base}/api/auth/password"))
+            .header(COOKIE, &cookie)
+            .json(&ChangePasswordRequest {
+                current_password: current.into(),
+                new_password: "brand new password here".into(),
+                passphrase_envelope: envelope(version, b"vault key wrapped by the new one"),
+            })
+            .send()
+    };
+    assert_eq!(
+        change("not the password at all", Some(1))
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(change(PASSWORD, Some(7)).await.unwrap().status(), 409);
+    let login = |password: &str| {
+        client()
+            .post(format!("{base}/api/auth/login"))
+            .json(&LoginRequest {
+                email: "owner@example.com".into(),
+                password: password.into(),
+                device_id,
+                device_name: None,
+            })
+            .send()
+    };
+    assert_eq!(login(PASSWORD).await.unwrap().status(), 200);
+    assert_eq!(change(PASSWORD, Some(1)).await.unwrap().status(), 200);
+    assert_eq!(login(PASSWORD).await.unwrap().status(), 401);
+    assert_eq!(
+        login("brand new password here").await.unwrap().status(),
+        200
+    );
+    let stored: Vec<RecoveryEnvelopeResponse> = client()
+        .get(format!("{base}/api/auth/recovery-envelopes"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored[0].version, 2);
+    assert_eq!(
+        stored[0].ciphertext_b64,
+        b64_encode(b"vault key wrapped by the new one")
+    );
+}
+
+#[tokio::test]
+async fn public_links_read_one_vault_and_nothing_else() {
+    let (base, pool) = setup_production().await;
+    let (_, cookie) = owner_setup_register(&base, &pool, "owner@example.com", Uuid::new_v4()).await;
+    let (workspace, doc_id) = create_workspace_doc(&base, &cookie).await;
+    let (other, _) = create_workspace_doc(&base, &cookie).await;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]);
+    let link_path = format!("{base}/api/workspaces/{}/public-link", workspace.id);
+
+    let short = client()
+        .put(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkRequest {
+            token: "too-short".into(),
+            editable: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status(), 400);
+    let enabled: WorkspaceResponse = client()
+        .put(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkRequest {
+            token: token.clone(),
+            editable: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(enabled.public_link);
+    assert_eq!(enabled.member_count, 1);
+
+    let bearer = format!("Bearer {token}");
+    let get = |path: String| {
+        client()
+            .get(format!("{base}{path}"))
+            .header("authorization", &bearer)
+            .send()
+    };
+    let details: PublicLinkResponse = get("/api/public-link".into())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(details.workspace.id, workspace.id);
+    for path in [
+        format!("/api/workspaces/{}/docs", workspace.id),
+        format!("/api/workspaces/{}/path-projections", workspace.id),
+        format!("/api/docs/{doc_id}/updates?after_seq=0"),
+    ] {
+        assert_eq!(get(path.clone()).await.unwrap().status(), 200, "{path}");
+    }
+    for path in [
+        format!("/api/workspaces/{}/docs", other.id),
+        format!("/api/workspaces/{}/members", workspace.id),
+        format!("/api/workspaces/{}/invitations", workspace.id),
+        "/api/workspaces".into(),
+        "/api/auth/me".into(),
+        "/api/auth/devices".into(),
+    ] {
+        assert_eq!(get(path.clone()).await.unwrap().status(), 403, "{path}");
+    }
+    let create = client()
+        .post(format!("{base}/api/workspaces"))
+        .header("authorization", &bearer)
+        .json(&workspace_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 403);
+    let as_cookie = client()
+        .get(format!("{base}/api/public-link"))
+        .header(COOKIE, format!("inkstone_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(as_cookie.status(), 401);
+
+    let members: Value = client()
+        .get(format!("{base}/api/workspaces/{}/members", workspace.id))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["items"].as_array().unwrap().len(), 1);
+
+    let url = format!(
+        "{}/api/sync/docs/{doc_id}/ws?link={token}",
+        base.replace("http", "ws")
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", "https://inkstone.test".parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    assert!(ready.contains("ready"), "{ready}");
+    let write = ClientWsMessage::EncryptedUpdate {
+        doc_id,
+        update_id: UpdateId::new_v4(),
+        encrypted_update_b64: b64_encode(b"an anonymous edit attempt"),
+        nonce_b64: b64_encode(b"123456789012"),
+        aad_version: 1,
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&write).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert!(reply.contains("Public links are read-only"), "{reply}");
+
+    let disabled: WorkspaceResponse = client()
+        .delete(&link_path)
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!disabled.public_link);
+    assert_eq!(get("/api/public-link".into()).await.unwrap().status(), 401);
+    assert_socket_closes(&mut socket).await;
+
+    client()
+        .put(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkRequest {
+            token,
+            editable: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    let deleted = client()
+        .delete(format!("{base}/api/workspaces/{}", workspace.id))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+    let leftover: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE public_link_workspace_id IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover, 0);
+}
+
+#[tokio::test]
+async fn guests_join_an_editable_link_and_work_only_in_that_vault() {
+    let (base, pool) = setup_production().await;
+    let (_, cookie) = owner_setup_register(&base, &pool, "owner@example.com", Uuid::new_v4()).await;
+    let (workspace, doc_id) = create_workspace_doc(&base, &cookie).await;
+    let (other, _) = create_workspace_doc(&base, &cookie).await;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]);
+    let link_path = format!("{base}/api/workspaces/{}/public-link", workspace.id);
+    let name = EncryptedGuestName {
+        ciphertext_b64: b64_encode(b"an encrypted guest name"),
+        nonce_b64: b64_encode(b"123456789012"),
+    };
+    let join = |bearer: String| {
+        client()
+            .post(format!("{base}/api/public-link/guests"))
+            .header("authorization", bearer)
+            .json(&GuestJoinRequest { name: name.clone() })
+            .send()
+    };
+
+    let view_only: WorkspaceResponse = client()
+        .put(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkRequest {
+            token: token.clone(),
+            editable: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(view_only.public_link && !view_only.public_link_editable);
+    assert_eq!(join(format!("Bearer {token}")).await.unwrap().status(), 403);
+
+    let editable: WorkspaceResponse = client()
+        .patch(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkAccessRequest { editable: true })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(editable.public_link_editable);
+
+    let guest: GuestJoinResponse = join(format!("Bearer {token}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bearer = format!("Bearer {}", guest.token);
+    let details: PublicLinkResponse = client()
+        .get(format!("{base}/api/public-link"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(details.workspace.id, workspace.id);
+    assert_eq!(details.user_id, guest.user_id);
+    assert_eq!(details.guest, Some(name.clone()));
+    assert_eq!(details.workspace.member_count, 1);
+    assert_eq!(details.workspace.guest_count, 1);
+
+    let post_update = |label: &'static [u8]| {
+        client()
+            .post(format!("{base}/api/docs/{doc_id}/updates"))
+            .header("authorization", &bearer)
+            .json(&PostUpdateRequest {
+                encrypted_update_b64: b64_encode(label),
+                nonce_b64: b64_encode(b"123456789012"),
+                aad_version: 1,
+                update_id: UpdateId::new_v4(),
+                sender_device_id: guest.device_id,
+            })
+            .send()
+    };
+    assert_eq!(
+        post_update(b"an encrypted guest edit")
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let new_doc = client()
+        .post(format!("{base}/api/workspaces/{}/docs", workspace.id))
+        .header("authorization", &bearer)
+        .json(&CreateDocRequest {
+            doc_id: Uuid::new_v4(),
+            encrypted_title_b64: Some(b64_encode(b"encrypted guest title")),
+            title_nonce_b64: Some(b64_encode(b"123456789012")),
+            encrypted_path_b64: b64_encode(b"encrypted guest path"),
+            path_nonce_b64: b64_encode(b"abcdefghijkl"),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(new_doc.status(), 200);
+
+    for path in [
+        format!("/api/workspaces/{}/docs", other.id),
+        format!("/api/workspaces/{}/members", workspace.id),
+        format!("/api/workspaces/{}/invitations", workspace.id),
+        "/api/workspaces".into(),
+        "/api/auth/me".into(),
+        "/api/auth/devices".into(),
+    ] {
+        let status = client()
+            .get(format!("{base}{path}"))
+            .header("authorization", &bearer)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 403, "{path}");
+    }
+    assert_eq!(join(bearer.clone()).await.unwrap().status(), 403);
+    let as_cookie = client()
+        .get(format!("{base}/api/public-link"))
+        .header(COOKIE, format!("inkstone_session={}", guest.token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(as_cookie.status(), 401);
+
+    let url = format!(
+        "{}/api/sync/docs/{doc_id}/ws?link={}",
+        base.replace("http", "ws"),
+        guest.token
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", "https://inkstone.test".parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    assert!(ready.contains("ready"), "{ready}");
+    let write = ClientWsMessage::EncryptedUpdate {
+        doc_id,
+        update_id: UpdateId::new_v4(),
+        encrypted_update_b64: b64_encode(b"a live guest edit"),
+        nonce_b64: b64_encode(b"123456789012"),
+        aad_version: 1,
+    };
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&write).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert!(!reply.contains("error"), "{reply}");
+
+    let members: Value = client()
+        .get(format!("{base}/api/workspaces/{}/members", workspace.id))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = members["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let listed = items
+        .iter()
+        .find(|item| item["user_id"] == guest.user_id.to_string())
+        .unwrap();
+    assert_eq!(listed["role"], "editor");
+    assert_eq!(listed["guest_name"]["nonce_b64"], name.nonce_b64);
+
+    client()
+        .patch(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkAccessRequest { editable: false })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_update(b"an encrypted late guest edit")
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    let removed = client()
+        .delete(format!(
+            "{base}/api/workspaces/{}/members/{}",
+            workspace.id, guest.user_id
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+    assert_socket_closes(&mut socket).await;
+    let after_removal = client()
+        .get(format!("{base}/api/public-link"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after_removal.status(), 401);
+
+    client()
+        .patch(&link_path)
+        .header(COOKIE, &cookie)
+        .json(&PublicLinkAccessRequest { editable: true })
+        .send()
+        .await
+        .unwrap();
+    let second: GuestJoinResponse = join(format!("Bearer {token}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let disabled: WorkspaceResponse = client()
+        .delete(&link_path)
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!disabled.public_link && !disabled.public_link_editable);
+    assert_eq!(disabled.guest_count, 0);
+    let gone = client()
+        .get(format!("{base}/api/public-link"))
+        .header("authorization", format!("Bearer {}", second.token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 401);
+    let leftover: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_members m JOIN users u ON u.id = m.user_id WHERE u.guest_workspace_id IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover, 0);
 }
