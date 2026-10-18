@@ -5,14 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>Inkstone</title>
-    <link rel="icon" href="data:," />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#191919" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div id="root"></div>
     <script type="module">
       import init from './pkg/inkstone_web.js';
+      window.inkstonePdf = () => import('/vendor/pdfjs-4.10.38/pdf.min.mjs');
       init().catch(console.error);
+      if ('serviceWorker' in navigator && !navigator.webdriver) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      }
     </script>
   </body>
 </html>
