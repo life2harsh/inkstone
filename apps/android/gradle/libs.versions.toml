@@ -1,0 +1,13 @@
+[versions]
+agp = "9.2.1"
+activity = "1.13.0"
+core = "1.18.0"
+webkit = "1.15.0"
+
+[libraries]
+activity-ktx = { group = "androidx.activity", name = "activity-ktx", version.ref = "activity" }
+core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "core" }
+webkit = { group = "androidx.webkit", name = "webkit", version.ref = "webkit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }

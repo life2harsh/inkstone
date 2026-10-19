@@ -1,0 +1,6 @@
+<resources>
+    <color name="app_background">#0F0F0F</color>
+    <color name="page_background">#191919</color>
+    <color name="ink">#E6E5E3</color>
+    <color name="ink_muted">#9B9A97</color>
+</resources>
