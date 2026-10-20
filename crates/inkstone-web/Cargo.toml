@@ -14,6 +14,7 @@ inkstone-client = { path = "../inkstone-client" }
 inkstone-core = { path = "../inkstone-core" }
 inkstone-workspace = { path = "../inkstone-workspace" }
 stonepen-wasm = { path = "../../stonepen/crates/stonepen-wasm" }
+stonepen-core = { path = "../../stonepen/crates/stonepen-core" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -40,6 +41,7 @@ features = [
     "Window",
     "Document",
     "Element",
+    "FocusOptions",
     "HtmlElement",
     "HtmlInputElement",
     "HtmlTextAreaElement",
@@ -62,6 +64,7 @@ features = [
     "IdbVersionChangeEvent",
     "DomStringList",
     "HtmlAnchorElement",
+    "HtmlIFrameElement",
     "HtmlSelectElement",
     "Blob",
     "BlobPropertyBag",
@@ -81,4 +84,40 @@ features = [
     "CloseEvent",
     "Location",
     "History",
+    "PointerEvent",
+    "DomRect",
+    "CssStyleDeclaration",
+    "AddEventListenerOptions",
+    "EventListenerOptions",
+    "HtmlCanvasElement",
+    "HtmlImageElement",
+    "CanvasRenderingContext2d",
+    "ResizeObserver",
+    "HtmlCollection",
+    "Range",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
+    "RtcPeerConnection",
+    "RtcConfiguration",
+    "RtcIceServer",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelEvent",
+    "RtcDataChannelState",
+    "RtcPeerConnectionIceEvent",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcSdpType",
+    "RtcPeerConnectionState",
+    "PointerEventInit",
+    "ClipboardEvent",
+    "DataTransfer",
+    "DragEvent",
+    "DomRectList",
+    "Node",
 ]
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = ["-O", "-g"]
