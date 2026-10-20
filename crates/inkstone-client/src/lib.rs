@@ -1,5 +1,7 @@
 pub mod assets;
 pub mod inbox;
+pub mod page_ink;
+pub mod page_text;
 pub mod text_sync;
 
 use std::collections::VecDeque;
@@ -13,18 +15,15 @@ use serde::{Deserialize, Serialize};
 use crate::inbox::SequencedInbox;
 
 fn update_version(op: &DocumentOp) -> u32 {
-    match op {
-        DocumentOp::ApplyTextUpdateV2 { .. } | DocumentOp::ApplyInkUpdateV2 { .. } => {
-            inkstone_core::doc_ops::DOCUMENT_UPDATE_V2_VERSION
-        }
-        _ => inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION,
-    }
+    op.update_version()
 }
 
+/// Updates the main document state machine applies itself. Text v2 updates
+/// are owned by the collaborative text state instead.
 fn main_state_update_supported(update: &DocumentUpdate) -> bool {
     update.version == inkstone_core::doc_ops::DOCUMENT_UPDATE_VERSION
         || update.version == inkstone_core::doc_ops::DOCUMENT_UPDATE_V2_VERSION
-            && matches!(update.op, DocumentOp::ApplyInkUpdateV2 { .. })
+            && !matches!(update.op, DocumentOp::ApplyTextUpdateV2 { .. })
 }
 
 // ── Public token types ─────────────────────────────────────────────────────
@@ -226,6 +225,7 @@ struct PendingConfirmationState {
     payload: ConfirmationPayload,
     persistence_retries: u8,
     replay_conflict: Option<PendingConflict>,
+    known_pending: Vec<UpdateId>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +240,8 @@ pub struct ClientState {
     pending_intent: Option<PreparedLocalUpdate>,
     local_persistence_failed: bool,
     intent_queue: VecDeque<QueuedIntent>,
+    /// The view with queued intents applied too, while any are queued.
+    optimistic_view_doc: Option<InkstoneDocument>,
     pending_confirmation: Option<PendingConfirmationState>,
     next_confirm_token: u64,
     pending_conflicts: Vec<PendingConflict>,
@@ -277,6 +279,7 @@ impl ClientState {
             pending_intent: None,
             local_persistence_failed: false,
             intent_queue: VecDeque::new(),
+            optimistic_view_doc: None,
             pending_confirmation: None,
             next_confirm_token: 0,
             pending_conflicts: Vec::new(),
@@ -319,7 +322,12 @@ impl ClientState {
     /// local intent that has not yet been persisted. This is needed for
     /// preview rendering that must reflect the most recent edit even
     /// before the async IndexedDB write completes.
+    /// What the user should see: the view with the intent being persisted
+    /// and every intent queued behind it applied.
     pub fn effective_view_doc(&self) -> &InkstoneDocument {
+        if let Some(optimistic) = &self.optimistic_view_doc {
+            return optimistic;
+        }
         match &self.pending_intent {
             Some(prepared) => &prepared.candidate_view_doc,
             None => &self.view_doc,
@@ -336,6 +344,12 @@ impl ClientState {
 
     pub fn errors(&self) -> &[String] {
         &self.errors
+    }
+
+    pub fn pending_intent_op(&self) -> Option<&DocumentOp> {
+        self.pending_intent
+            .as_ref()
+            .map(|prepared| &prepared.update.op)
     }
 
     pub fn has_pending_intent(&self) -> bool {
@@ -435,31 +449,50 @@ impl ClientState {
     fn rebuild_view(&mut self) {
         let mut doc = self.confirmed_doc.clone();
         self.pending_conflicts.clear();
-        for update in &self.pending_local {
-            match sequenced_replay(&mut doc, update.clone()) {
-                ReplayOutcome::Fatal { .. } => {
-                    self.phase = SessionPhase::Error;
-                    self.errors.push("Fatal during view rebuild".into());
-                    return;
-                }
-                ReplayOutcome::Adjusted { reason } => {
-                    self.pending_conflicts.push(PendingConflict {
-                        update_id: update.update_id,
-                        outcome: "Adjusted".into(),
-                        reason,
-                    });
-                }
-                ReplayOutcome::NoOp { conflict } => {
-                    self.pending_conflicts.push(PendingConflict {
-                        update_id: update.update_id,
-                        outcome: "NoOp".into(),
-                        reason: conflict,
-                    });
-                }
-                _ => {}
+        let pending = std::mem::take(&mut self.pending_local);
+        for update in &pending {
+            if !self.replay_into(&mut doc, update) {
+                self.pending_local = pending;
+                return;
             }
         }
+        self.pending_local = pending;
         self.view_doc = doc;
+    }
+
+    fn extend_view(&mut self, update: &DocumentUpdate) {
+        let mut doc = std::mem::replace(&mut self.view_doc, InkstoneDocument::new(self.doc_id));
+        let applied = self.replay_into(&mut doc, update);
+        self.view_doc = doc;
+        if !applied {
+            self.rebuild_view();
+        }
+    }
+
+    fn replay_into(&mut self, doc: &mut InkstoneDocument, update: &DocumentUpdate) -> bool {
+        match sequenced_replay(doc, update.clone()) {
+            ReplayOutcome::Fatal { .. } => {
+                self.phase = SessionPhase::Error;
+                self.errors.push("Fatal during view rebuild".into());
+                return false;
+            }
+            ReplayOutcome::Adjusted { reason } => {
+                self.pending_conflicts.push(PendingConflict {
+                    update_id: update.update_id,
+                    outcome: "Adjusted".into(),
+                    reason,
+                });
+            }
+            ReplayOutcome::NoOp { conflict } => {
+                self.pending_conflicts.push(PendingConflict {
+                    update_id: update.update_id,
+                    outcome: "NoOp".into(),
+                    reason: conflict,
+                });
+            }
+            _ => {}
+        }
+        true
     }
 
     fn enter_live(&mut self) -> Vec<Effect> {
@@ -628,6 +661,11 @@ impl ClientState {
                     payload,
                     persistence_retries: 0,
                     replay_conflict,
+                    known_pending: self
+                        .pending_local
+                        .iter()
+                        .map(|update| update.update_id)
+                        .collect(),
                 });
                 break;
             }
@@ -667,7 +705,13 @@ impl ClientState {
 
         self.confirmed_doc = payload.confirmed_doc;
         self.confirmed_seq = payload.confirmed_seq;
-        self.pending_local = payload.pending_updates_after_rebase;
+        let mut pending = payload.pending_updates_after_rebase;
+        pending.extend(
+            self.pending_local
+                .drain(..)
+                .filter(|update| !stored.known_pending.contains(&update.update_id)),
+        );
+        self.pending_local = pending;
         self.rebuild_view();
         if let Some(conflict) = stored.replay_conflict {
             self.pending_conflicts.push(conflict);
@@ -707,6 +751,39 @@ impl ClientState {
     }
 
     pub fn transition(&mut self, event: ClientEvent) -> Vec<Effect> {
+        let effects = self.apply_event(event);
+        self.refresh_optimistic_view();
+        effects
+    }
+
+    /// Recomputes [`Self::effective_view_doc`] for queued intents, so a
+    /// block inserted while another edit is still persisting shows at once.
+    fn refresh_optimistic_view(&mut self) {
+        if self.intent_queue.is_empty() {
+            self.optimistic_view_doc = None;
+            return;
+        }
+        let mut document = match &self.pending_intent {
+            Some(prepared) => prepared.candidate_view_doc.clone(),
+            None => self.view_doc.clone(),
+        };
+        for queued in &self.intent_queue {
+            let update = DocumentUpdate {
+                version: update_version(&queued.op),
+                update_id: queued.update_id,
+                doc_id: self.doc_id,
+                applied_at_ms: queued.applied_at_ms,
+                op: queued.op.clone(),
+            };
+            let mut candidate = document.clone();
+            if inkstone_core::doc_ops::apply_update(&mut candidate, update).is_ok() {
+                document = candidate;
+            }
+        }
+        self.optimistic_view_doc = Some(document);
+    }
+
+    fn apply_event(&mut self, event: ClientEvent) -> Vec<Effect> {
         let effects = match event {
             // ── OpenDocument: reset lifecycle and state ──────────────────
             ClientEvent::OpenDocument { doc_id } => {
@@ -815,7 +892,7 @@ impl ClientState {
                     self.local_persistence_failed = false;
                     let was_live = self.phase == SessionPhase::Live;
                     self.pending_local.push(prepared.update.clone());
-                    self.rebuild_view();
+                    self.extend_view(&prepared.update);
 
                     let mut effects = self.prepare_next_intent();
 

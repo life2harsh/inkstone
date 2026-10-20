@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use inkstone_core::document::InkstoneDocument;
+use inkstone_core::document::{BlockContent, InkstoneDocument};
 use inkstone_core::ids::{DocId, UpdateId};
 use inkstone_core::{
     CollaborativeTextSnapshot, CollaborativeTextState, DocumentUpdate, RelativePosition,
@@ -61,6 +61,9 @@ pub struct TextMergeCheckpoint {
     pub document: InkstoneDocument,
     pub text_snapshot: CollaborativeTextSnapshot,
     pub pending_updates: Vec<DocumentUpdate>,
+    /// The update this merge confirmed. Local updates saved while the merge
+    /// was in flight stay pending, so stores drop only this one.
+    pub merged_update_id: UpdateId,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +150,40 @@ impl TextClientState {
             .unwrap_or(&self.view_document)
     }
 
+    /// [`Self::document`] with edits still waiting for persistence applied as
+    /// plain text, so a display can show what was typed before it is durable.
+    pub fn optimistic_document(&self) -> std::borrow::Cow<'_, InkstoneDocument> {
+        if self.queued_edits.is_empty() {
+            return std::borrow::Cow::Borrowed(self.document());
+        }
+        let mut document = self.document().clone();
+        for queued in &self.queued_edits {
+            apply_plain_edit(&mut document, queued.target, &queued.edit);
+        }
+        std::borrow::Cow::Owned(document)
+    }
+
+    /// Takes block structure (blocks inserted, removed, moved or retyped)
+    /// from `structure`, keeping the text this state owns for every block it
+    /// already has. New blocks bring their initial text, which seeds their
+    /// text CRDT on first use.
+    ///
+    /// Unlike re-hydrating, this never re-seeds text that edits still in
+    /// flight are relative to, so typed text cannot be applied twice.
+    pub fn adopt_structure(&mut self, structure: &InkstoneDocument) {
+        if structure.id != self.doc_id {
+            return;
+        }
+        merge_structure(&mut self.confirmed_document, structure);
+        merge_structure(&mut self.view_document, structure);
+        if let Some(prepared) = self.prepared_edit.as_mut() {
+            merge_structure(&mut prepared.document, structure);
+        }
+        if let Some(prepared) = self.prepared_merge.as_mut() {
+            merge_structure(&mut prepared.document, structure);
+        }
+    }
+
     pub fn confirmed_document(&self) -> &InkstoneDocument {
         &self.confirmed_document
     }
@@ -195,8 +232,39 @@ impl TextClientState {
         Ok(RelativeSelection { anchor, focus })
     }
 
+    /// A position in the current view text that follows concurrent edits.
+    pub fn relative_position(
+        &mut self,
+        target: TextTarget,
+        offset_utf16: u32,
+        association: TextAssociation,
+    ) -> Result<RelativePosition, TextCrdtError> {
+        self.view_text
+            .relative_position(&self.view_document, target, offset_utf16, association)
+    }
+
     pub fn resolve_position(&self, position: &RelativePosition) -> Result<u32, TextCrdtError> {
         self.view_text.resolve_relative_position(position)
+    }
+
+    /// Resolves `position` in [`Self::optimistic_document`]: through the
+    /// in-flight edit and then every edit still queued behind it.
+    pub fn resolve_position_optimistic(
+        &self,
+        position: &RelativePosition,
+    ) -> Result<u32, TextCrdtError> {
+        let text = self
+            .prepared_edit
+            .as_ref()
+            .map(|prepared| &prepared.text)
+            .unwrap_or(&self.view_text);
+        let mut offset = text.resolve_relative_position(position)?;
+        for queued in &self.queued_edits {
+            if queued.target == position.target {
+                offset = shift_offset(offset, &queued.edit);
+            }
+        }
+        Ok(offset)
     }
 
     pub fn transition(&mut self, event: TextClientEvent) -> Vec<TextClientEffect> {
@@ -283,7 +351,9 @@ impl TextClientState {
                 }
                 self.confirmed_document = prepared.document;
                 self.confirmed_text = prepared.text;
-                self.pending_updates = prepared.checkpoint.pending_updates;
+                let merged = prepared.checkpoint.merged_update_id;
+                self.pending_updates
+                    .retain(|pending| pending.update_id != merged);
                 if let Err(error) = self.rebuild_view() {
                     return self.fail(error);
                 }
@@ -354,28 +424,40 @@ impl TextClientState {
         if self.prepared_edit.is_some() || self.local_persistence_failed {
             return Vec::new();
         }
-        let Some(queued) = self.queued_edits.pop_front() else {
-            return Vec::new();
-        };
-        let mut document = self.view_document.clone();
-        let mut text = self.view_text.clone();
-        match text.local_document_edit(
-            &mut document,
-            queued.update_id,
-            queued.applied_at_ms,
-            queued.target,
-            queued.edit,
-        ) {
-            Ok(update) => {
-                self.prepared_edit = Some(PreparedEdit {
-                    update: update.clone(),
-                    document,
-                    text,
-                });
-                vec![TextClientEffect::PersistLocalUpdate { update }]
+        while let Some(queued) = self.queued_edits.pop_front() {
+            let mut edits = vec![queued.edit];
+            let mut applied_at_ms = queued.applied_at_ms;
+            while let Some(next) = self
+                .queued_edits
+                .pop_front_if(|next| next.target == queued.target)
+            {
+                edits.push(next.edit);
+                applied_at_ms = next.applied_at_ms;
             }
-            Err(error) => self.fail(error),
+            let mut document = self.view_document.clone();
+            let mut text = self.view_text.clone();
+            match text.local_document_edits(
+                &mut document,
+                queued.update_id,
+                applied_at_ms,
+                queued.target,
+                edits,
+            ) {
+                Ok(update) => {
+                    self.prepared_edit = Some(PreparedEdit {
+                        update: update.clone(),
+                        document,
+                        text,
+                    });
+                    return vec![TextClientEffect::PersistLocalUpdate { update }];
+                }
+                // Typing that reached a block after it was deleted or turned
+                // into another kind has nothing left to change.
+                Err(TextCrdtError::TargetNotFound | TextCrdtError::TargetIsNotText) => {}
+                Err(error) => return self.fail(error),
+            }
         }
+        Vec::new()
     }
 
     fn prepare_next_merge(&mut self) -> Vec<TextClientEffect> {
@@ -400,6 +482,7 @@ impl TextClientState {
             document: document.clone(),
             text_snapshot: text.snapshot(),
             pending_updates,
+            merged_update_id: update.update_id,
         };
         let token = TextMergeToken(self.next_merge_token);
         self.next_merge_token += 1;
@@ -442,11 +525,89 @@ impl TextClientState {
     }
 }
 
+/// Replaces `own`'s blocks with `structure`'s, carrying over `own`'s text for
+/// blocks it already has with the same kind.
+fn merge_structure(own: &mut InkstoneDocument, structure: &InkstoneDocument) {
+    let mut blocks = structure.blocks.clone();
+    for block in &mut blocks {
+        let Some(existing) = own.get_block(block.id) else {
+            continue;
+        };
+        match (&mut block.content, &existing.content) {
+            (BlockContent::Markdown { text }, BlockContent::Markdown { text: mine }) => {
+                text.clone_from(mine)
+            }
+            (BlockContent::Math { source }, BlockContent::Math { source: mine }) => {
+                source.clone_from(mine)
+            }
+            _ => {}
+        }
+    }
+    own.blocks = blocks;
+}
+
+fn apply_plain_edit(document: &mut InkstoneDocument, target: TextTarget, edit: &TextEdit) {
+    let text = match target {
+        TextTarget::Title => &mut document.title,
+        TextTarget::Markdown(block_id) => match document
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == block_id)
+            .map(|block| &mut block.content)
+        {
+            Some(BlockContent::Markdown { text }) => text,
+            _ => return,
+        },
+        TextTarget::Math(block_id) => match document
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == block_id)
+            .map(|block| &mut block.content)
+        {
+            Some(BlockContent::Math { source }) => source,
+            _ => return,
+        },
+    };
+    let (Some(start), Some(end)) = (
+        byte_index_of_utf16(text, edit.start_utf16),
+        byte_index_of_utf16(text, edit.end_utf16),
+    ) else {
+        return;
+    };
+    if start <= end {
+        text.replace_range(start..end, &edit.replacement);
+    }
+}
+
+/// Where an offset that follows its character lands after `edit`.
+fn shift_offset(offset: u32, edit: &TextEdit) -> u32 {
+    if offset < edit.start_utf16 {
+        offset
+    } else if offset >= edit.end_utf16 {
+        offset - (edit.end_utf16 - edit.start_utf16)
+            + edit.replacement.encode_utf16().count() as u32
+    } else {
+        edit.start_utf16
+    }
+}
+
+fn byte_index_of_utf16(text: &str, offset: u32) -> Option<usize> {
+    let mut units = 0_u32;
+    for (index, character) in text.char_indices() {
+        if units == offset {
+            return Some(index);
+        }
+        units += character.len_utf16() as u32;
+    }
+    (units == offset).then_some(text.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use inkstone_core::doc_ops::DocumentOp;
     use inkstone_core::document::InkstoneDocument;
+    use inkstone_core::ids::BlockId;
 
     fn state(replica: u64) -> TextClientState {
         TextClientState::new(
@@ -491,6 +652,216 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    fn block_edit(
+        state: &mut TextClientState,
+        block_id: BlockId,
+        at: u32,
+        text: &str,
+    ) -> Vec<TextClientEffect> {
+        state.transition(TextClientEvent::LocalEdit {
+            target: TextTarget::Markdown(block_id),
+            edit: TextEdit {
+                start_utf16: at,
+                end_utf16: at,
+                replacement: text.into(),
+            },
+            update_id: UpdateId::new_v4(),
+            applied_at_ms: 1,
+        })
+    }
+
+    fn markdown(state: &TextClientState, block_id: BlockId) -> String {
+        match &state
+            .optimistic_document()
+            .get_block(block_id)
+            .unwrap()
+            .content
+        {
+            BlockContent::Markdown { text } => text.clone(),
+            _ => panic!("not markdown"),
+        }
+    }
+
+    #[test]
+    fn adopting_new_blocks_never_replays_typing_twice() {
+        use inkstone_core::document::DocumentBlock;
+        let doc_id = DocId::new_v4();
+        let mut document = InkstoneDocument::new(doc_id);
+        let first = BlockId::new_v4();
+        document.blocks.push(DocumentBlock::new(
+            first,
+            BlockContent::Markdown {
+                text: String::new(),
+            },
+        ));
+        let mut state =
+            TextClientState::new(document.clone(), TextReplicaId::new(7).unwrap()).unwrap();
+
+        // "Key" is persisted and pending; " ideas" is still in flight.
+        let persisted = match block_edit(&mut state, first, 0, "Key").as_slice() {
+            [TextClientEffect::PersistLocalUpdate { update }] => update.clone(),
+            _ => panic!("expected persistence"),
+        };
+        state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: persisted.update_id,
+        });
+        let in_flight = match block_edit(&mut state, first, 3, " ideas").as_slice() {
+            [TextClientEffect::PersistLocalUpdate { update }] => update.clone(),
+            _ => panic!("expected persistence"),
+        };
+        block_edit(&mut state, first, 9, "!");
+        assert_eq!(markdown(&state, first), "Key ideas!");
+
+        // A block is inserted elsewhere, structure only.
+        let second = BlockId::new_v4();
+        let mut structure = document.clone();
+        structure.blocks.push(DocumentBlock::new(
+            second,
+            BlockContent::Markdown {
+                text: "seed".into(),
+            },
+        ));
+        state.adopt_structure(&structure);
+        assert_eq!(markdown(&state, first), "Key ideas!");
+        assert_eq!(markdown(&state, second), "seed");
+
+        state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: in_flight.update_id,
+        });
+        assert_eq!(markdown(&state, first), "Key ideas!");
+        block_edit(&mut state, second, 4, "ed");
+        assert_eq!(markdown(&state, second), "seeded");
+        assert_eq!(markdown(&state, first), "Key ideas!");
+        assert!(state.errors().is_empty());
+    }
+
+    #[test]
+    fn typing_queued_for_a_deleted_block_is_dropped_not_stuck() {
+        use inkstone_core::document::DocumentBlock;
+        let doc_id = DocId::new_v4();
+        let mut document = InkstoneDocument::new(doc_id);
+        let (keep, gone) = (BlockId::new_v4(), BlockId::new_v4());
+        for id in [keep, gone] {
+            document.blocks.push(DocumentBlock::new(
+                id,
+                BlockContent::Markdown {
+                    text: String::new(),
+                },
+            ));
+        }
+        let mut state =
+            TextClientState::new(document.clone(), TextReplicaId::new(8).unwrap()).unwrap();
+        let in_flight = match block_edit(&mut state, keep, 0, "a").as_slice() {
+            [TextClientEffect::PersistLocalUpdate { update }] => update.clone(),
+            _ => panic!("expected persistence"),
+        };
+        block_edit(&mut state, gone, 0, "/math");
+        block_edit(&mut state, keep, 1, "b");
+
+        // The block is deleted while its typing waits behind the save.
+        let mut structure = document.clone();
+        structure.blocks.retain(|block| block.id != gone);
+        state.adopt_structure(&structure);
+
+        let effects = state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: in_flight.update_id,
+        });
+        let next = match effects.as_slice() {
+            [TextClientEffect::PersistLocalUpdate { update }] => update.clone(),
+            other => panic!("expected the next edit to persist, got {other:?}"),
+        };
+        state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: next.update_id,
+        });
+        assert_eq!(markdown(&state, keep), "ab");
+        assert!(!state.has_pending_persistence());
+        assert!(state.errors().is_empty());
+    }
+
+    #[test]
+    fn optimistic_document_shows_edits_queued_behind_persistence() {
+        let mut state = state(1);
+        let first = local_edit(&mut state, "Hé");
+        for (offset, text) in [(2, "llo"), (5, " 🌍"), (0, ">")] {
+            let effects = state.transition(TextClientEvent::LocalEdit {
+                target: TextTarget::Title,
+                edit: TextEdit {
+                    start_utf16: offset,
+                    end_utf16: offset,
+                    replacement: text.into(),
+                },
+                update_id: UpdateId::new_v4(),
+                applied_at_ms: 1,
+            });
+            assert!(effects.is_empty(), "later edits queue behind the first");
+        }
+        assert_eq!(state.document().title, "Hé");
+        assert_eq!(state.optimistic_document().title, ">Héllo 🌍");
+
+        let effects = state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: first.update_id,
+        });
+        let [TextClientEffect::PersistLocalUpdate { update: merged }] = effects.as_slice() else {
+            panic!("queued edits should save as one update, got {effects:?}");
+        };
+        assert_eq!(state.optimistic_document().title, ">Héllo 🌍");
+        let mut replay = TextClientState::new(
+            InkstoneDocument::new(first.doc_id),
+            TextReplicaId::new(2).unwrap(),
+        )
+        .unwrap();
+        for update in [&first, merged] {
+            for effect in replay.transition(TextClientEvent::RemoteUpdate {
+                update: update.clone(),
+            }) {
+                if let TextClientEffect::PersistRemoteMerge { token, .. } = effect {
+                    replay.transition(TextClientEvent::RemoteMergePersisted { token });
+                }
+            }
+        }
+        assert_eq!(replay.optimistic_document().title, ">Héllo 🌍");
+        // "é" in the persisted "Hé" sits after ">" and "H" once the rest lands.
+        let e = state
+            .relative_position(TextTarget::Title, 1, TextAssociation::After)
+            .unwrap();
+        assert_eq!(state.resolve_position_optimistic(&e).unwrap(), 2);
+    }
+
+    #[test]
+    fn typing_saved_while_an_echo_merges_is_not_lost() {
+        let mut state = state(103);
+        state.transition(TextClientEvent::Connected);
+        let first = local_edit(&mut state, "T");
+        state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: first.update_id,
+        });
+        let merge = state.transition(TextClientEvent::RemoteUpdate {
+            update: first.clone(),
+        });
+        let token = match merge.as_slice() {
+            [TextClientEffect::PersistRemoteMerge { token, checkpoint }] => {
+                assert_eq!(checkpoint.merged_update_id, first.update_id);
+                *token
+            }
+            other => panic!("expected the echo to merge, got {other:?}"),
+        };
+        for text in ["r", "a"] {
+            let update = local_edit(&mut state, text);
+            state.transition(TextClientEvent::LocalUpdatePersisted {
+                update_id: update.update_id,
+            });
+        }
+        state.transition(TextClientEvent::RemoteMergePersisted { token });
+        assert_eq!(state.document().title, "Tra");
+        assert_eq!(state.pending_updates().len(), 2);
+        let next = local_edit(&mut state, "n");
+        state.transition(TextClientEvent::LocalUpdatePersisted {
+            update_id: next.update_id,
+        });
+        assert_eq!(state.document().title, "Tran");
+        assert!(state.errors().is_empty());
     }
 
     #[test]
