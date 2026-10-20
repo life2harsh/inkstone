@@ -109,6 +109,10 @@ mkdir -p "$package_dir"
 cp -a "$package_build_dir/." "$package_dir/"
 rm -rf "$package_build_dir"
 cp apps/web/styles.css "$dist_dir/styles.css"
+cp -r apps/web/vendor "$dist_dir/vendor"
+for asset in sw.js manifest.webmanifest icon.svg icon-192.png icon-512.png icon-maskable-512.png apple-touch-icon.png; do
+    cp "apps/web/$asset" "$dist_dir/$asset"
+done
 
 in_module_script=false
 while IFS= read -r line || [[ -n "$line" ]]; do
