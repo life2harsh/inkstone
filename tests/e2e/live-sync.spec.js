@@ -25,6 +25,22 @@ async function loadedWebModuleUrl(page) {
   });
 }
 
+// The page renders blocks until one is clicked; edit its source, then return.
+async function writeMarkdown(page, markdown) {
+  const block = page.locator('.page-block[data-block-type="markdown"]').first();
+  if (await block.locator('.page-source').count() === 0) {
+    await block.evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await block.locator('.page-rendered').click({ position: { x: 2, y: 2 } });
+  }
+  await block.locator('.page-source').fill(markdown);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.page-source')).toHaveCount(0);
+}
+
+function renderedMarkdown(page) {
+  return page.locator('.page-block[data-block-type="markdown"]').first().locator('.page-rendered');
+}
+
 test.use({ trace: 'off', screenshot: 'off', video: 'off' });
 
 test.describe('destructive encrypted live sync (test deployments only)', () => {
@@ -49,7 +65,6 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     await owner.goto('/?local=1');
     await owner.locator('.auth-email').fill(ownerEmail);
     await owner.locator('.auth-password').fill(ownerPassword);
-    await owner.locator('.auth-vault-passphrase').fill(ownerVaultPassphrase);
     if (process.env.INKSTONE_E2E_BOOTSTRAP === '1') {
       await owner.locator('.auth-bootstrap-token').fill(requiredEnv('INKSTONE_E2E_BOOTSTRAP_TOKEN'));
       await owner.getByRole('button', { name: 'Create first account' }).click();
@@ -63,7 +78,7 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     await owner.locator('.explorer-create-input').press('Enter');
     await expect(owner.locator('.phase-badge')).toHaveText('Live');
     await owner.locator('.document-title-input').fill('Shared encrypted note');
-    await owner.locator('.markdown-source-input').fill('# Owner ciphertext');
+    await writeMarkdown(owner, '# Owner ciphertext');
 
     await owner.locator('.invite-email').fill(inviteeEmail);
     await expect(owner.locator('.invite-email')).toHaveValue(inviteeEmail);
@@ -74,7 +89,6 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     await invitee.goto(shareUrl);
     await invitee.locator('.auth-email').fill(inviteeEmail);
     await invitee.locator('.auth-password').fill(inviteePassword);
-    await invitee.locator('.auth-vault-passphrase').fill(`vault ${suffix}`);
     await invitee.getByRole('button', { name: 'Register and accept' }).click();
     await invitee.locator(`.explorer-folder[data-path="Live E2E ${suffix}"]`).click();
     await expect(invitee.locator(`.file-entry[data-path="${sharedPath}"]`)).toBeVisible();
@@ -82,8 +96,8 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     await expect(invitee.locator('.document-title-input')).toHaveValue('Shared encrypted note');
     await expect(invitee.locator('.phase-badge')).toHaveText('Live');
 
-    await invitee.locator('.markdown-source-input').fill('# Invitee live edit');
-    await expect(owner.locator('.markdown-source-input')).toHaveValue('# Invitee live edit');
+    await writeMarkdown(invitee, '# Invitee live edit');
+    await expect(renderedMarkdown(owner)).toHaveText('Invitee live edit');
 
     const webModuleUrl = await loadedWebModuleUrl(owner);
     await owner.evaluate(async moduleUrl => {
@@ -91,9 +105,9 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
       module.disconnect_sync_for_test();
     }, webModuleUrl);
     await expect(owner.locator('.phase-badge')).toHaveText('Offline');
-    await invitee.locator('.markdown-source-input').fill('# Catch up after reconnect');
+    await writeMarkdown(invitee, '# Catch up after reconnect');
     await expect(owner.locator('.phase-badge')).toHaveText('Live', { timeout: 20_000 });
-    await expect(owner.locator('.markdown-source-input')).toHaveValue('# Catch up after reconnect');
+    await expect(renderedMarkdown(owner)).toHaveText('Catch up after reconnect');
 
     await invitee.locator(`.file-entry[data-path="${sharedPath}"]`).hover();
     await invitee.getByRole('button', { name: 'Rename Shared.md' }).click();
@@ -106,13 +120,13 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     await invitee.locator('.explorer-create-input').press('Enter');
     await expect(invitee.locator('.phase-badge')).toHaveText('Live', { timeout: 20_000 });
     await invitee.locator('.document-title-input').fill('Created by collaborator');
-    await invitee.locator('.markdown-source-input').fill('# Discovered without reload');
+    await writeMarkdown(invitee, '# Discovered without reload');
 
     const discovered = owner.locator(`.file-entry[data-path="${collaboratorPath}"]`);
     await expect(discovered).toBeVisible({ timeout: 15_000 });
     await discovered.locator('.file-select-btn').click();
     await expect(owner.locator('.document-title-input')).toHaveValue('Created by collaborator');
-    await expect(owner.locator('.markdown-source-input')).toHaveValue('# Discovered without reload');
+    await expect(renderedMarkdown(owner)).toHaveText('Discovered without reload');
 
     await owner.locator(`.file-entry[data-path="${renamedPath}"]`).hover();
     owner.once('dialog', dialog => dialog.accept());
@@ -138,7 +152,6 @@ test.describe('destructive encrypted live sync (test deployments only)', () => {
     }), invitedWorkspaceId)).toBeUndefined();
     await invitee.locator('.auth-email').fill(ownerEmail);
     await invitee.locator('.auth-password').fill(ownerPassword);
-    await invitee.locator('.auth-vault-passphrase').fill(ownerVaultPassphrase);
     await invitee.getByRole('button', { name: 'Sign in' }).click();
     await expect(invitee.locator('.explorer-new-btn')).toBeVisible();
 
