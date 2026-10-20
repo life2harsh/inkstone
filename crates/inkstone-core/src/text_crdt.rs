@@ -160,7 +160,18 @@ impl CollaborativeTextState {
         target: TextTarget,
         edit: TextEdit,
     ) -> Result<DocumentUpdate, TextCrdtError> {
-        let payload = self.local_edit(document, target, edit)?;
+        self.local_document_edits(document, update_id, applied_at_ms, target, [edit])
+    }
+
+    pub fn local_document_edits(
+        &mut self,
+        document: &mut InkstoneDocument,
+        update_id: UpdateId,
+        applied_at_ms: i64,
+        target: TextTarget,
+        edits: impl IntoIterator<Item = TextEdit>,
+    ) -> Result<DocumentUpdate, TextCrdtError> {
+        let payload = self.local_edits(document, target, edits)?;
         Ok(DocumentUpdate {
             version: DOCUMENT_UPDATE_V2_VERSION,
             update_id,
@@ -216,15 +227,22 @@ impl CollaborativeTextState {
         target: TextTarget,
         edit: TextEdit,
     ) -> Result<CollaborativeTextUpdate, TextCrdtError> {
+        self.local_edits(document, target, [edit])
+    }
+
+    pub fn local_edits(
+        &mut self,
+        document: &mut InkstoneDocument,
+        target: TextTarget,
+        edits: impl IntoIterator<Item = TextEdit>,
+    ) -> Result<CollaborativeTextUpdate, TextCrdtError> {
         self.ensure_target(document, target)?;
         let text_doc = self.docs.get_mut(&target).expect("target was initialized");
         let text = text_doc.doc.get_or_insert_text(TEXT_ROOT);
-        let read_txn = text_doc.doc.transact();
-        let before_text = text.get_string(&read_txn);
-        let before = read_txn.state_vector();
-        drop(read_txn);
-        {
+        let before = text_doc.doc.transact().state_vector();
+        for edit in edits {
             let mut txn = text_doc.doc.transact_mut();
+            let before_text = text.get_string(&txn);
             let len = text.len(&txn);
             if edit.start_utf16 > edit.end_utf16
                 || edit.end_utf16 > len
