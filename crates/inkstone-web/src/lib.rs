@@ -16,15 +16,30 @@ pub struct MissingNoteRequest {
 mod api;
 mod crypto;
 pub mod explorer;
+mod home;
+mod icons;
 pub mod indexed_db;
 pub mod ink_runtime;
 pub mod knowledge;
+mod live;
 pub mod local_graph;
 pub mod markdown_render;
 pub mod math_render;
+mod page_commands;
+mod page_drag;
+mod page_driver;
+mod page_editing;
+mod page_export;
+mod page_files;
+mod page_history;
+pub mod page_surface;
+mod page_touch;
+mod pdf_pages;
+mod prefs;
 pub mod search;
 pub mod storage;
 mod theme;
+mod vaults;
 pub mod workspace_db;
 
 use base64::Engine;
@@ -44,19 +59,19 @@ use inkstone_core::document::{BlockContent, InkstoneDocument};
 use inkstone_core::ids::{BlockId, DocId, UpdateId};
 use inkstone_core::protocol::{
     ApproveInvitationKeyRequest, AssetChunkResponse, AssetResponse, AuthUserResponse,
-    ClientWsMessage, ConsumeEmailVerificationRequest, ConsumePasswordResetRequest,
-    CreateAssetRequest, CreateDocRequest, CreateInvitationRequest, CreateInvitationResponse,
-    CreateWorkspaceRequest, DeviceResponse, DocResponse, EncryptedUpdateResponse,
-    GenericMessageResponse, InvitationKeyRequestResponse, InvitationRegisterRequest,
-    InvitationResponse, LoginRequest, OutgoingInvitationResponse, OwnerSetupRequest,
-    PaginatedResponse, PathProjectionResponse, PostSnapshotRequest, PutAssetChunkRequest,
-    PutPathProjectionRequest, PutWorkspaceKeyEnvelopeRequest, RecoveryEnvelopeRequest,
-    RecoveryEnvelopeResponse, RegisterRequest, ServerWsMessage, SubmitInvitationKeyRequest,
-    TokenRequest, TransferOwnershipRequest, TreeAssetMetadataUpdate, TreeDocPathUpdate,
-    TreePathProjectionUpdate, UpdateAssetMetadataRequest, UpdateDocPathProjectionRequest,
-    UpdateDocTitleProjectionRequest, UpdateMemberRoleRequest, UpdateWorkspaceRequest,
-    WorkspaceKeyEnvelopeResponse, WorkspaceMemberResponse, WorkspaceResponse,
-    WorkspaceTreeMutationRequest,
+    ChangePasswordRequest, ClientWsMessage, ConsumeEmailVerificationRequest,
+    ConsumePasswordResetRequest, CreateAssetRequest, CreateDocRequest, CreateInvitationRequest,
+    CreateInvitationResponse, CreateWorkspaceRequest, DeviceResponse, DocResponse,
+    EncryptedUpdateResponse, GenericMessageResponse, InvitationKeyRequestResponse,
+    InvitationRegisterRequest, InvitationResponse, LoginRequest, OutgoingInvitationResponse,
+    OwnerSetupRequest, PaginatedResponse, PathProjectionResponse, PostSnapshotRequest,
+    PublicLinkResponse, PutAssetChunkRequest, PutPathProjectionRequest,
+    PutWorkspaceKeyEnvelopeRequest, RecoveryEnvelopeRequest, RecoveryEnvelopeResponse,
+    RegisterRequest, ServerWsMessage, SubmitInvitationKeyRequest, TokenRequest,
+    TransferOwnershipRequest, TreeAssetMetadataUpdate, TreeDocPathUpdate, TreePathProjectionUpdate,
+    UpdateAssetMetadataRequest, UpdateDocPathProjectionRequest, UpdateDocTitleProjectionRequest,
+    UpdateMemberRoleRequest, UpdateWorkspaceRequest, WorkspaceKeyEnvelopeResponse,
+    WorkspaceMemberResponse, WorkspaceResponse, WorkspaceTreeMutationRequest,
 };
 use inkstone_core::{
     DocumentUpdate, INK_PRESENCE_VERSION, InkPresencePayload, RelativeSelection, TextEdit,
@@ -68,15 +83,104 @@ use inkstone_workspace::{WorkspaceEntry, WorkspaceEntryKind, WorkspacePath, Work
 use indexed_db::IndexedDb;
 use workspace_db::WorkspaceDb;
 
+/// Scroll containers whose position survives a full render.
+const RETAINED_SCROLLERS: [&str; 3] = [".main-content", ".sidebar", ".inspector"];
+
 thread_local! {
     // Replacing the DOM blurs active editors. Ignore that synthetic focusout while
     // render holds the driver borrow; user-initiated focus changes still render.
     static RENDERING: Cell<bool> = const { Cell::new(false) };
+    static ASSET_URLS: RefCell<HashMap<String, AssetUrl>> = RefCell::new(HashMap::new());
+    static PAGE_HEIGHT_HOLD: Cell<u32> = const { Cell::new(0) };
+}
+
+const PAGE_HEIGHT_HOLD_MS: i32 = 2500;
+
+fn hold_page_height(document: &web_sys::Document, key: Option<String>, height: f64) {
+    let same_note = document
+        .query_selector(".main-content")
+        .ok()
+        .flatten()
+        .is_some_and(|scroller| scroller.get_attribute("data-scroll-key") == key);
+    let Some(surface) = document
+        .query_selector(".page-surface")
+        .ok()
+        .flatten()
+        .and_then(|surface| surface.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    if !same_note || height <= 0.0 {
+        return;
+    }
+    let _ = surface
+        .style()
+        .set_property("min-height", &format!("{}px", height.ceil()));
+    let generation = PAGE_HEIGHT_HOLD.with(|hold| {
+        hold.set(hold.get().wrapping_add(1));
+        hold.get()
+    });
+    let release = Closure::once_into_js(move || {
+        if PAGE_HEIGHT_HOLD.with(Cell::get) != generation {
+            return;
+        }
+        if let Some(surface) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.query_selector(".page-surface").ok().flatten())
+            .and_then(|surface| surface.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = surface.style().remove_property("min-height");
+        }
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            release.unchecked_ref(),
+            PAGE_HEIGHT_HOLD_MS,
+        );
+    }
+}
+
+struct AssetUrl {
+    url: String,
+    fingerprint: u64,
+    checked_at_ms: f64,
+    checking: bool,
+}
+
+const ASSET_RECHECK_MS: f64 = 5_000.0;
+
+fn asset_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64 ^ bytes.len() as u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn set_asset_src(document: &web_sys::Document, path: &str, url: &str) {
+    let Ok(nodes) = document.query_selector_all("img[data-asset-path]") else {
+        return;
+    };
+    for index in 0..nodes.length() {
+        let Some(element) = nodes
+            .item(index)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        if element.get_attribute("data-asset-path").as_deref() == Some(path)
+            && element.get_attribute("src").as_deref() != Some(url)
+        {
+            let _ = element.set_attribute("src", url);
+        }
+    }
 }
 
 const DEVICE_ID_KEY: &str = "\0device_id";
 const ACCOUNT_VAULT_KEY: &str = "\0account_vault_key";
 const DEVICE_PRIVATE_KEY: &str = "\0device_private_key";
+const REMEMBERED_VAULT_KEY: &str = "\0remembered_vault_key";
 const AWAITING_INVITATION_KEY: &str = "\0awaiting_invitation_workspace";
 const SELECTED_WORKSPACE_KEY: &str = "\0selected_workspace";
 
@@ -86,6 +190,10 @@ fn asset_id_metadata(path: &str) -> String {
 
 fn asset_version_metadata(path: &str) -> String {
     format!("\0asset_metadata_version:{path}")
+}
+
+fn asset_fetched_metadata(asset_id: uuid::Uuid) -> String {
+    format!("\0asset_fetched:{asset_id}")
 }
 
 fn folder_id_metadata(path: &str) -> String {
@@ -100,6 +208,8 @@ fn folder_version_metadata(path: &str) -> String {
 struct WorkspaceMetadata {
     name: String,
     description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_link: Option<String>,
 }
 
 fn decrypt_workspace_metadata(
@@ -193,6 +303,7 @@ struct RuntimeHandles {
     discovery_interval: Option<(i32, Closure<dyn FnMut()>)>,
     presence_interval: Option<(i32, Closure<dyn FnMut()>)>,
     presence_timeout: Option<(i32, Closure<dyn FnMut()>)>,
+    live: live::LiveMesh,
 }
 
 const PRESENCE_VERSION: u32 = 1;
@@ -201,9 +312,18 @@ const PRESENCE_TTL_MS: f64 = 25_000.0;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PresenceKind {
-    Text { selection: RelativeSelection },
-    Ink { payload: InkPresencePayload },
+    Text {
+        selection: RelativeSelection,
+    },
+    Ink {
+        payload: InkPresencePayload,
+    },
     Idle,
+    /// Live mode handshake; never shown, only routed.
+    Signal {
+        to: Option<uuid::Uuid>,
+        signal: live::LiveSignal,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -213,7 +333,7 @@ struct PresencePayload {
     state: PresenceKind,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EncryptedPresenceWire {
     doc_id: uuid::Uuid,
     sender_device_id: uuid::Uuid,
@@ -242,6 +362,49 @@ fn presence_sender_allowed(sender: uuid::Uuid, own: uuid::Uuid) -> bool {
     sender != own
 }
 
+fn target_text(document: &InkstoneDocument, target: TextTarget) -> Option<String> {
+    match target {
+        TextTarget::Title => Some(document.title.clone()),
+        TextTarget::Markdown(block_id) => {
+            match document.get_block(block_id).map(|block| &block.content) {
+                Some(BlockContent::Markdown { text }) => Some(text.clone()),
+                _ => None,
+            }
+        }
+        TextTarget::Math(block_id) => {
+            match document.get_block(block_id).map(|block| &block.content) {
+                Some(BlockContent::Math { source }) => Some(source.clone()),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn note_name_has_extension(name: &str) -> bool {
+    name.rsplit('/')
+        .next()
+        .and_then(|file| file.rsplit_once('.'))
+        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+}
+
+fn graph_node_radius(kind: local_graph::GraphNodeKind) -> f32 {
+    if kind == local_graph::GraphNodeKind::Active {
+        22.0
+    } else {
+        11.0
+    }
+}
+
+fn graph_label(label: &str) -> String {
+    if label.chars().count() <= 20 {
+        label.to_string()
+    } else {
+        let mut short: String = label.chars().take(19).collect();
+        short.push('…');
+        short
+    }
+}
+
 fn workspace_capabilities(local_mode: bool, is_owner: bool, role: Option<&str>) -> (bool, bool) {
     let can_read = local_mode
         || is_owner
@@ -267,6 +430,13 @@ fn can_read_workspace(inner: &DriverInner) -> bool {
     workspace_capabilities(inner.local_mode, is_owner, role).0
 }
 
+fn viewport_width() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|width| width.as_f64())
+        .unwrap_or(0.0)
+}
+
 fn can_edit_workspace(inner: &DriverInner) -> bool {
     let user_id = inner.auth_user.as_ref().map(|user| user.id);
     let is_owner = user_id.is_some_and(|user_id| {
@@ -280,6 +450,14 @@ fn can_edit_workspace(inner: &DriverInner) -> bool {
         .find(|member| Some(member.user_id) == user_id)
         .map(|member| member.role.as_str());
     workspace_capabilities(inner.local_mode, is_owner, role).1
+}
+
+/// Whether the open note has loaded, so edits reach the right document.
+fn document_ready(inner: &DriverInner) -> bool {
+    !matches!(
+        inner.client_state.phase(),
+        SessionPhase::Closed | SessionPhase::HydratingLocal
+    )
 }
 
 fn client_event_allowed(inner: &DriverInner, event: &ClientEvent) -> bool {
@@ -327,9 +505,7 @@ fn expire_auth_context(inner: &mut DriverInner) {
     inner.outgoing_invitations.clear();
     inner.key_requests.clear();
     inner.devices.clear();
-    inner.auth_error = Some(
-        "Your session expired. Sign in again; pending local changes remain safely stored.".into(),
-    );
+    inner.auth_error = Some("You've been signed out. Sign in again; your changes are safe.".into());
     inner.invitation_generation += 1;
     inner.advance_workspace_revision();
 }
@@ -451,6 +627,7 @@ impl InkSaveTracker {
         Some(state.phase)
     }
 
+    #[cfg(test)]
     fn phase(&self, doc_id: DocId, block_id: BlockId) -> InkSavePhase {
         self.states
             .get(&(doc_id, block_id))
@@ -502,12 +679,16 @@ pub struct DriverInner {
     pub search_index_revision: u64,
     pub index_error: Option<String>,
     pub search_documents: Vec<search::SearchDocument>,
+    note_summaries: HashMap<String, home::NoteSummary>,
+    home_filter: String,
+    home_tag: Option<String>,
     pub search_results: Vec<search::SearchResult>,
     pub search_highlighted_index: Option<usize>,
     pub recent_notes: Vec<String>,
     pub knowledge: knowledge::KnowledgeIndex,
     pub knowledge_tab: String,
     pub inspector_open: bool,
+    pub export_menu_open: bool,
     pub selection_revision: u64,
     pub pending_selection: Option<PendingSelection>,
     pub recent_notes_revision: u64,
@@ -515,7 +696,25 @@ pub struct DriverInner {
     pub ink_tool: String,
     pub ink_brush_width: f32,
     pub ink_brush_color: (u8, u8, u8),
+    pub ink_panel_open: bool,
     pub expanded_ink_block: Option<BlockId>,
+    /// Markdown or Math block currently shown as source on the page surface.
+    pub editing_block: Option<BlockId>,
+    /// Mouse and touch ink when true; otherwise only a pen inks.
+    pub ink_mode: bool,
+    pending_block_caret: Option<(BlockId, u32)>,
+    /// The `/` command menu, while open.
+    slash_menu: Option<page_commands::SlashMenu>,
+    /// A `/` the user closed the menu for, so it stays closed.
+    slash_dismissed: Option<(BlockId, u32)>,
+    /// A text save held back until structural saves ahead of it finish, so
+    /// text is never stored against blocks that are not stored yet.
+    deferred_text_persist: Option<DocumentUpdate>,
+    quiet_dispatch: bool,
+    /// A block being dragged by its grip.
+    block_drag: Option<page_drag::BlockDrag>,
+    page_history: page_history::PageHistory,
+    migrated_docs: HashSet<DocId>,
     pub sidebar_open: bool,
     pub settings_open: bool,
     pub settings_category: String,
@@ -531,6 +730,8 @@ pub struct DriverInner {
     recovery_key_display: Option<String>,
     new_account_setup_pending: bool,
     owner_setup_token: Option<String>,
+    link_email: Option<String>,
+    pending_password: Option<String>,
     owner_setup_in_flight: bool,
     sync_error: Option<String>,
     device_id: Option<uuid::Uuid>,
@@ -538,10 +739,19 @@ pub struct DriverInner {
     workspace_id: Option<uuid::Uuid>,
     workspace_name: String,
     workspace_description: String,
+    workspace_public_link: Option<String>,
+    vault_names: HashMap<uuid::Uuid, String>,
+    vault_menu_open: bool,
+    new_vault: Option<vaults::NewVaultDraft>,
+    public_view: Option<String>,
+    public_view_error: Option<String>,
+    guest_join: Option<vaults::GuestJoin>,
+    guest_name: Option<String>,
+    public_link_busy: bool,
+    public_link_status: Option<String>,
     asset_preview_url: Option<String>,
     asset_preview_type: String,
-    asset_blob_urls: Vec<String>,
-    asset_blob_generation: u64,
+    reserved_asset_paths: HashSet<String>,
     workspace_key: Option<[u8; 32]>,
     members: Vec<WorkspaceMemberResponse>,
     outgoing_invitations: Vec<OutgoingInvitationResponse>,
@@ -638,6 +848,7 @@ pub struct Driver(
 
 impl Driver {
     pub fn new(doc_id: DocId) -> Self {
+        let saved_brush = page_driver::load_brush();
         Driver(
             Rc::new(RefCell::new(DriverInner {
                 client_state: ClientState::new(doc_id),
@@ -667,20 +878,37 @@ impl Driver {
                 search_index_revision: 0,
                 index_error: None,
                 search_documents: Vec::new(),
+                note_summaries: HashMap::new(),
+                home_filter: String::new(),
+                home_tag: None,
                 search_results: Vec::new(),
                 search_highlighted_index: None,
                 recent_notes: Vec::new(),
                 knowledge: knowledge::KnowledgeIndex::new(),
                 knowledge_tab: "Outline".to_string(),
                 inspector_open: false,
+                export_menu_open: false,
                 selection_revision: 0,
                 pending_selection: None,
                 recent_notes_revision: 0,
                 missing_note: None,
-                ink_tool: "pen".to_string(),
-                ink_brush_width: 3.0,
-                ink_brush_color: (31, 41, 55),
+                ink_tool: saved_brush
+                    .as_ref()
+                    .map_or_else(|| "pen".to_string(), |brush| brush.0.clone()),
+                ink_brush_width: saved_brush.as_ref().map_or(3.0, |brush| brush.1),
+                ink_brush_color: saved_brush.as_ref().map_or((31, 41, 55), |brush| brush.2),
+                ink_panel_open: false,
                 expanded_ink_block: None,
+                editing_block: None,
+                ink_mode: false,
+                pending_block_caret: None,
+                slash_menu: None,
+                slash_dismissed: None,
+                deferred_text_persist: None,
+                quiet_dispatch: false,
+                block_drag: None,
+                page_history: Default::default(),
+                migrated_docs: HashSet::new(),
                 sidebar_open: false,
                 settings_open: false,
                 settings_category: "General".to_string(),
@@ -691,6 +919,8 @@ impl Driver {
                 auth_user: None,
                 auth_error: None,
                 auth_notice: None,
+                link_email: fragment_email_from_window(),
+                pending_password: None,
                 account_token_flow: parse_account_token_fragment_from_window(),
                 account_vault_key: None,
                 recovery_key_display: None,
@@ -703,10 +933,19 @@ impl Driver {
                 workspace_id: None,
                 workspace_name: "Local knowledge workspace".to_string(),
                 workspace_description: String::new(),
+                workspace_public_link: None,
+                vault_names: HashMap::new(),
+                vault_menu_open: false,
+                new_vault: None,
+                public_view: None,
+                public_view_error: None,
+                guest_join: None,
+                guest_name: None,
+                public_link_busy: false,
+                public_link_status: None,
                 asset_preview_url: None,
                 asset_preview_type: String::new(),
-                asset_blob_urls: Vec::new(),
-                asset_blob_generation: 0,
+                reserved_asset_paths: HashSet::new(),
                 workspace_key: None,
                 members: Vec::new(),
                 outgoing_invitations: Vec::new(),
@@ -988,6 +1227,7 @@ impl Driver {
                 },
             };
             if immediate {
+                self.live_broadcast(&state, true);
                 self.0.borrow_mut().pending_presence = Some(PresencePayload {
                     version: PRESENCE_VERSION,
                     sent_at_ms: js_sys::Date::now() as i64,
@@ -1025,6 +1265,7 @@ impl Driver {
     }
 
     fn flush_ink_runtimes(&self) {
+        self.flush_page_ink();
         let result = { self.1.borrow_mut().destroy_all() };
         match result {
             Ok(updates) => {
@@ -1036,7 +1277,7 @@ impl Driver {
         }
     }
 
-    fn flush_ink_before_transition(&self) {
+    pub(crate) fn flush_ink_before_transition(&self) {
         let was_rendering = RENDERING.with(|rendering| {
             let was_rendering = rendering.get();
             rendering.set(true);
@@ -1109,6 +1350,33 @@ impl Driver {
         }
     }
 
+    fn go_home(&self) {
+        if self.0.borrow().selected_path.is_none() {
+            self.0.borrow_mut().sidebar_open = false;
+            self.render();
+            return;
+        }
+        self.flush_ink_before_transition();
+        if self.has_unsaved_edits() {
+            let this = self.clone();
+            let retry = Closure::once_into_js(move || this.go_home());
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    retry.unchecked_ref(),
+                    120,
+                );
+            }
+            return;
+        }
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.selected_path = None;
+            inner.sidebar_open = false;
+        }
+        self.dispatch(ClientEvent::Close);
+        self.render();
+    }
+
     fn select_entry(&self, path: &str) {
         {
             let inner = self.0.borrow();
@@ -1128,7 +1396,7 @@ impl Driver {
             let mut inner = self.0.borrow_mut();
             inner.deferred_navigation = Some(path_str);
             inner.sidebar_open = false;
-            inner.inspector_open = false;
+            inner.inspector_open &= !inspector_is_drawer();
             inner.persistence_status = if inner.client_state.local_persistence_failed()
                 || inner
                     .text_client_state
@@ -1157,7 +1425,9 @@ impl Driver {
             inner.show_create = false;
             inner.create_folder = None;
             inner.sidebar_open = false;
-            inner.inspector_open = false;
+            inner.inspector_open &= !inspector_is_drawer();
+            inner.editing_block = None;
+            inner.pending_block_caret = None;
             let ancestors = markdown_render::ancestor_folders(&path_str);
             for folder in &ancestors {
                 inner.expanded_folders.insert(folder.clone());
@@ -1291,9 +1561,12 @@ impl Driver {
         if !can_edit_workspace(&self.0.borrow()) {
             return;
         }
-        let name = name.trim().to_string();
+        let mut name = name.trim().to_string();
         if name.is_empty() {
             return;
+        }
+        if !self.0.borrow().creating_folder && !note_name_has_extension(&name) {
+            name.push_str(".md");
         }
         let full_path = {
             let inner = self.0.borrow();
@@ -2204,7 +2477,10 @@ impl Driver {
                         return;
                     }
                     if !local_mode {
-                        entries.retain(|entry| ownership.contains_key(entry.path.as_str()));
+                        entries.retain(|entry| {
+                            entry.kind == WorkspaceEntryKind::Folder
+                                || ownership.contains_key(entry.path.as_str())
+                        });
                     }
                     entries.sort_by(|a, b| a.path.cmp(&b.path));
                     this.0.borrow_mut().entries = entries;
@@ -2290,6 +2566,7 @@ impl Driver {
                 .collect();
 
             let mut search_docs = Vec::new();
+            let mut summaries = HashMap::new();
 
             // Rebuild knowledge index completely from scratch
             let mut new_knowledge = knowledge::KnowledgeIndex::new();
@@ -2319,6 +2596,7 @@ impl Driver {
                 let mut title = String::new();
                 let mut blocks = Vec::new();
                 let mut md_blocks_for_knowledge = Vec::new();
+                let mut summary = None;
 
                 if let Some(doc_id) = doc_id_opt {
                     let storage_key = document_storage_key(workspace_id, doc_id);
@@ -2326,6 +2604,11 @@ impl Driver {
                     match record_result {
                         Ok(Some(record_json)) => match storage::deserialize_record(&record_json) {
                             Ok(record) => {
+                                let edited_at_ms = record
+                                    .pending_updates
+                                    .iter()
+                                    .map(|update| update.applied_at_ms)
+                                    .fold(record.edited_at_ms, i64::max);
                                 let mut doc = record.confirmed_doc;
                                 let text_pending = record
                                     .pending_updates
@@ -2393,6 +2676,7 @@ impl Driver {
                                     continue;
                                 }
                                 title = doc.title.clone();
+                                summary = Some(home::summarize(&doc, edited_at_ms));
                                 md_blocks_for_knowledge =
                                     inkstone_core::markdown::index_document_blocks(&doc);
                                 for block in doc.blocks {
@@ -2421,6 +2705,9 @@ impl Driver {
                     }
                 }
 
+                if let Some(summary) = summary {
+                    summaries.insert(path.clone(), summary);
+                }
                 search_docs.push(search::SearchDocument {
                     path: path.clone(),
                     file_name,
@@ -2440,6 +2727,7 @@ impl Driver {
                     return;
                 }
                 inner.search_documents = search_docs;
+                inner.note_summaries = summaries;
                 inner.knowledge = new_knowledge;
                 inner.search_indexing = false;
             }
@@ -2448,6 +2736,14 @@ impl Driver {
     }
 
     fn update_search_index_for_active_doc(&self, path: &str) {
+        {
+            let mut inner = self.0.borrow_mut();
+            let summary = home::summarize(
+                &Driver::effective_document(&inner),
+                js_sys::Date::now() as i64,
+            );
+            inner.note_summaries.insert(path.to_string(), summary);
+        }
         let updated = {
             let mut inner = self.0.borrow_mut();
             inner.search_index_revision += 1;
@@ -2845,13 +3141,6 @@ impl Driver {
             .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
             .map(|input| input.value())
             .unwrap_or_default();
-        let vault_passphrase = document
-            .query_selector(".auth-vault-passphrase")
-            .ok()
-            .flatten()
-            .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
-            .map(|input| input.value())
-            .unwrap_or_default();
         if endpoint == "/api/auth/login" {
             let mut inner = self.0.borrow_mut();
             inner.new_account_setup_pending = false;
@@ -2863,11 +3152,12 @@ impl Driver {
             self.render();
             return;
         }
-        if endpoint == "/api/auth/register" && vault_passphrase.is_empty() {
-            self.0.borrow_mut().auth_error =
-                Some("A vault passphrase is required to protect workspace keys".into());
-            self.render();
-            return;
+        if endpoint == "/api/auth/register" {
+            if let Err(message) = crypto::check_new_password(&password) {
+                self.0.borrow_mut().auth_error = Some(message);
+                self.render();
+                return;
+            }
         }
         if endpoint == "/api/auth/register" && self.0.borrow().recovery_key_display.is_none() {
             let Ok(vault_key) = crypto::random_key() else {
@@ -2884,23 +3174,15 @@ impl Driver {
             inner.account_vault_key = Some(vault_key);
             inner.recovery_key_display = Some(crypto::recovery_key_to_string(&recovery_key));
             inner.new_account_setup_pending = true;
-            inner.auth_error = Some(
-                "Save the recovery key, then confirm below before registration can complete."
-                    .into(),
-            );
+            inner.auth_error =
+                Some("Save your recovery key somewhere safe, then confirm below.".into());
             drop(inner);
             self.render();
             return;
         }
         if endpoint == "/api/auth/register" && !recovery_confirmation_checked(&document) {
             self.0.borrow_mut().auth_error =
-                Some("Confirm that you saved the recovery key before continuing".into());
-            self.render();
-            return;
-        }
-        if vault_passphrase.len() > 1024 {
-            self.0.borrow_mut().auth_error =
-                Some("Vault passphrase must be at most 1024 bytes".into());
+                Some("Confirm you've saved your recovery key first".into());
             self.render();
             return;
         }
@@ -2915,9 +3197,20 @@ impl Driver {
         let pending_invite = self.0.borrow().pending_invite.clone();
         let this = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
+            let secret = match crypto::login_secret(&password, &email) {
+                Ok(secret) => secret,
+                Err(message) => {
+                    let mut inner = this.0.borrow_mut();
+                    inner.auth_phase = AuthPhase::SignedOut;
+                    inner.auth_error = Some(message);
+                    drop(inner);
+                    this.render();
+                    return;
+                }
+            };
             let registration = RegisterRequest {
                 email: email.clone(),
-                password: password.clone(),
+                password: secret.clone(),
                 device_id,
                 device_name: Some("Inkstone browser".into()),
             };
@@ -2928,7 +3221,7 @@ impl Driver {
                         endpoint,
                         Some(&LoginRequest {
                             email,
-                            password,
+                            password: secret,
                             device_id,
                             device_name: Some("Inkstone browser".into()),
                         }),
@@ -2952,11 +3245,7 @@ impl Driver {
                 _ => return,
             };
             match result {
-                Ok(user) => {
-                    let vault_passphrase =
-                        (!vault_passphrase.is_empty()).then_some(vault_passphrase);
-                    this.bootstrap_authenticated(user, vault_passphrase).await;
-                }
+                Ok(user) => this.bootstrap_authenticated(user, Some(password)).await,
                 Err(error) => {
                     let mut inner = this.0.borrow_mut();
                     inner.auth_phase = AuthPhase::SignedOut;
@@ -2972,12 +3261,35 @@ impl Driver {
         let Some(flow) = self.0.borrow().account_token_flow.clone() else {
             return;
         };
-        let password = web_sys::window()
-            .and_then(|window| window.document())
-            .and_then(|document| document.query_selector(".reset-password").ok().flatten())
-            .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
-            .map(|input| input.value())
-            .unwrap_or_default();
+        let read = |selector: &str| {
+            web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.query_selector(selector).ok().flatten())
+                .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
+                .map(|input| input.value())
+                .unwrap_or_default()
+        };
+        let password = read(".reset-password");
+        let email = read(".reset-email");
+        let secret = if matches!(flow, AccountTokenFlow::PasswordReset(_)) {
+            if email.trim().is_empty() {
+                self.0.borrow_mut().auth_error = Some("Enter your account email".into());
+                self.render();
+                return;
+            }
+            match crypto::check_new_password(&password)
+                .and_then(|()| crypto::login_secret(&password, &email))
+            {
+                Ok(secret) => secret,
+                Err(message) => {
+                    self.0.borrow_mut().auth_error = Some(message);
+                    self.render();
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
         let this = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let result = match flow {
@@ -2989,18 +3301,17 @@ impl Driver {
                     )
                     .await
                 }
-                AccountTokenFlow::PasswordReset(token) if !password.is_empty() => {
+                AccountTokenFlow::PasswordReset(token) => {
                     api::json::<GenericMessageResponse, _>(
                         "POST",
                         "/api/auth/password-reset/consume",
-                        Some(&ConsumePasswordResetRequest { token, password }),
+                        Some(&ConsumePasswordResetRequest {
+                            token,
+                            email: Some(email),
+                            password: secret,
+                        }),
                     )
                     .await
-                }
-                AccountTokenFlow::PasswordReset(_) => {
-                    this.0.borrow_mut().auth_error = Some("Enter a new account password".into());
-                    this.render();
-                    return;
                 }
             };
             let mut inner = this.0.borrow_mut();
@@ -3087,8 +3398,19 @@ impl Driver {
                 .unwrap_or_default()
         };
         let recovery = value(".recovery-key-input");
-        let new_passphrase = value(".recovery-new-passphrase");
+        let typed = value(".recovery-password");
         let Some(user) = self.0.borrow().auth_user.clone() else {
+            return;
+        };
+        let Some(password) = self
+            .0
+            .borrow()
+            .pending_password
+            .clone()
+            .or((!typed.is_empty()).then_some(typed))
+        else {
+            self.0.borrow_mut().auth_error = Some("Enter your password too".into());
+            self.render();
             return;
         };
         let this = self.clone();
@@ -3107,27 +3429,22 @@ impl Driver {
                         .iter()
                         .find(|item| item.kind == "recovery_key")
                         .ok_or_else(|| "No recovery envelope is configured".to_string())?;
-                let passphrase_version = envelopes
-                    .iter()
-                    .find(|item| item.kind == "passphrase")
-                    .map(|item| item.version);
                 let vault_key: [u8; 32] = crypto::decrypt(
                     &recovery_key,
                     &recovery_envelope.ciphertext_b64,
                     &recovery_envelope.nonce_b64,
                     &crypto::account_vault_aad(user.id, "recovery_key"),
-                )?
+                )
+                .map_err(|_| "That recovery key doesn't match this account".to_string())?
                 .try_into()
                 .map_err(|_| "Recovery envelope has an invalid key length".to_string())?;
-                this.put_account_envelope(
-                    user.id,
-                    "passphrase",
-                    &crypto::derive_account_kek(&new_passphrase, user.id)?,
-                    &vault_key,
-                    passphrase_version,
-                )
-                .await?;
-                this.0.borrow_mut().account_vault_key = Some(vault_key);
+                this.rewrap_with_password(&user, &envelopes, &password, &password, &vault_key)
+                    .await?;
+                {
+                    let mut inner = this.0.borrow_mut();
+                    inner.account_vault_key = Some(vault_key);
+                    inner.pending_password = None;
+                }
                 this.bootstrap_authenticated_inner(&user, None).await
             }
             .await;
@@ -3136,6 +3453,46 @@ impl Driver {
                 this.render();
             }
         });
+    }
+
+    /// Wraps the vault key with `new_password` and makes it the sign-in
+    /// password, in one step on the server.
+    async fn rewrap_with_password(
+        &self,
+        user: &AuthUserResponse,
+        envelopes: &[RecoveryEnvelopeResponse],
+        current_password: &str,
+        new_password: &str,
+        vault_key: &[u8; 32],
+    ) -> Result<(), String> {
+        let expected_version = envelopes
+            .iter()
+            .find(|item| item.kind == "passphrase")
+            .map(|item| item.version);
+        let encrypted = crypto::encrypt(
+            &crypto::derive_account_kek(new_password, user.id)?,
+            vault_key,
+            &crypto::account_vault_aad(user.id, "passphrase"),
+        )?;
+        api::json::<GenericMessageResponse, _>(
+            "POST",
+            "/api/auth/password",
+            Some(&ChangePasswordRequest {
+                current_password: crypto::login_secret(current_password, &user.email)?,
+                new_password: crypto::login_secret(new_password, &user.email)?,
+                passphrase_envelope: RecoveryEnvelopeRequest {
+                    kind: "passphrase".into(),
+                    expected_version,
+                    ciphertext_b64: encrypted.ciphertext_b64,
+                    nonce_b64: encrypted.nonce_b64,
+                    aad_version: crypto::AAD_VERSION,
+                    wrapping_version: crypto::WRAPPING_VERSION,
+                },
+            }),
+        )
+        .await
+        .map_err(|error| error.message)?;
+        Ok(())
     }
 
     fn copy_recovery_key(&self) {
@@ -3163,7 +3520,7 @@ impl Driver {
         }
     }
 
-    fn change_vault_passphrase(&self) {
+    fn change_password(&self) {
         let Some(document) = web_sys::window().and_then(|window| window.document()) else {
             return;
         };
@@ -3176,9 +3533,17 @@ impl Driver {
                 .map(|input| input.value())
                 .unwrap_or_default()
         };
-        let passphrase = read(".new-vault-passphrase");
-        if passphrase.is_empty() || passphrase != read(".new-vault-passphrase-confirm") {
-            self.0.borrow_mut().auth_error = Some("New vault passphrases must match".into());
+        let current = read(".current-password");
+        let new_password = read(".new-password");
+        let problem = if current.is_empty() {
+            Some("Enter your current password".to_string())
+        } else if new_password != read(".new-password-confirm") {
+            Some("New passwords don't match".to_string())
+        } else {
+            crypto::check_new_password(&new_password).err()
+        };
+        if let Some(problem) = problem {
+            self.0.borrow_mut().auth_error = Some(problem);
             self.render();
             return;
         }
@@ -3198,25 +3563,33 @@ impl Driver {
                 )
                 .await
                 .map_err(|error| error.message)?;
-                let version = envelopes
-                    .iter()
-                    .find(|item| item.kind == "passphrase")
-                    .map(|item| item.version);
-                this.put_account_envelope(
-                    user.id,
-                    "passphrase",
-                    &crypto::derive_account_kek(&passphrase, user.id)?,
-                    &vault_key,
-                    version,
-                )
-                .await
+                this.rewrap_with_password(&user, &envelopes, &current, &new_password, &vault_key)
+                    .await
             }
             .await;
             match result {
-                Ok(()) => this.0.borrow_mut().auth_notice = Some(
-                    "Vault passphrase changed. Documents and workspace keys were not re-encrypted."
-                        .into(),
-                ),
+                Ok(()) => {
+                    if let Some(inputs) = web_sys::window()
+                        .and_then(|window| window.document())
+                        .and_then(|document| {
+                            document
+                                .query_selector_all(".settings-dialog input[type=password]")
+                                .ok()
+                        })
+                    {
+                        for index in 0..inputs.length() {
+                            if let Some(input) = inputs
+                                .item(index)
+                                .and_then(|node| node.dyn_into::<web_sys::HtmlInputElement>().ok())
+                            {
+                                input.set_value("");
+                            }
+                        }
+                    }
+                    let mut inner = this.0.borrow_mut();
+                    inner.auth_error = None;
+                    inner.auth_notice = Some("Password changed.".into());
+                }
                 Err(error) => this.0.borrow_mut().auth_error = Some(error),
             }
             this.render();
@@ -3236,33 +3609,18 @@ impl Driver {
                 .map(|input| input.value())
                 .unwrap_or_default()
         };
+        let email = input_value(".owner-email");
         let password = input_value(".owner-password");
         let password_confirmation = input_value(".owner-password-confirmation");
-        let vault_passphrase = input_value(".owner-vault-passphrase");
-        let vault_confirmation = input_value(".owner-vault-confirmation");
-        if password.is_empty() || password_confirmation.is_empty() {
-            self.0.borrow_mut().auth_error = Some("Enter and confirm the account password".into());
-            self.render();
-            return;
-        }
-        if password != password_confirmation {
-            self.0.borrow_mut().auth_error = Some("Account passwords do not match".into());
-            self.render();
-            return;
-        }
-        if vault_passphrase.is_empty() || vault_confirmation.is_empty() {
-            self.0.borrow_mut().auth_error = Some("Enter and confirm the vault passphrase".into());
-            self.render();
-            return;
-        }
-        if vault_passphrase != vault_confirmation {
-            self.0.borrow_mut().auth_error = Some("Vault passphrases do not match".into());
-            self.render();
-            return;
-        }
-        if vault_passphrase.len() > 1024 {
-            self.0.borrow_mut().auth_error =
-                Some("Vault passphrase must be at most 1024 bytes".into());
+        let problem = if email.trim().is_empty() {
+            Some("Enter your email".to_string())
+        } else if password != password_confirmation {
+            Some("Passwords don't match".to_string())
+        } else {
+            crypto::check_new_password(&password).err()
+        };
+        if let Some(problem) = problem {
+            self.0.borrow_mut().auth_error = Some(problem);
             self.render();
             return;
         }
@@ -3277,16 +3635,15 @@ impl Driver {
             inner.account_vault_key = Some(vault_key);
             inner.recovery_key_display = Some(crypto::recovery_key_to_string(&recovery_key));
             inner.new_account_setup_pending = true;
-            inner.auth_error = Some(
-                "Save the recovery key, then confirm below before owner setup can complete.".into(),
-            );
+            inner.auth_error =
+                Some("Save your recovery key somewhere safe, then confirm below.".into());
             drop(inner);
             self.render();
             return;
         }
         if !recovery_confirmation_checked(&document) {
             self.0.borrow_mut().auth_error =
-                Some("Confirm that you saved the recovery key before continuing".into());
+                Some("Confirm you've saved your recovery key first".into());
             self.render();
             return;
         }
@@ -3306,12 +3663,24 @@ impl Driver {
         self.render();
         let this = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
+            let secret = match crypto::login_secret(&password, &email) {
+                Ok(secret) => secret,
+                Err(message) => {
+                    let mut inner = this.0.borrow_mut();
+                    inner.owner_setup_in_flight = false;
+                    inner.auth_error = Some(message);
+                    drop(inner);
+                    this.render();
+                    return;
+                }
+            };
             match api::json::<AuthUserResponse, _>(
                 "POST",
                 "/api/auth/owner-setup",
                 Some(&OwnerSetupRequest {
                     token,
-                    password,
+                    email: Some(email),
+                    password: secret,
                     device_id,
                     device_name: Some("Inkstone browser".into()),
                 }),
@@ -3324,8 +3693,7 @@ impl Driver {
                         inner.owner_setup_token = None;
                         inner.owner_setup_in_flight = false;
                     }
-                    this.bootstrap_authenticated(user, Some(vault_passphrase))
-                        .await;
+                    this.bootstrap_authenticated(user, Some(password)).await;
                 }
                 Err(error) => {
                     let mut inner = this.0.borrow_mut();
@@ -3339,20 +3707,14 @@ impl Driver {
     }
 
     fn unlock_workspace(&self) {
-        let vault_passphrase = web_sys::window()
+        let password = web_sys::window()
             .and_then(|window| window.document())
             .and_then(|document| document.query_selector(".unlock-password").ok().flatten())
             .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
             .map(|input| input.value())
             .unwrap_or_default();
-        if vault_passphrase.is_empty() {
-            self.0.borrow_mut().auth_error = Some("Vault passphrase is required".into());
-            self.render();
-            return;
-        }
-        if vault_passphrase.len() > 1024 {
-            self.0.borrow_mut().auth_error =
-                Some("Vault passphrase must be at most 1024 bytes".into());
+        if password.is_empty() {
+            self.0.borrow_mut().auth_error = Some("Enter your password".into());
             self.render();
             return;
         }
@@ -3364,8 +3726,7 @@ impl Driver {
         self.render();
         let this = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            this.bootstrap_authenticated(user, Some(vault_passphrase))
-                .await;
+            this.bootstrap_authenticated(user, Some(password)).await;
         });
     }
 
@@ -3394,6 +3755,7 @@ impl Driver {
             .await;
         if let Err(message) = result {
             let mut inner = self.0.borrow_mut();
+            inner.pending_password = password;
             inner.auth_phase = if inner.auth_user.is_some() {
                 AuthPhase::UnlockRequired
             } else {
@@ -3424,9 +3786,8 @@ impl Driver {
                 .borrow()
                 .account_vault_key
                 .ok_or_else(|| "New account vault key is unavailable".to_string())?;
-            if let (Some(passphrase), Some(displayed)) =
-                (password, self.0.borrow().recovery_key_display.clone())
-            {
+            let displayed = self.0.borrow().recovery_key_display.clone();
+            if let (Some(passphrase), Some(displayed)) = (password, displayed) {
                 let recovery_key = crypto::recovery_key_from_string(&displayed)?;
                 self.ensure_new_account_envelopes(
                     user.id,
@@ -3444,15 +3805,28 @@ impl Driver {
             vault_key
         } else if let Some(vault_key) = self.0.borrow().account_vault_key {
             vault_key
+        } else if let Some(password) = password {
+            self.unlock_account_vault(user.id, password).await?
+        } else if let Some(vault_key) = remembered_vault_key(&workspace_db, user.id).await {
+            vault_key
         } else {
-            let Some(passphrase) = password else {
-                self.0.borrow_mut().auth_phase = AuthPhase::UnlockRequired;
-                self.render();
-                return Ok(());
-            };
-            self.unlock_account_vault(user.id, passphrase).await?
+            self.0.borrow_mut().auth_phase = AuthPhase::UnlockRequired;
+            self.render();
+            return Ok(());
         };
         self.0.borrow_mut().account_vault_key = Some(vault_key);
+        self.0.borrow_mut().pending_password = None;
+        let remembered = format!(
+            "{}:{}",
+            user.id,
+            base64::engine::general_purpose::STANDARD.encode(vault_key)
+        );
+        if let Err(error) = workspace_db
+            .set_global_metadata(REMEMBERED_VAULT_KEY, &remembered)
+            .await
+        {
+            web_sys::console::warn_1(&format!("Could not remember the unlock: {error:?}").into());
+        }
         self.ensure_device_key(user, &workspace_db, &vault_key)
             .await?;
 
@@ -3510,8 +3884,9 @@ impl Driver {
             let encrypted_metadata = crypto::encrypt(
                 &key,
                 &serde_json::to_vec(&WorkspaceMetadata {
-                    name: "My Workspace".into(),
+                    name: "My vault".into(),
                     description: String::new(),
+                    public_link: None,
                 })
                 .map_err(|error| error.to_string())?,
                 &crypto::workspace_metadata_aad(workspace_id),
@@ -3549,17 +3924,18 @@ impl Driver {
             .await
             .map_err(|error| format!("Failed to read selected workspace: {error:?}"))?
             .and_then(|value| uuid::Uuid::parse_str(&value).ok());
-        let preferred_id = awaiting_workspace
-            .or(self.0.borrow().workspace_id)
-            .or(stored_preference);
-        let workspace = match preferred_id {
-            Some(id) => workspaces
-                .iter()
-                .find(|workspace| workspace.id == id)
+        let remembered = self.0.borrow().workspace_id.or(stored_preference);
+        let find = |id: uuid::Uuid| workspaces.iter().find(|workspace| workspace.id == id);
+        let workspace = match awaiting_workspace {
+            // An invitation names its workspace; anything else is wrong.
+            Some(id) => find(id)
                 .cloned()
-                .ok_or_else(|| "The selected workspace is no longer available".to_string())?,
-            None => workspaces
-                .first()
+                .ok_or_else(|| "The invited workspace is not available yet".to_string())?,
+            // The last workspace used may since have been deleted or left:
+            // open another rather than locking the user out.
+            None => remembered
+                .and_then(find)
+                .or_else(|| workspaces.first())
                 .cloned()
                 .ok_or_else(|| "No workspace is available".to_string())?,
         };
@@ -3651,7 +4027,7 @@ impl Driver {
         let envelope = envelopes
             .into_iter()
             .find(|envelope| envelope.kind == "passphrase")
-            .ok_or_else(|| "This account has no passphrase vault envelope".to_string())?;
+            .ok_or_else(|| "This account has no password-locked vault yet".to_string())?;
         if envelope.aad_version != crypto::AAD_VERSION
             || envelope.wrapping_version != crypto::WRAPPING_VERSION
         {
@@ -3662,7 +4038,11 @@ impl Driver {
             &envelope.ciphertext_b64,
             &envelope.nonce_b64,
             &crypto::account_vault_aad(user_id, "passphrase"),
-        )?
+        )
+        .map_err(|_| {
+            "That password didn't unlock your notes. If you reset it, use your recovery key."
+                .to_string()
+        })?
         .try_into()
         .map_err(|_| "Account vault envelope has an invalid key length".into())
     }
@@ -3678,17 +4058,25 @@ impl Driver {
             .await
             .map_err(|error| format!("Failed to read the device key: {error:?}"))?
         {
-            let envelope: crypto::Ciphertext = serde_json::from_str(&value)
-                .map_err(|_| "Invalid local device key envelope".to_string())?;
-            let private: [u8; 32] = crypto::decrypt(
-                vault_key,
-                &envelope.ciphertext_b64,
-                &envelope.nonce_b64,
-                &crypto::device_private_key_aad(user.id, user.device_id),
-            )?
-            .try_into()
-            .map_err(|_| "Local device private key has an invalid length".to_string())?;
-            return Ok(private);
+            // A key that this account's vault cannot open was left by an
+            // account that is gone (signed in elsewhere, reset, recreated)
+            // without signing out here. It only ever received invitation keys
+            // for that account, so this one gets a fresh key instead.
+            let private = serde_json::from_str::<crypto::Ciphertext>(&value)
+                .ok()
+                .and_then(|envelope| {
+                    crypto::decrypt(
+                        vault_key,
+                        &envelope.ciphertext_b64,
+                        &envelope.nonce_b64,
+                        &crypto::device_private_key_aad(user.id, user.device_id),
+                    )
+                    .ok()
+                })
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+            if let Some(private) = private {
+                return Ok(private);
+            }
         }
         let (private, _) = crypto::generate_device_keypair()?;
         let envelope = crypto::encrypt(
@@ -3778,12 +4166,54 @@ impl Driver {
                 encrypted_key_b64: encrypted.ciphertext_b64,
                 nonce_b64: encrypted.nonce_b64,
                 aad_version: crypto::AAD_VERSION,
+                replace_version: None,
             }),
         )
         .await
         .map_err(|error| error.message)?;
         self.0.borrow_mut().needs_key_envelope = false;
         Ok(())
+    }
+
+    async fn share_key_across_devices(
+        &self,
+        workspace: &WorkspaceResponse,
+        user: &AuthUserResponse,
+        vault_key: &[u8; 32],
+        key: &[u8; 32],
+        envelope: &WorkspaceKeyEnvelopeResponse,
+    ) {
+        let aad = crypto::workspace_key_aad(workspace.id, user.id);
+        if crypto::decrypt(
+            vault_key,
+            &envelope.encrypted_key_b64,
+            &envelope.nonce_b64,
+            &aad,
+        )
+        .is_ok()
+        {
+            return;
+        }
+        let Ok(encrypted) = crypto::encrypt(vault_key, key, &aad) else {
+            return;
+        };
+        let path = format!("/api/workspaces/{}/key-envelope", workspace.id);
+        if let Err(error) = api::json::<WorkspaceKeyEnvelopeResponse, _>(
+            "PUT",
+            &path,
+            Some(&PutWorkspaceKeyEnvelopeRequest {
+                encrypted_key_b64: encrypted.ciphertext_b64,
+                nonce_b64: encrypted.nonce_b64,
+                aad_version: crypto::AAD_VERSION,
+                replace_version: Some(envelope.version),
+            }),
+        )
+        .await
+        {
+            web_sys::console::warn_1(
+                &format!("Could not share the vault key: {}", error.message).into(),
+            );
+        }
     }
 
     async fn activate_workspace(
@@ -3831,7 +4261,7 @@ impl Driver {
                     let Some(vault_key) = vault_key else {
                         let mut inner = self.0.borrow_mut();
                         inner.workspace_id = Some(workspace.id);
-                        inner.workspace_name = "Encrypted workspace".into();
+                        inner.workspace_name = "Locked vault".into();
                         inner.auth_phase = AuthPhase::UnlockRequired;
                         inner.auth_error = None;
                         drop(inner);
@@ -3861,13 +4291,17 @@ impl Driver {
                     }
                     self.0.borrow_mut().needs_key_envelope = false;
                 }
+                if let Some(vault_key) = vault_key {
+                    self.share_key_across_devices(&workspace, user, vault_key, &key, &envelope)
+                        .await;
+                }
                 key
             }
             (Some(key), Err(error)) if error.status == 404 => {
                 let Some(vault_key) = vault_key else {
                     let mut inner = self.0.borrow_mut();
                     inner.workspace_id = Some(workspace.id);
-                    inner.workspace_name = "Encrypted workspace".into();
+                    inner.workspace_name = "Locked vault".into();
                     inner.workspace_key = Some(key);
                     inner.auth_phase = AuthPhase::UnlockRequired;
                     inner.auth_error = None;
@@ -3884,7 +4318,7 @@ impl Driver {
                 let Some(vault_key) = vault_key else {
                     let mut inner = self.0.borrow_mut();
                     inner.workspace_id = Some(workspace.id);
-                    inner.workspace_name = "Encrypted workspace".into();
+                    inner.workspace_name = "Locked vault".into();
                     inner.auth_phase = AuthPhase::UnlockRequired;
                     inner.auth_error = None;
                     drop(inner);
@@ -3916,9 +4350,14 @@ impl Driver {
                             &private,
                             workspace.id,
                             user.id,
-                        )?
+                        )
+                        .map_err(|_| {
+                            "This device doesn't have the key to this vault yet. Open Inkstone once on the device where you accepted the invite, then sign in here again.".to_string()
+                        })?
                     }
                 };
+                self.share_key_across_devices(&workspace, user, vault_key, &key, &envelope)
+                    .await;
                 let local_envelope = crypto::encrypt(
                     vault_key,
                     &key,
@@ -3944,7 +4383,7 @@ impl Driver {
             let Some(vault_key) = vault_key else {
                 let mut inner = self.0.borrow_mut();
                 inner.workspace_id = Some(workspace.id);
-                inner.workspace_name = "Encrypted workspace".into();
+                inner.workspace_name = "Locked vault".into();
                 inner.workspace_key = Some(key);
                 inner.auth_phase = AuthPhase::UnlockRequired;
                 inner.auth_error = None;
@@ -3956,6 +4395,24 @@ impl Driver {
                 .await?;
         }
 
+        self.enter_workspace(workspace, key).await
+    }
+
+    async fn enter_workspace(
+        &self,
+        workspace: WorkspaceResponse,
+        key: [u8; 32],
+    ) -> Result<(), String> {
+        let (workspace_db, public_view) = {
+            let inner = self.0.borrow();
+            (
+                inner
+                    .workspace_db
+                    .clone()
+                    .ok_or_else(|| "Local workspace storage is unavailable".to_string())?,
+                inner.public_view.is_some(),
+            )
+        };
         workspace_db
             .activate_workspace_scope(workspace.id)
             .await
@@ -3978,6 +4435,9 @@ impl Driver {
             inner.workspace_id = Some(workspace.id);
             inner.workspace_name = workspace_metadata.name;
             inner.workspace_description = workspace_metadata.description;
+            inner.workspace_public_link = workspace_metadata.public_link;
+            let name = inner.workspace_name.clone();
+            inner.vault_names.insert(workspace.id, name);
             inner.workspace_key = Some(key);
             inner.active_workspace_ownership = ownership;
             inner.remote_docs.clear();
@@ -3998,23 +4458,45 @@ impl Driver {
             .into_iter()
             .filter(|path| ownership_paths.contains(path))
             .collect();
-        workspace_db
-            .set_global_metadata(SELECTED_WORKSPACE_KEY, &workspace.id.to_string())
-            .await
-            .map_err(|error| format!("Failed to preserve selected workspace: {error:?}"))?;
+        if !public_view {
+            workspace_db
+                .set_global_metadata(SELECTED_WORKSPACE_KEY, &workspace.id.to_string())
+                .await
+                .map_err(|error| format!("Failed to preserve selected workspace: {error:?}"))?;
+        }
         self.persist_active_workspace_ownership(workspace.id)
             .await?;
         self.discover_remote_docs(workspace.id, key, workspace_revision)
             .await?;
-        let members_path = format!("/api/workspaces/{}/members", workspace.id);
-        let members = api::json::<PaginatedResponse<WorkspaceMemberResponse>, serde_json::Value>(
-            "GET",
-            &members_path,
-            None,
-        )
-        .await
-        .map(|response| response.items)
-        .unwrap_or_default();
+        let members = if public_view {
+            let inner = self.0.borrow();
+            let role = if inner.guest_name.is_some() && workspace.public_link_editable {
+                "editor"
+            } else {
+                "viewer"
+            };
+            inner
+                .auth_user
+                .iter()
+                .map(|user| WorkspaceMemberResponse {
+                    user_id: user.id,
+                    email: String::new(),
+                    role: role.into(),
+                    joined_at: workspace.created_at,
+                    guest_name: None,
+                })
+                .collect()
+        } else {
+            let members_path = format!("/api/workspaces/{}/members", workspace.id);
+            api::json::<PaginatedResponse<WorkspaceMemberResponse>, serde_json::Value>(
+                "GET",
+                &members_path,
+                None,
+            )
+            .await
+            .map(|response| response.items)
+            .unwrap_or_default()
+        };
         {
             let mut inner = self.0.borrow_mut();
             inner.members = members;
@@ -4027,6 +4509,9 @@ impl Driver {
         self.refresh_entries();
         self.start_discovery_timer();
         self.render();
+        if !public_view {
+            self.load_vault_names();
+        }
         Ok(())
     }
 
@@ -4078,6 +4563,7 @@ impl Driver {
         workspace_id: uuid::Uuid,
         key: [u8; 32],
         doc_id: DocId,
+        remote_seq: Option<i64>,
         db: &IndexedDb,
     ) -> Result<bool, String> {
         if self.0.borrow().selected_doc_id == doc_id
@@ -4095,6 +4581,9 @@ impl Driver {
                 .map_err(|error| format!("local record is corrupt: {error}"))?,
             None => storage::new_record(doc_id),
         };
+        if remote_seq.is_some_and(|seq| record.confirmed_seq >= seq) {
+            return Ok(false);
+        }
         let mut changed = false;
         let snapshot_endpoint = format!("/api/docs/{}/snapshot", doc_id.0);
         match api::json::<inkstone_core::protocol::SnapshotResponse, serde_json::Value>(
@@ -4138,7 +4627,12 @@ impl Driver {
         let hydration_effects = state.transition(TextClientEvent::Hydrate {
             document: record.confirmed_doc.clone(),
             snapshot: record.text_snapshot.clone(),
-            pending_updates: record.pending_updates.clone(),
+            pending_updates: record
+                .pending_updates
+                .iter()
+                .filter(|update| matches!(update.op, DocumentOp::ApplyTextUpdateV2 { .. }))
+                .cloned()
+                .collect(),
         });
         if let Some(error) = hydration_effects
             .into_iter()
@@ -4181,19 +4675,57 @@ impl Driver {
                 if update.doc_id != doc_id || update.update_id != encrypted.update_id {
                     return Err("decrypted tail update identity mismatch".into());
                 }
+                storage::note_edit(&mut record, update.applied_at_ms);
+                if !matches!(update.op, DocumentOp::ApplyTextUpdateV2 { .. }) {
+                    // Blocks, ink and moves replay on the document itself;
+                    // only text goes through the CRDT, which then learns
+                    // the new structure.
+                    let mut document = record.confirmed_doc.clone();
+                    if let inkstone_core::ReplayOutcome::Fatal { reason } =
+                        inkstone_core::sequenced_replay(&mut document, update)
+                    {
+                        return Err(format!(
+                            "tail update {} could not be replayed: {reason}",
+                            encrypted.seq
+                        ));
+                    }
+                    storage::preserve_collaborative_text(&mut document, &record.confirmed_doc);
+                    state.adopt_structure(&document);
+                    record.confirmed_doc = document;
+                    record.confirmed_seq = encrypted.seq;
+                    changed = true;
+                    continue;
+                }
+                let op = update.op.clone();
                 let effects = state.transition(TextClientEvent::RemoteUpdate { update });
+                let mut merge_error = None;
                 let (token, checkpoint) = effects
                     .into_iter()
                     .find_map(|effect| match effect {
                         TextClientEffect::PersistRemoteMerge { token, checkpoint } => {
                             Some((token, checkpoint))
                         }
+                        TextClientEffect::NotifyError(error) => {
+                            merge_error = Some(error);
+                            None
+                        }
                         _ => None,
                     })
-                    .ok_or_else(|| "tail update could not be merged".to_string())?;
+                    .ok_or_else(|| {
+                        format!(
+                            "tail update {} could not be merged ({}): {op:?}",
+                            encrypted.seq,
+                            merge_error.unwrap_or_default()
+                        )
+                        .chars()
+                        .take(400)
+                        .collect::<String>()
+                    })?;
                 record.confirmed_doc = checkpoint.document.clone();
                 record.text_snapshot = Some(checkpoint.text_snapshot.clone());
-                record.pending_updates = checkpoint.pending_updates.clone();
+                record
+                    .pending_updates
+                    .retain(|pending| pending.update_id != checkpoint.merged_update_id);
                 record.confirmed_seq = encrypted.seq;
                 state.transition(TextClientEvent::RemoteMergePersisted { token });
                 changed = true;
@@ -4452,7 +4984,7 @@ impl Driver {
                 continue;
             }
             match self
-                .refresh_inactive_document(workspace_id, key, doc_id, &document_db)
+                .refresh_inactive_document(workspace_id, key, doc_id, doc.current_seq, &document_db)
                 .await
             {
                 Ok(true) => background_changed = true,
@@ -4601,6 +5133,18 @@ impl Driver {
             if self.0.borrow().workspace_revision != workspace_revision {
                 return Ok(false);
             }
+            let fetched = format!("{}:{}", asset.version, asset.metadata_version);
+            if workspace_db
+                .get_metadata(&asset_fetched_metadata(asset.id))
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(fetched.as_str())
+            {
+                remote_asset_ids.insert(asset.id);
+                continue;
+            }
             let mut chunks = Vec::with_capacity(asset.chunk_count as usize);
             for index in 0..asset.chunk_count {
                 let endpoint = format!(
@@ -4724,6 +5268,10 @@ impl Driver {
                     .insert(path.as_str().into(), None);
                 changed = true;
             }
+            workspace_db
+                .set_metadata(&asset_fetched_metadata(asset.id), &fetched)
+                .await
+                .map_err(|error| error.to_string())?;
             remote_asset_ids.insert(asset.id);
         }
 
@@ -4895,6 +5443,14 @@ impl Driver {
                 let _ = workspace_db
                     .delete_global_metadata(DEVICE_PRIVATE_KEY)
                     .await;
+                if let Err(error) = workspace_db
+                    .delete_global_metadata(REMEMBERED_VAULT_KEY)
+                    .await
+                {
+                    cleanup_error.get_or_insert_with(|| {
+                        format!("Failed to forget this device's unlock: {error:?}")
+                    });
+                }
                 cleanup_error
             } else {
                 Some("Local workspace storage is unavailable".to_string())
@@ -5587,6 +6143,7 @@ impl Driver {
         if self.0.borrow().local_mode {
             return;
         }
+        self.live_broadcast(&state, false);
         self.0.borrow_mut().pending_presence = Some(PresencePayload {
             version: PRESENCE_VERSION,
             sent_at_ms: js_sys::Date::now() as i64,
@@ -5613,34 +6170,48 @@ impl Driver {
 
     fn send_pending_presence(&self) {
         let payload = self.0.borrow_mut().pending_presence.take();
-        let Some(mut payload) = payload else { return };
-        let Ok((workspace_id, key, device_id)) = self.socket_context() else {
-            return;
-        };
+        let Some(payload) = payload else { return };
+        self.0.borrow_mut().last_presence = Some(payload.clone());
+        if let Some(frame) = self.seal_presence(payload) {
+            self.send_presence_frame(&frame);
+        }
+    }
+
+    /// Encrypts presence under the next counter, ready for the socket or a
+    /// direct Live mode channel.
+    fn seal_presence(&self, mut payload: PresencePayload) -> Option<EncryptedPresenceWire> {
+        let (workspace_id, key, device_id) = self.socket_context().ok()?;
         let doc_id = self.0.borrow().selected_doc_id;
         let counter = {
             let mut inner = self.0.borrow_mut();
             inner.presence_counter = inner.presence_counter.saturating_add(1);
-            payload.sent_at_ms = js_sys::Date::now() as i64;
-            inner.last_presence = Some(payload.clone());
             inner.presence_counter
         };
-        let Ok(plaintext) = serde_json::to_vec(&payload) else {
-            return;
-        };
-        let Ok(encrypted) = crypto::encrypt(
+        payload.sent_at_ms = js_sys::Date::now() as i64;
+        let plaintext = serde_json::to_vec(&payload).ok()?;
+        let encrypted = crypto::encrypt(
             &key,
             &plaintext,
             &crypto::presence_aad(workspace_id, doc_id.0, device_id, counter),
-        ) else {
-            return;
-        };
-        let Ok(message) = serde_json::to_string(&ClientWsMessage::EncryptedPresence {
+        )
+        .ok()?;
+        Some(EncryptedPresenceWire {
             doc_id: doc_id.0,
+            sender_device_id: device_id,
             encrypted_presence_b64: encrypted.ciphertext_b64,
             nonce_b64: encrypted.nonce_b64,
             aad_version: crypto::AAD_VERSION,
             counter,
+        })
+    }
+
+    fn send_presence_frame(&self, frame: &EncryptedPresenceWire) {
+        let Ok(message) = serde_json::to_string(&ClientWsMessage::EncryptedPresence {
+            doc_id: frame.doc_id,
+            encrypted_presence_b64: frame.encrypted_presence_b64.clone(),
+            nonce_b64: frame.nonce_b64.clone(),
+            aad_version: frame.aad_version,
+            counter: frame.counter,
         }) else {
             return;
         };
@@ -5651,6 +6222,9 @@ impl Driver {
         }
     }
 
+    /// Presence from the socket, or with `direct` from a Live mode channel.
+    /// Each path keeps its own replay counter: a direct frame may overtake
+    /// the socket copy of an earlier one, and both must still be accepted.
     fn handle_encrypted_presence(
         &self,
         frame: EncryptedPresenceWire,
@@ -5658,6 +6232,7 @@ impl Driver {
         doc_id: DocId,
         key: &[u8; 32],
         own_device_id: uuid::Uuid,
+        direct: bool,
     ) {
         if !presence_sender_allowed(frame.sender_device_id, own_device_id)
             || frame.doc_id != doc_id.0
@@ -5665,12 +6240,17 @@ impl Driver {
         {
             return;
         }
-        let previous = self
+        let socket_counter = self
             .0
             .borrow()
             .remote_presence
             .get(&frame.sender_device_id)
             .map(|item| item.counter);
+        let previous = if direct {
+            self.2.borrow().live.direct_counter(frame.sender_device_id)
+        } else {
+            socket_counter
+        };
         if !accept_presence_counter(previous, frame.counter) {
             return;
         }
@@ -5690,6 +6270,45 @@ impl Driver {
         let Some(payload) = payload.filter(|payload| payload.version == PRESENCE_VERSION) else {
             return;
         };
+        let sender = frame.sender_device_id;
+        if direct {
+            self.2
+                .borrow_mut()
+                .live
+                .note_direct_counter(sender, frame.counter);
+        }
+        if let PresenceKind::Signal { to, signal } = payload.state {
+            if direct {
+                return;
+            }
+            {
+                // Keep the counter moving without replacing what the sender
+                // is shown doing.
+                let mut inner = self.0.borrow_mut();
+                let now = js_sys::Date::now();
+                let entry = inner
+                    .remote_presence
+                    .entry(sender)
+                    .or_insert_with(|| RemotePresence {
+                        payload: PresencePayload {
+                            version: PRESENCE_VERSION,
+                            sent_at_ms: now as i64,
+                            state: PresenceKind::Idle,
+                        },
+                        counter: frame.counter,
+                        received_at_ms: now,
+                    });
+                entry.counter = frame.counter;
+                entry.received_at_ms = now;
+            }
+            if to.is_none_or(|to| to == own_device_id) {
+                self.live_handle_signal(sender, signal);
+            }
+            return;
+        }
+        if !direct {
+            self.live_noticed(sender);
+        }
         let is_ink = matches!(payload.state, PresenceKind::Ink { .. });
         if let PresenceKind::Ink {
             payload: ink_payload,
@@ -5708,7 +6327,11 @@ impl Driver {
             frame.sender_device_id,
             RemotePresence {
                 payload,
-                counter: frame.counter,
+                counter: if direct {
+                    socket_counter.unwrap_or(0)
+                } else {
+                    frame.counter
+                },
                 received_at_ms: js_sys::Date::now(),
             },
         );
@@ -5741,12 +6364,16 @@ impl Driver {
             };
             {
                 let mut ink = this.1.borrow_mut();
-                for participant in expired {
-                    ink.remove_remote_participant(participant);
+                for participant in &expired {
+                    ink.remove_remote_participant(*participant);
                 }
                 ink.expire_remote_previews(now, PRESENCE_TTL_MS);
             }
+            for participant in expired {
+                this.live_close_peer(participant);
+            }
             this.send_pending_presence();
+            this.live_announce();
             if changed {
                 this.render();
             }
@@ -5775,6 +6402,7 @@ impl Driver {
             }
         }
         drop(handles);
+        self.live_close_all(true);
         let mut inner = self.0.borrow_mut();
         inner.pending_presence = None;
         inner.last_presence = None;
@@ -5799,9 +6427,12 @@ impl Driver {
             "ws"
         };
         let url = format!(
-            "{scheme}://{}/api/sync/docs/{}/ws?device_id={device_id}",
+            "{scheme}://{}/api/sync/docs/{}/ws?device_id={device_id}{}",
             location.host().map_err(|_| "Invalid browser host")?,
-            doc_id.0
+            doc_id.0,
+            api::link_token()
+                .map(|token| format!("&link={token}"))
+                .unwrap_or_default()
         );
         let socket = web_sys::WebSocket::new(&url)
             .map_err(|error| format!("Failed to open WebSocket: {error:?}"))?;
@@ -5841,6 +6472,7 @@ impl Driver {
                         doc_id,
                         &key,
                         device_id,
+                        false,
                     );
                 }
                 return;
@@ -5856,11 +6488,14 @@ impl Driver {
                 ServerWsMessage::Ready {
                     doc_id: outer_doc_id,
                     current_seq,
-                } if outer_doc_id == doc_id.0 => message_driver.dispatch(ClientEvent::Ready {
-                    lifecycle,
-                    connection_id,
-                    current_seq,
-                }),
+                } if outer_doc_id == doc_id.0 => {
+                    message_driver.dispatch(ClientEvent::Ready {
+                        lifecycle,
+                        connection_id,
+                        current_seq,
+                    });
+                    message_driver.live_announce();
+                }
                 ServerWsMessage::EncryptedUpdate {
                     doc_id: outer_doc_id,
                     update_id: outer_update_id,
@@ -5917,6 +6552,10 @@ impl Driver {
                     }
                 }
                 ServerWsMessage::Error { message } => {
+                    if message == RATE_LIMITED {
+                        message_driver.resend_pending_text_soon();
+                        return;
+                    }
                     if message == "Workspace role is read-only" {
                         let mut inner = message_driver.0.borrow_mut();
                         let user_id = inner.auth_user.as_ref().map(|user| user.id);
@@ -5945,7 +6584,16 @@ impl Driver {
         socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
         let close_driver = self.clone();
-        let on_close = Closure::wrap(Box::new(move |_event: web_sys::CloseEvent| {
+        let on_close = Closure::wrap(Box::new(move |event: web_sys::CloseEvent| {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "Sync connection closed ({}{})",
+                event.code(),
+                if event.reason().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", event.reason())
+                }
+            )));
             close_driver.dispatch(ClientEvent::SocketDisconnected {
                 lifecycle,
                 connection_id,
@@ -5978,7 +6626,7 @@ impl Driver {
         }
     }
 
-    fn set_sync_error(&self, message: String) {
+    pub(crate) fn set_sync_error(&self, message: String) {
         web_sys::console::error_1(&JsValue::from_str(&message));
         self.0.borrow_mut().sync_error = Some(message);
         self.render();
@@ -5986,6 +6634,10 @@ impl Driver {
 
     fn invalidate_expired_session(&self) {
         if self.0.borrow().auth_user.is_none() {
+            return;
+        }
+        if self.0.borrow().public_view.is_some() {
+            self.public_link_revoked();
             return;
         }
         self.stop_discovery_timer();
@@ -6067,13 +6719,36 @@ impl Driver {
                 .discover_remote_docs(context.0, context.1, context.2)
                 .await;
             let members_path = format!("/api/workspaces/{}/members", context.0);
-            let refreshed_members = api::json::<
-                PaginatedResponse<WorkspaceMemberResponse>,
-                serde_json::Value,
-            >("GET", &members_path, None)
-            .await
-            .ok()
-            .map(|response| response.items);
+            let guest = this.0.borrow().guest_name.is_some();
+            let refreshed_members = if guest {
+                api::json::<PublicLinkResponse, serde_json::Value>("GET", "/api/public-link", None)
+                    .await
+                    .ok()
+                    .map(|details| {
+                        vec![WorkspaceMemberResponse {
+                            user_id: details.user_id,
+                            email: String::new(),
+                            role: if details.workspace.public_link_editable {
+                                "editor".into()
+                            } else {
+                                "viewer".into()
+                            },
+                            joined_at: details.workspace.created_at,
+                            guest_name: details.guest,
+                        }]
+                    })
+            } else if this.0.borrow().public_view.is_some() {
+                None
+            } else {
+                api::json::<PaginatedResponse<WorkspaceMemberResponse>, serde_json::Value>(
+                    "GET",
+                    &members_path,
+                    None,
+                )
+                .await
+                .ok()
+                .map(|response| response.items)
+            };
             let current = {
                 let mut inner = this.0.borrow_mut();
                 if inner.workspace_revision != context.2
@@ -6167,25 +6842,47 @@ impl Driver {
         card.append_child(&brand).unwrap();
         let subtitle = document.create_element("p").unwrap();
         subtitle.set_class_name("auth-subtitle");
-        subtitle.set_text_content(Some(
-            "Private notes, encrypted before they leave this browser.",
-        ));
+        subtitle.set_text_content(Some("Notes, ink and ideas, on one page."));
         card.append_child(&subtitle).unwrap();
+        if let Some(message) = &inner.public_view_error {
+            vaults::render_link_unavailable(document, &card, message);
+            shell.append_child(&card).unwrap();
+            root.append_child(&shell).unwrap();
+            return;
+        }
+        if let Some(join) = &inner.guest_join {
+            vaults::render_guest_join(document, &card, join);
+            shell.append_child(&card).unwrap();
+            root.append_child(&shell).unwrap();
+            return;
+        }
 
         if let Some(flow) = &inner.account_token_flow {
             let heading = document.create_element("h2").unwrap();
             heading.set_text_content(Some(match flow {
                 AccountTokenFlow::VerifyEmail(_) => "Verify email address",
-                AccountTokenFlow::PasswordReset(_) => "Reset account password",
+                AccountTokenFlow::PasswordReset(_) => "Reset your password",
             }));
             card.append_child(&heading).unwrap();
             if matches!(flow, AccountTokenFlow::PasswordReset(_)) {
                 let warning = document.create_element("p").unwrap();
                 warning.set_class_name("settings-warning");
                 warning.set_text_content(Some(
-                    "Password reset does not recover vault access. You still need your vault passphrase or recovery key.",
+                    "Your notes are locked with your old password. After signing in with the new one, you'll need your recovery key to unlock them.",
                 ));
                 card.append_child(&warning).unwrap();
+                let email = document.create_element("input").unwrap();
+                email.set_class_name("reset-email");
+                email.set_attribute("type", "email").unwrap();
+                email.set_attribute("autocomplete", "email").unwrap();
+                email.set_attribute("placeholder", "Email").unwrap();
+                email.set_attribute("aria-label", "Email").unwrap();
+                if let Some(link_email) = &inner.link_email {
+                    email
+                        .unchecked_ref::<web_sys::HtmlInputElement>()
+                        .set_value(link_email);
+                }
+                card.append_child(&email).unwrap();
                 let password = document.create_element("input").unwrap();
                 password.set_class_name("reset-password");
                 password.set_attribute("type", "password").unwrap();
@@ -6193,7 +6890,10 @@ impl Driver {
                     .set_attribute("autocomplete", "new-password")
                     .unwrap();
                 password
-                    .set_attribute("placeholder", "New account password")
+                    .set_attribute("placeholder", "New password")
+                    .unwrap();
+                password
+                    .set_attribute("aria-label", "New password")
                     .unwrap();
                 card.append_child(&password).unwrap();
             }
@@ -6201,54 +6901,41 @@ impl Driver {
             action.set_class_name("account-token-btn");
             action.set_text_content(Some(match flow {
                 AccountTokenFlow::VerifyEmail(_) => "Verify email",
-                AccountTokenFlow::PasswordReset(_) => "Reset account password",
+                AccountTokenFlow::PasswordReset(_) => "Reset password",
             }));
             card.append_child(&action).unwrap();
         } else if inner.owner_setup_token.is_some() {
             let heading = document.create_element("h2").unwrap();
-            heading.set_text_content(Some("Set up the vault owner"));
+            heading.set_text_content(Some("Create your account"));
             card.append_child(&heading).unwrap();
             let explanation = document.create_element("p").unwrap();
             explanation.set_class_name("auth-subtitle");
             explanation.set_text_content(Some(
-                "Create the operator account, then choose a separate vault passphrase for local workspace-key encryption.",
+                "Your password also locks your notes. It never leaves this device, so the server can't read them.",
             ));
             card.append_child(&explanation).unwrap();
             if inner.owner_setup_in_flight {
                 let status = document.create_element("p").unwrap();
                 status.set_class_name("auth-status loading-status");
                 status.set_attribute("role", "status").unwrap();
-                status.set_text_content(Some("Creating the owner account and encrypted vault..."));
+                status.set_text_content(Some("Setting things up…"));
                 card.append_child(&status).unwrap();
             } else {
-                for (id, label_text, class_name, autocomplete, help) in [
+                for (id, label_text, kind, autocomplete, help) in [
+                    ("owner-email", "Email", "email", "email", ""),
                     (
                         "owner-password",
-                        "Account password",
-                        "owner-password",
+                        "Password",
+                        "password",
                         "new-password",
-                        "Sent to the server only to authenticate this account.",
+                        "At least 12 characters.",
                     ),
                     (
                         "owner-password-confirmation",
-                        "Confirm account password",
-                        "owner-password-confirmation",
+                        "Confirm password",
+                        "password",
                         "new-password",
-                        "Enter the same account password again.",
-                    ),
-                    (
-                        "owner-vault-passphrase",
-                        "Vault passphrase",
-                        "owner-vault-passphrase",
-                        "off",
-                        "Encrypts workspace keys in this browser and is never sent to the server.",
-                    ),
-                    (
-                        "owner-vault-confirmation",
-                        "Confirm vault passphrase",
-                        "owner-vault-confirmation",
-                        "off",
-                        "Keep this separate from the account password and store it safely.",
+                        "",
                     ),
                 ] {
                     let field = document.create_element("div").unwrap();
@@ -6259,23 +6946,32 @@ impl Driver {
                     field.append_child(&label).unwrap();
                     let input = document.create_element("input").unwrap();
                     input.set_id(id);
-                    input.set_class_name(class_name);
-                    input.set_attribute("type", "password").unwrap();
+                    input.set_class_name(id);
+                    input.set_attribute("type", kind).unwrap();
                     input.set_attribute("autocomplete", autocomplete).unwrap();
-                    input
-                        .set_attribute("aria-describedby", &format!("{id}-help"))
-                        .unwrap();
+                    if id == "owner-email" {
+                        if let Some(link_email) = &inner.link_email {
+                            input
+                                .unchecked_ref::<web_sys::HtmlInputElement>()
+                                .set_value(link_email);
+                        }
+                    }
                     field.append_child(&input).unwrap();
-                    let help_element = document.create_element("p").unwrap();
-                    help_element.set_id(&format!("{id}-help"));
-                    help_element.set_class_name("auth-help");
-                    help_element.set_text_content(Some(help));
-                    field.append_child(&help_element).unwrap();
+                    if !help.is_empty() {
+                        input
+                            .set_attribute("aria-describedby", &format!("{id}-help"))
+                            .unwrap();
+                        let help_element = document.create_element("p").unwrap();
+                        help_element.set_id(&format!("{id}-help"));
+                        help_element.set_class_name("auth-help");
+                        help_element.set_text_content(Some(help));
+                        field.append_child(&help_element).unwrap();
+                    }
                     card.append_child(&field).unwrap();
                 }
                 let submit = document.create_element("button").unwrap();
                 submit.set_class_name("owner-setup-btn");
-                submit.set_text_content(Some("Create owner and vault"));
+                submit.set_text_content(Some("Create account"));
                 card.append_child(&submit).unwrap();
                 append_recovery_ceremony(document, &card, inner.recovery_key_display.as_deref());
             }
@@ -6283,7 +6979,7 @@ impl Driver {
             let status = document.create_element("p").unwrap();
             status.set_class_name("auth-status");
             status.set_attribute("role", "status").unwrap();
-            status.set_text_content(Some("Opening your encrypted workspace..."));
+            status.set_text_content(Some("Opening your notes…"));
             card.append_child(&status).unwrap();
         } else if inner.auth_phase == AuthPhase::SignedOut {
             if inner.pending_invite.is_some() {
@@ -6292,9 +6988,8 @@ impl Driver {
                 card.append_child(&heading).unwrap();
                 let invitation = document.create_element("p").unwrap();
                 invitation.set_class_name("invite-notice");
-                invitation.set_text_content(Some(
-                    "Register with the invited email, or sign in to accept with an existing account.",
-                ));
+                invitation
+                    .set_text_content(Some("Sign up with the invited email, or sign in to join."));
                 card.append_child(&invitation).unwrap();
             }
             let email_label = document.create_element("label").unwrap();
@@ -6311,7 +7006,7 @@ impl Driver {
             password_label
                 .set_attribute("for", "auth-password")
                 .unwrap();
-            password_label.set_text_content(Some("Account password"));
+            password_label.set_text_content(Some("Password"));
             card.append_child(&password_label).unwrap();
             let password = document.create_element("input").unwrap();
             password.set_id("auth-password");
@@ -6321,26 +7016,6 @@ impl Driver {
                 .set_attribute("autocomplete", "current-password")
                 .unwrap();
             card.append_child(&password).unwrap();
-            let vault_label = document.create_element("label").unwrap();
-            vault_label
-                .set_attribute("for", "auth-vault-passphrase")
-                .unwrap();
-            vault_label.set_text_content(Some("Vault passphrase"));
-            card.append_child(&vault_label).unwrap();
-            let vault_passphrase = document.create_element("input").unwrap();
-            vault_passphrase.set_id("auth-vault-passphrase");
-            vault_passphrase.set_class_name("auth-vault-passphrase");
-            vault_passphrase.set_attribute("type", "password").unwrap();
-            vault_passphrase
-                .set_attribute("autocomplete", "off")
-                .unwrap();
-            card.append_child(&vault_passphrase).unwrap();
-            let vault_help = document.create_element("p").unwrap();
-            vault_help.set_class_name("auth-help");
-            vault_help.set_text_content(Some(
-                "Decrypts the account vault key locally. It is never sent to the server.",
-            ));
-            card.append_child(&vault_help).unwrap();
             append_recovery_ceremony(document, &card, inner.recovery_key_display.as_deref());
             let actions = document.create_element("div").unwrap();
             actions.set_class_name("auth-actions");
@@ -6357,7 +7032,7 @@ impl Driver {
             card.append_child(&actions).unwrap();
             let reset = document.create_element("button").unwrap();
             reset.set_class_name("request-password-reset-btn text-btn");
-            reset.set_text_content(Some("Send password reset link"));
+            reset.set_text_content(Some("Forgot your password?"));
             card.append_child(&reset).unwrap();
         } else if inner.auth_phase == AuthPhase::AwaitingKey {
             let heading = document.create_element("h2").unwrap();
@@ -6365,7 +7040,9 @@ impl Driver {
             card.append_child(&heading).unwrap();
             let status = document.create_element("p").unwrap();
             status.set_class_name("invite-notice");
-            status.set_text_content(Some("Your device public key was uploaded. A workspace owner must approve it and encrypt the workspace key to this device. Reload after approval; no trusted-device or server escrow path is used."));
+            status.set_text_content(Some(
+                "Waiting for the workspace owner to let this device in. Reload once they have.",
+            ));
             card.append_child(&status).unwrap();
             let logout = document.create_element("button").unwrap();
             logout.set_class_name("logout-btn text-btn");
@@ -6373,37 +7050,38 @@ impl Driver {
             card.append_child(&logout).unwrap();
         } else {
             let heading = document.create_element("h2").unwrap();
-            heading.set_text_content(Some(if inner.workspaces.is_empty() {
-                "Create your encrypted workspace"
-            } else if inner.needs_key_envelope {
+            // Workspaces are only listed once unlocked, so an empty list
+            // here says nothing about whether this is a first visit.
+            heading.set_text_content(Some(if inner.needs_key_envelope {
                 "Finish securing this workspace"
             } else {
-                "Unlock workspace"
+                "Unlock your notes"
             }));
             card.append_child(&heading).unwrap();
             let explanation = document.create_element("p").unwrap();
             explanation.set_class_name("auth-subtitle");
-            explanation.set_text_content(Some(
-                "Enter the separate vault passphrase that protects your workspace keys. It never leaves this browser.",
-            ));
+            let has_password = inner.pending_password.is_some();
+            explanation.set_text_content(Some(if has_password {
+                "Your password changed since your notes were locked. Enter your recovery key to unlock them."
+            } else {
+                "Enter your password to unlock your notes on this device."
+            }));
             card.append_child(&explanation).unwrap();
-            let password = document.create_element("input").unwrap();
-            password.set_class_name("unlock-password");
-            password.set_attribute("type", "password").unwrap();
-            password
-                .set_attribute("autocomplete", "current-password")
-                .unwrap();
-            password
-                .set_attribute("placeholder", "Vault passphrase")
-                .unwrap();
-            password
-                .set_attribute("aria-label", "Vault passphrase")
-                .unwrap();
-            card.append_child(&password).unwrap();
-            let unlock = document.create_element("button").unwrap();
-            unlock.set_class_name("unlock-btn");
-            unlock.set_text_content(Some("Unlock"));
-            card.append_child(&unlock).unwrap();
+            if !has_password {
+                let password = document.create_element("input").unwrap();
+                password.set_class_name("unlock-password");
+                password.set_attribute("type", "password").unwrap();
+                password
+                    .set_attribute("autocomplete", "current-password")
+                    .unwrap();
+                password.set_attribute("placeholder", "Password").unwrap();
+                password.set_attribute("aria-label", "Password").unwrap();
+                card.append_child(&password).unwrap();
+                let unlock = document.create_element("button").unwrap();
+                unlock.set_class_name("unlock-btn");
+                unlock.set_text_content(Some("Unlock"));
+                card.append_child(&unlock).unwrap();
+            }
             let logout = document.create_element("button").unwrap();
             logout.set_class_name("logout-btn text-btn");
             logout.set_text_content(Some("Sign out"));
@@ -6411,21 +7089,31 @@ impl Driver {
             let recovery = document.create_element("section").unwrap();
             recovery.set_class_name("recovery-unlock");
             let recovery_heading = document.create_element("h3").unwrap();
-            recovery_heading.set_text_content(Some("Use recovery key"));
+            recovery_heading.set_text_content(Some(if has_password {
+                "Recovery key"
+            } else {
+                "Reset your password? Use your recovery key"
+            }));
             recovery.append_child(&recovery_heading).unwrap();
-            for (class_name, placeholder) in [
-                ("recovery-key-input", "Recovery key"),
-                ("recovery-new-passphrase", "New vault passphrase"),
-            ] {
+            let mut fields = vec![("recovery-key-input", "Recovery key")];
+            if !has_password {
+                fields.push(("recovery-password", "Your current password"));
+            }
+            for (class_name, placeholder) in fields {
                 let input = document.create_element("input").unwrap();
                 input.set_class_name(class_name);
                 input.set_attribute("type", "password").unwrap();
                 input.set_attribute("placeholder", placeholder).unwrap();
+                input.set_attribute("aria-label", placeholder).unwrap();
                 recovery.append_child(&input).unwrap();
             }
             let recover = document.create_element("button").unwrap();
-            recover.set_class_name("recover-account-btn secondary-btn");
-            recover.set_text_content(Some("Recover and reset vault passphrase"));
+            recover.set_class_name(if has_password {
+                "recover-account-btn"
+            } else {
+                "recover-account-btn secondary-btn"
+            });
+            recover.set_text_content(Some("Unlock with recovery key"));
             recovery.append_child(&recover).unwrap();
             card.append_child(&recovery).unwrap();
         }
@@ -6498,8 +7186,8 @@ impl Driver {
         for category in [
             "General",
             "Appearance",
-            "Members & Invitations",
-            "Encryption & Recovery",
+            "Sharing",
+            "Password & Recovery",
             "Sync & Storage",
             "Devices & Security",
             "Export",
@@ -6546,9 +7234,7 @@ impl Driver {
 
         match inner.settings_category.as_str() {
             "General" => {
-                add_description(
-                    "Rename this vault and edit its private description. Synchronized workspace metadata is encrypted in this browser before upload.",
-                );
+                add_description("Name and describe this vault.");
                 let name_label = document.create_element("label").unwrap();
                 name_label
                     .set_attribute("for", "workspace-name-setting")
@@ -6583,46 +7269,62 @@ impl Driver {
                 if !inner.local_mode {
                     let create = document.create_element("button").unwrap();
                     create.set_class_name("create-workspace-btn settings-row-action");
-                    create.set_text_content(Some("Create another workspace"));
+                    create.set_text_content(Some("New vault…"));
                     content.append_child(&create).unwrap();
                     if current_user_is_owner(&inner) {
                         let delete = document.create_element("button").unwrap();
                         delete.set_class_name(
                             "delete-workspace-btn settings-row-action danger-action",
                         );
-                        delete.set_text_content(Some("Delete workspace permanently"));
+                        delete.set_text_content(Some("Delete this vault"));
                         content.append_child(&delete).unwrap();
                     }
                 }
             }
             "Appearance" => {
-                add_description(
-                    "Choose how Inkstone's browser interface appears. System follows your device setting.",
-                );
-                content
+                add_description("Make Inkstone look the way you like.");
+                let theme_row = document.create_element("div").unwrap();
+                theme_row.set_class_name("prefs-row");
+                let theme_label = document.create_element("span").unwrap();
+                theme_label.set_class_name("prefs-label");
+                theme_label.set_text_content(Some("Theme"));
+                theme_row.append_child(&theme_label).unwrap();
+                theme_row
                     .append_child(&theme::render_control(
                         document,
                         "theme-control settings-theme-control",
                     ))
                     .unwrap();
+                content.append_child(&theme_row).unwrap();
+                content
+                    .append_child(&prefs::render_controls(document))
+                    .unwrap();
                 let note = document.create_element("p").unwrap();
                 note.set_class_name("settings-note");
                 note.set_text_content(Some(
-                    "The Stonepen drawing paper remains light to preserve ink contrast.",
+                    "In dark themes, black ink shows as white so it stays readable.",
                 ));
                 content.append_child(&note).unwrap();
             }
-            "Members & Invitations" => {
-                add_description(
-                    "Invitation links contain only a single-use token. Membership activates only after an owner encrypts the workspace key to the recipient device public key.",
-                );
+            "Sharing" => {
+                vaults::render_access_section(document, &content, &inner);
                 let list = document.create_element("div").unwrap();
                 list.set_class_name("settings-member-list");
                 for member in &inner.members {
                     let row = document.create_element("div").unwrap();
                     row.set_class_name("settings-member-row");
                     let identity = document.create_element("span").unwrap();
-                    identity.set_text_content(Some(&member.email));
+                    let guest = member.guest_name.is_some();
+                    let label = match (inner.workspace_id, inner.workspace_key) {
+                        (Some(workspace_id), Some(key)) if guest => {
+                            vaults::guest_name(member, workspace_id, &key)
+                                .map(|name| format!("{name} (guest)"))
+                                .unwrap_or_else(|| "Guest".into())
+                        }
+                        _ if guest => "Guest".into(),
+                        _ => member.email.clone(),
+                    };
+                    identity.set_text_content(Some(&label));
                     row.append_child(&identity).unwrap();
                     let role = document.create_element("span").unwrap();
                     role.set_class_name("member-role");
@@ -6638,7 +7340,12 @@ impl Driver {
                         select
                             .set_attribute("data-member-id", &member.user_id.to_string())
                             .unwrap();
-                        for candidate in ["viewer", "editor", "admin", "owner"] {
+                        let candidates: &[&str] = if guest {
+                            &["viewer", "editor"]
+                        } else {
+                            &["viewer", "editor", "admin", "owner"]
+                        };
+                        for &candidate in candidates {
                             let option = document.create_element("option").unwrap();
                             option.set_attribute("value", candidate).unwrap();
                             if candidate == member.role {
@@ -6658,7 +7365,7 @@ impl Driver {
                             .unwrap();
                         remove.set_text_content(Some("Remove"));
                         row.append_child(&remove).unwrap();
-                        if current_user_is_owner(&inner) {
+                        if current_user_is_owner(&inner) && !guest {
                             let transfer = document.create_element("button").unwrap();
                             transfer.set_class_name("settings-row-action");
                             transfer
@@ -6857,35 +7564,51 @@ impl Driver {
                     content.append_child(&alert).unwrap();
                 }
             }
-            "Encryption & Recovery" => {
+            "Password & Recovery" => {
                 add_description(
-                    "A random account vault key wraps workspace keys. Passphrase changes rewrap only that vault key and never re-encrypt documents.",
+                    "Your password signs you in and locks your notes. The server never sees it.",
                 );
                 let warning = document.create_element("div").unwrap();
                 warning.set_class_name("settings-warning");
-                warning.set_text_content(Some("Recovery is available only through your high-entropy recovery key. There is no trusted-device or server escrow path."));
+                warning.set_text_content(Some("If you forget your password and lose your recovery key, your notes can't be recovered."));
                 content.append_child(&warning).unwrap();
-                for (class_name, placeholder) in [
-                    ("new-vault-passphrase", "New vault passphrase"),
+                for (class_name, placeholder, autocomplete) in [
+                    ("current-password", "Current password", "current-password"),
+                    ("new-password", "New password", "new-password"),
                     (
-                        "new-vault-passphrase-confirm",
-                        "Confirm new vault passphrase",
+                        "new-password-confirm",
+                        "Confirm new password",
+                        "new-password",
                     ),
                 ] {
                     let input = document.create_element("input").unwrap();
                     input.set_class_name(class_name);
                     input.set_attribute("type", "password").unwrap();
                     input.set_attribute("placeholder", placeholder).unwrap();
+                    input.set_attribute("aria-label", placeholder).unwrap();
+                    input.set_attribute("autocomplete", autocomplete).unwrap();
                     content.append_child(&input).unwrap();
                 }
                 let change = document.create_element("button").unwrap();
-                change.set_class_name("change-vault-passphrase-btn");
-                change.set_text_content(Some("Change vault passphrase"));
+                change.set_class_name("change-password-btn");
+                change.set_text_content(Some("Change password"));
                 content.append_child(&change).unwrap();
+                for (text, class) in [
+                    (inner.auth_error.as_deref(), "settings-error"),
+                    (inner.auth_notice.as_deref(), "settings-note"),
+                ] {
+                    if let Some(text) = text {
+                        let line = document.create_element("p").unwrap();
+                        line.set_class_name(class);
+                        line.set_attribute("role", "status").unwrap();
+                        line.set_text_content(Some(text));
+                        content.append_child(&line).unwrap();
+                    }
+                }
             }
             "Sync & Storage" => {
                 add_description(if inner.local_mode {
-                    "This vault is browser-local. Remote sync is not active."
+                    "Notes are stored on this device only."
                 } else {
                     "Changes are saved locally first. Encrypted document updates sync when connected; an error here means remote state may lag behind local state."
                 });
@@ -6897,9 +7620,14 @@ impl Driver {
                 let cache = document.create_element("p").unwrap();
                 let cached_bytes: u64 = inner.entries.iter().map(|entry| entry.size_bytes).sum();
                 cache.set_class_name("settings-note");
+                let size = if cached_bytes >= 1 << 20 {
+                    format!("{:.1} MB", cached_bytes as f64 / f64::from(1 << 20))
+                } else {
+                    format!("{} KB", (cached_bytes as f64 / 1024.0).ceil())
+                };
                 cache.set_text_content(Some(&format!(
-                    "Workspace cache estimate: {} bytes across {} entries.",
-                    cached_bytes,
+                    "About {} on this device, {} items.",
+                    size,
                     inner.entries.len()
                 )));
                 content.append_child(&cache).unwrap();
@@ -6911,9 +7639,7 @@ impl Driver {
                 }
             }
             "Devices & Security" => {
-                add_description(
-                    "Review devices and sessions. Revoking the current session returns this browser to sign-in without deleting pending local changes.",
-                );
+                add_description("Devices signed in to your account.");
                 for device in &inner.devices {
                     let row = document.create_element("div").unwrap();
                     row.set_class_name("settings-member-row");
@@ -6970,11 +7696,11 @@ impl Driver {
                 content.append_child(&revoke_others).unwrap();
                 let reset = document.create_element("p").unwrap();
                 reset.set_class_name("settings-note");
-                reset.set_text_content(Some("Account password reset does not recover vault access. Sign out to request a reset link."));
+                reset.set_text_content(Some("Forgot your password? Sign out to get a reset link."));
                 content.append_child(&reset).unwrap();
                 for (action, text) in [
                     ("request-verification", "Send email verification link"),
-                    ("request-account-reset", "Send account password reset link"),
+                    ("request-account-reset", "Email me a reset link"),
                 ] {
                     let button = document.create_element("button").unwrap();
                     button.set_class_name("settings-row-action");
@@ -6986,9 +7712,7 @@ impl Driver {
                 }
             }
             "Export" => {
-                add_description(
-                    "Download a versioned ZIP containing deterministic Markdown projections, assets, empty folders, a manifest, and encrypted CRDT backups. Pending local updates are identified in the manifest.",
-                );
+                add_description("Download everything as a ZIP of Markdown files and attachments.");
                 let export = document.create_element("button").unwrap();
                 export.set_class_name("export-vault-btn settings-row-action");
                 export.set_text_content(Some("Download complete vault"));
@@ -7006,9 +7730,7 @@ impl Driver {
                 content.append_child(&import_label).unwrap();
             }
             _ => {
-                add_description(
-                    "Vault-wide settings apply to this workspace in the current browser.",
-                );
+                add_description("Settings for this vault.");
                 let details = document.create_element("dl").unwrap();
                 details.set_class_name("settings-details");
                 for (term, value) in [
@@ -7026,7 +7748,7 @@ impl Driver {
                         if inner.local_mode {
                             "Not applicable"
                         } else {
-                            "Managed in Members & Invitations"
+                            "Managed in Sharing"
                         },
                     ),
                 ] {
@@ -7046,7 +7768,7 @@ impl Driver {
         backdrop
     }
 
-    fn create_workspace(&self) {
+    fn create_workspace(&self, name: String, access: vaults::VaultAccess) {
         let (Some(user), Some(vault_key), Some(workspace_db)) = ({
             let inner = self.0.borrow();
             (
@@ -7063,13 +7785,14 @@ impl Driver {
             let key = match crypto::random_key() {
                 Ok(key) => key,
                 Err(error) => {
-                    this.set_sync_error(error);
+                    this.vault_creation_failed(error);
                     return;
                 }
             };
             let metadata = WorkspaceMetadata {
-                name: "New Workspace".into(),
+                name,
                 description: String::new(),
+                public_link: None,
             };
             let encrypted = match serde_json::to_vec(&metadata)
                 .map_err(|error| error.to_string())
@@ -7078,7 +7801,7 @@ impl Driver {
                 }) {
                 Ok(encrypted) => encrypted,
                 Err(error) => {
-                    this.set_sync_error(error);
+                    this.vault_creation_failed(error);
                     return;
                 }
             };
@@ -7095,7 +7818,7 @@ impl Driver {
             {
                 Ok(workspace) => workspace,
                 Err(error) => {
-                    this.set_sync_error(error.message);
+                    this.vault_creation_failed(error.message);
                     return;
                 }
             };
@@ -7106,7 +7829,7 @@ impl Driver {
             ) {
                 Ok(envelope) => envelope,
                 Err(error) => {
-                    this.set_sync_error(error);
+                    this.vault_creation_failed(error);
                     return;
                 }
             };
@@ -7117,7 +7840,7 @@ impl Driver {
                 )
                 .await
             {
-                this.set_sync_error(format!(
+                this.vault_creation_failed(format!(
                     "Workspace created but local key storage failed: {error}"
                 ));
                 return;
@@ -7126,7 +7849,7 @@ impl Driver {
                 .put_key_envelope(&workspace, &user, &vault_key, &key)
                 .await
             {
-                this.set_sync_error(format!(
+                this.vault_creation_failed(format!(
                     "Workspace created but key upload can be retried: {error}"
                 ));
                 return;
@@ -7136,8 +7859,10 @@ impl Driver {
                 .activate_workspace(workspace, &user, Some(&vault_key))
                 .await
             {
-                this.set_sync_error(error);
+                this.vault_creation_failed(error);
+                return;
             }
+            this.vault_created(access).await;
         });
     }
 
@@ -7145,7 +7870,9 @@ impl Driver {
         let confirmed = web_sys::window()
             .and_then(|window| {
                 window
-                    .confirm_with_message("Permanently delete this workspace for every member?")
+                    .confirm_with_message(
+                        "Delete this vault and every note in it, for everyone who has access? This can't be undone.",
+                    )
                     .ok()
             })
             .unwrap_or(false);
@@ -7198,7 +7925,7 @@ impl Driver {
                         this.set_sync_error(error);
                     }
                 }
-                None => this.create_workspace(),
+                None => this.create_workspace("My vault".into(), vaults::VaultAccess::Private),
             }
         });
     }
@@ -7207,147 +7934,174 @@ impl Driver {
         if !can_edit_workspace(&self.0.borrow()) {
             return;
         }
-        let (workspace_id, key, workspace_db, local_mode, entries) = {
-            let inner = self.0.borrow();
-            (
-                inner.workspace_id.unwrap_or_else(uuid::Uuid::nil),
-                inner.workspace_key,
-                inner.workspace_db.clone(),
-                inner.local_mode,
-                inner.entries.clone(),
-            )
-        };
-        let Some(workspace_db) = workspace_db else {
-            return;
-        };
-        let key = key.unwrap_or([0; 32]);
-        let name = file.name();
-        let media_type = if file.type_().is_empty() {
-            "application/octet-stream".into()
-        } else {
-            file.type_()
-        };
         let this = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let value = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-                Ok(value) => value,
-                Err(error) => {
-                    this.set_sync_error(format!("Could not read selected file: {error:?}"));
-                    return;
+            let stored = match page_files::read_file_bytes(&file).await {
+                Ok(bytes) => {
+                    this.store_asset(&file.name(), page_files::file_media_type(&file), bytes)
+                        .await
                 }
+                Err(error) => Err(error),
             };
-            let bytes = js_sys::Uint8Array::new(&value).to_vec();
+            if let Err(error) = stored {
+                this.set_sync_error(error);
+                return;
+            }
+            this.refresh_entries();
+            this.render();
+        });
+    }
+
+    async fn store_asset(
+        &self,
+        name: &str,
+        media_type: String,
+        bytes: Vec<u8>,
+    ) -> Result<WorkspacePath, String> {
+        let (workspace_id, key, workspace_db, local_mode, candidate) = {
+            let mut inner = self.0.borrow_mut();
+            let taken = |candidate: &str| {
+                inner
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.as_str() == candidate)
+                    || inner.reserved_asset_paths.contains(candidate)
+            };
             let mut candidate = format!("Assets/{name}");
             let mut suffix = 2;
-            while entries.iter().any(|entry| entry.path.as_str() == candidate) {
+            while taken(&candidate) {
                 candidate = match name.rsplit_once('.') {
                     Some((stem, extension)) => format!("Assets/{stem} ({suffix}).{extension}"),
                     None => format!("Assets/{name} ({suffix})"),
                 };
                 suffix += 1;
             }
-            let path = match WorkspacePath::new(&candidate) {
-                Ok(path) if !path.is_internal() => path,
-                _ => {
-                    this.set_sync_error(
-                        "The selected asset name is not a safe workspace path".into(),
-                    );
-                    return;
-                }
-            };
-            use sha2::Digest;
-            let digest =
-                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
-            let metadata = AssetMetadata {
-                path: path.as_str().into(),
+            inner.reserved_asset_paths.insert(candidate.clone());
+            (
+                inner.workspace_id.unwrap_or_else(uuid::Uuid::nil),
+                inner.workspace_key,
+                inner.workspace_db.clone(),
+                inner.local_mode,
+                candidate,
+            )
+        };
+        let stored = self
+            .upload_asset(
+                workspace_id,
+                key.unwrap_or([0; 32]),
+                workspace_db,
+                local_mode,
+                &candidate,
                 media_type,
-                plaintext_size: bytes.len() as u64,
-                content_sha256: digest,
-            };
-            let asset_id = uuid::Uuid::new_v4();
-            let encrypted = match encrypt_asset(&key, workspace_id, asset_id, 1, &metadata, &bytes)
+                bytes,
+            )
+            .await;
+        self.0.borrow_mut().reserved_asset_paths.remove(&candidate);
+        stored
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_asset(
+        &self,
+        workspace_id: uuid::Uuid,
+        key: [u8; 32],
+        workspace_db: Option<WorkspaceDb>,
+        local_mode: bool,
+        candidate: &str,
+        media_type: String,
+        bytes: Vec<u8>,
+    ) -> Result<WorkspacePath, String> {
+        let Some(workspace_db) = workspace_db else {
+            return Err("No vault is open".into());
+        };
+        let path = match WorkspacePath::new(candidate) {
+            Ok(path) if !path.is_internal() => path,
+            _ => {
+                return Err("The selected asset name is not a safe workspace path".into());
+            }
+        };
+        use sha2::Digest;
+        let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
+        let metadata = AssetMetadata {
+            path: path.as_str().into(),
+            media_type,
+            plaintext_size: bytes.len() as u64,
+            content_sha256: digest,
+        };
+        let asset_id = uuid::Uuid::new_v4();
+        let encrypted = match encrypt_asset(&key, workspace_id, asset_id, 1, &metadata, &bytes) {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                return Err(error.to_string());
+            }
+        };
+        if !local_mode {
+            let encrypted_size = encrypted
+                .chunks
+                .iter()
+                .filter_map(|chunk| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&chunk.ciphertext_b64)
+                        .ok()
+                })
+                .map(|chunk| chunk.len() as u64)
+                .sum();
+            let endpoint = format!("/api/workspaces/{workspace_id}/assets");
+            if let Err(error) = api::json::<AssetResponse, _>(
+                "POST",
+                &endpoint,
+                Some(&CreateAssetRequest {
+                    asset_id,
+                    version: 1,
+                    chunk_count: encrypted.chunks.len() as u32,
+                    encrypted_size,
+                    encrypted_metadata_b64: encrypted.metadata_ciphertext_b64.clone(),
+                    metadata_nonce_b64: encrypted.metadata_nonce_b64.clone(),
+                    aad_version: crypto::AAD_VERSION,
+                }),
+            )
+            .await
             {
-                Ok(encrypted) => encrypted,
-                Err(error) => {
-                    this.set_sync_error(error.to_string());
-                    return;
-                }
-            };
-            if !local_mode {
-                let encrypted_size = encrypted
-                    .chunks
-                    .iter()
-                    .filter_map(|chunk| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(&chunk.ciphertext_b64)
-                            .ok()
-                    })
-                    .map(|chunk| chunk.len() as u64)
-                    .sum();
-                let endpoint = format!("/api/workspaces/{workspace_id}/assets");
-                if let Err(error) = api::json::<AssetResponse, _>(
-                    "POST",
+                return Err(format!("Asset upload can be retried: {}", error.message));
+            }
+            for chunk in &encrypted.chunks {
+                let endpoint = format!("/api/assets/{asset_id}/versions/1/chunks/{}", chunk.index);
+                if let Err(error) = api::empty(
+                    "PUT",
                     &endpoint,
-                    Some(&CreateAssetRequest {
-                        asset_id,
-                        version: 1,
-                        chunk_count: encrypted.chunks.len() as u32,
-                        encrypted_size,
-                        encrypted_metadata_b64: encrypted.metadata_ciphertext_b64.clone(),
-                        metadata_nonce_b64: encrypted.metadata_nonce_b64.clone(),
+                    Some(&PutAssetChunkRequest {
+                        ciphertext_b64: chunk.ciphertext_b64.clone(),
+                        nonce_b64: chunk.nonce_b64.clone(),
                         aad_version: crypto::AAD_VERSION,
                     }),
                 )
                 .await
                 {
-                    this.set_sync_error(format!("Asset upload can be retried: {}", error.message));
-                    return;
-                }
-                for chunk in &encrypted.chunks {
-                    let endpoint =
-                        format!("/api/assets/{asset_id}/versions/1/chunks/{}", chunk.index);
-                    if let Err(error) = api::empty(
-                        "PUT",
-                        &endpoint,
-                        Some(&PutAssetChunkRequest {
-                            ciphertext_b64: chunk.ciphertext_b64.clone(),
-                            nonce_b64: chunk.nonce_b64.clone(),
-                            aad_version: crypto::AAD_VERSION,
-                        }),
-                    )
-                    .await
-                    {
-                        this.set_sync_error(format!(
-                            "Asset upload stopped at chunk {}; re-import to retry idempotently: {}",
-                            chunk.index, error.message
-                        ));
-                        return;
-                    }
+                    return Err(format!(
+                        "Asset upload stopped at chunk {}; re-import to retry idempotently: {}",
+                        chunk.index, error.message
+                    ));
                 }
             }
-            if let Err(error) = workspace_db.write_file(&path, &bytes).await {
-                this.set_sync_error(format!(
-                    "Asset uploaded but local cache write failed: {error}"
-                ));
-                return;
-            }
-            if let Err(error) = workspace_db
-                .set_metadata(&asset_id_metadata(path.as_str()), &asset_id.to_string())
-                .await
-            {
-                this.set_sync_error(format!("Asset cache identity write failed: {error}"));
-                return;
-            }
-            if let Err(error) = workspace_db
-                .set_metadata(&asset_version_metadata(path.as_str()), "1")
-                .await
-            {
-                this.set_sync_error(format!("Asset cache version write failed: {error}"));
-                return;
-            }
-            this.refresh_entries();
-            this.render();
-        });
+        }
+        if let Err(error) = workspace_db.write_file(&path, &bytes).await {
+            return Err(format!(
+                "Asset uploaded but local cache write failed: {error}"
+            ));
+        }
+        if let Err(error) = workspace_db
+            .set_metadata(&asset_id_metadata(path.as_str()), &asset_id.to_string())
+            .await
+        {
+            return Err(format!("Asset cache identity write failed: {error}"));
+        }
+        if let Err(error) = workspace_db
+            .set_metadata(&asset_version_metadata(path.as_str()), "1")
+            .await
+        {
+            return Err(format!("Asset cache version write failed: {error}"));
+        }
+        Ok(path)
     }
 
     fn save_workspace_settings(&self) {
@@ -7370,7 +8124,7 @@ impl Driver {
             self.render();
             return;
         }
-        let (local_mode, workspace_id, key, version) = {
+        let (local_mode, workspace_id, key, version, public_link) = {
             let inner = self.0.borrow();
             let version = inner
                 .workspaces
@@ -7382,6 +8136,7 @@ impl Driver {
                 inner.workspace_id,
                 inner.workspace_key,
                 version,
+                inner.workspace_public_link.clone(),
             )
         };
         if local_mode {
@@ -7401,6 +8156,7 @@ impl Driver {
             let plaintext = match serde_json::to_vec(&WorkspaceMetadata {
                 name: name.clone(),
                 description: description.clone(),
+                public_link,
             }) {
                 Ok(value) => value,
                 Err(error) => {
@@ -7440,6 +8196,7 @@ impl Driver {
                     {
                         *stored = workspace;
                     }
+                    inner.vault_names.insert(workspace_id, name.clone());
                     inner.workspace_name = name;
                     inner.workspace_description = description;
                     inner.auth_notice = Some("Encrypted vault details saved.".into());
@@ -7452,7 +8209,7 @@ impl Driver {
         });
     }
 
-    fn export_vault(&self) {
+    pub(crate) fn export_vault(&self) {
         self.flush_ink_before_transition();
         let this = self.clone();
         let (
@@ -7980,7 +8737,7 @@ impl Driver {
         let Some(text_state) = &inner.text_client_state else {
             return document;
         };
-        let text_document = text_state.document();
+        let text_document = text_state.optimistic_document();
         document.title.clone_from(&text_document.title);
         for block in &mut document.blocks {
             let Some(text_block) = text_document.get_block(block.id) else {
@@ -8026,47 +8783,109 @@ impl Driver {
         Ok(())
     }
 
-    fn dispatch_text_edit(&self, target: TextTarget, before: &str, after: &str) {
-        if !can_edit_workspace(&self.0.borrow()) {
+    /// Makes sure the text state exists and knows `target` (a block may have
+    /// been inserted since it was hydrated).
+    pub(crate) fn ensure_text_target(&self, target: TextTarget) {
+        let mut inner = self.0.borrow_mut();
+        if !document_ready(&inner) {
             return;
         }
-        let Some(edit) = minimal_text_edit(before, after) else {
+        if inner.text_client_state.is_none() {
+            let document = inner.client_state.effective_view_doc().clone();
+            let replica_id = text_replica_id(inner.device_id, document.id);
+            inner.text_client_state = TextClientState::new(document, replica_id).ok();
+        }
+        let needs_target = inner.text_client_state.as_ref().is_some_and(|state| {
+            let document = state.document();
+            match target {
+                TextTarget::Title => false,
+                TextTarget::Markdown(block_id) => !matches!(
+                    document.get_block(block_id).map(|block| &block.content),
+                    Some(BlockContent::Markdown { .. })
+                ),
+                TextTarget::Math(block_id) => !matches!(
+                    document.get_block(block_id).map(|block| &block.content),
+                    Some(BlockContent::Math { .. })
+                ),
+            }
+        });
+        if needs_target {
+            // Structure only: re-hydrating from text that already holds
+            // unpersisted typing would replay that typing on top of itself.
+            let structure = inner.client_state.effective_view_doc().clone();
+            if let Some(state) = inner.text_client_state.as_mut() {
+                state.adopt_structure(&structure);
+            }
+        }
+    }
+
+    /// Makes the text state know every text block on the page, so ink can
+    /// pin to text in blocks inserted since it was hydrated.
+    pub(crate) fn ensure_page_text_targets(&self) {
+        let missing = {
+            let inner = self.0.borrow();
+            let known = inner
+                .text_client_state
+                .as_ref()
+                .map(TextClientState::document);
+            inner
+                .client_state
+                .effective_view_doc()
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    let target = match block.content {
+                        BlockContent::Markdown { .. } => TextTarget::Markdown(block.id),
+                        BlockContent::Math { .. } => TextTarget::Math(block.id),
+                        _ => return None,
+                    };
+                    known
+                        .is_none_or(|known| known.get_block(block.id).is_none())
+                        .then_some(target)
+                })
+        };
+        if let Some(target) = missing {
+            self.ensure_text_target(target);
+        }
+    }
+
+    pub(crate) fn dispatch_text_edit(&self, target: TextTarget, before: &str, after: &str) {
+        if !can_edit_workspace(&self.0.borrow()) || !document_ready(&self.0.borrow()) {
+            return;
+        }
+        self.ensure_text_target(target);
+        // If a keystroke never reached the model, the field is ahead of it and
+        // this edit's range no longer fits; diff against the model instead.
+        let model_text = {
+            let inner = self.0.borrow();
+            inner
+                .text_client_state
+                .as_ref()
+                .filter(|state| state.document().id == inner.selected_doc_id)
+                .and_then(|state| target_text(&state.optimistic_document(), target))
+        };
+        let Some(mut edit) = minimal_text_edit(before, after) else {
             return;
         };
+        if let Some(model_text) = model_text.filter(|text| {
+            text.as_str() != before && edit.end_utf16 as usize > text.encode_utf16().count()
+        }) {
+            match minimal_text_edit(&model_text, after) {
+                Some(repair) => edit = repair,
+                None => return,
+            }
+        }
+        if !matches!(target, TextTarget::Title) {
+            self.record_change(page_history::ChangeKind::Typing(target));
+        }
         let effects = {
             let mut inner = self.0.borrow_mut();
-            if inner.text_client_state.is_none() {
-                let document = inner.client_state.effective_view_doc().clone();
-                let replica_id = text_replica_id(inner.device_id, document.id);
-                inner.text_client_state = TextClientState::new(document, replica_id).ok();
-            }
-            let needs_target = inner.text_client_state.as_ref().is_some_and(|state| {
-                let document = state.document();
-                match target {
-                    TextTarget::Title => false,
-                    TextTarget::Markdown(block_id) => !matches!(
-                        document.get_block(block_id).map(|block| &block.content),
-                        Some(BlockContent::Markdown { .. })
-                    ),
-                    TextTarget::Math(block_id) => !matches!(
-                        document.get_block(block_id).map(|block| &block.content),
-                        Some(BlockContent::Math { .. })
-                    ),
-                }
-            });
-            if needs_target {
-                let document = Driver::effective_document(&inner);
-                if let Some(state) = inner.text_client_state.as_mut() {
-                    let snapshot = state.snapshot();
-                    let pending_updates = state.pending_updates().to_vec();
-                    let _ = state.transition(TextClientEvent::Hydrate {
-                        document,
-                        snapshot: Some(snapshot),
-                        pending_updates,
-                    });
-                }
-            }
-            let Some(state) = inner.text_client_state.as_mut() else {
+            let selected = inner.selected_doc_id;
+            let Some(state) = inner
+                .text_client_state
+                .as_mut()
+                .filter(|state| state.document().id == selected)
+            else {
                 return;
             };
             state.transition(TextClientEvent::LocalEdit {
@@ -8161,7 +8980,20 @@ impl Driver {
     fn project_remote_text_update(&self, update: DocumentUpdate) -> DocumentUpdate {
         let target = match &update.op {
             DocumentOp::ApplyTextUpdateV2 { payload } => payload.target,
-            _ => return update,
+            _ => {
+                let mut inner = self.0.borrow_mut();
+                if let Some(state) = inner.text_client_state.as_mut() {
+                    let mut structure = state.confirmed_document().clone();
+                    if matches!(
+                        inkstone_core::sequenced_replay(&mut structure, update.clone()),
+                        inkstone_core::ReplayOutcome::Applied
+                            | inkstone_core::ReplayOutcome::Adjusted { .. }
+                    ) {
+                        state.adopt_structure(&structure);
+                    }
+                }
+                return update;
+            }
         };
         let selection = self.capture_relative_selection(target);
         self.0
@@ -8193,100 +9025,157 @@ impl Driver {
         }
     }
 
+    /// The server drops updates past its per-second limit; send whatever is
+    /// still unconfirmed again once the window has passed.
+    fn resend_pending_text_soon(&self) {
+        if RESEND_SCHEDULED.with(|scheduled| scheduled.replace(true)) {
+            return;
+        }
+        let this = self.clone();
+        let resend = Closure::once_into_js(move || {
+            RESEND_SCHEDULED.with(|scheduled| scheduled.set(false));
+            let effects = {
+                let mut inner = this.0.borrow_mut();
+                if inner.client_state.phase() != SessionPhase::Live {
+                    return;
+                }
+                inner
+                    .text_client_state
+                    .as_mut()
+                    .map(|state| state.transition(TextClientEvent::Connected))
+                    .unwrap_or_default()
+            };
+            for effect in effects {
+                this.execute_text_effect(effect);
+            }
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                resend.unchecked_ref(),
+                1_100,
+            );
+        }
+    }
+
+    /// Writes a text update to this device's copy of the note.
+    fn persist_text_update(&self, update: DocumentUpdate) {
+        let this = self.clone();
+        let doc_id = update.doc_id;
+        let update_id = update.update_id;
+        let storage_key = document_storage_key(this.0.borrow().workspace_id, doc_id);
+        let snapshot = this
+            .0
+            .borrow()
+            .text_client_state
+            .as_ref()
+            .map(TextClientState::persistence_snapshot);
+        let text_document = this
+            .0
+            .borrow()
+            .text_client_state
+            .as_ref()
+            .map(|state| state.document().clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(db) = this.0.borrow().db.clone() else {
+                let effects = this
+                    .0
+                    .borrow_mut()
+                    .text_client_state
+                    .as_mut()
+                    .map(|state| {
+                        state
+                            .transition(TextClientEvent::LocalUpdatePersistenceFailed { update_id })
+                    })
+                    .unwrap_or_default();
+                for effect in effects {
+                    this.execute_text_effect(effect);
+                }
+                this.render();
+                return;
+            };
+            let result = db
+                .update_document_record(&storage_key, move |current| {
+                    let mut record = current
+                        .map(|json| storage::deserialize_record(&json))
+                        .transpose()
+                        .map_err(|error| JsValue::from_str(&error.to_string()))?
+                        .unwrap_or_else(|| storage::new_record(doc_id));
+                    if let (Some(document), Some(snapshot)) = (text_document, snapshot) {
+                        storage::apply_text_checkpoint(
+                            &mut record,
+                            document,
+                            snapshot,
+                            vec![update],
+                            None,
+                        );
+                    } else {
+                        storage::append_pending_update(&mut record, update);
+                    }
+                    serde_json::to_string(&record)
+                        .map_err(|error| JsValue::from_str(&error.to_string()))
+                })
+                .await;
+            let event = if result.is_ok() {
+                TextClientEvent::LocalUpdatePersisted { update_id }
+            } else {
+                TextClientEvent::LocalUpdatePersistenceFailed { update_id }
+            };
+            let effects = this
+                .0
+                .borrow_mut()
+                .text_client_state
+                .as_mut()
+                .map(|state| state.transition(event))
+                .unwrap_or_default();
+            for effect in effects {
+                this.execute_text_effect(effect);
+            }
+            if result.is_ok() && !this.0.borrow().client_state.local_persistence_failed() {
+                let mut inner = this.0.borrow_mut();
+                inner.persistence_status = "Saved".to_string();
+                inner.local_persistence_error = None;
+            }
+            if result.is_ok() {
+                let current_path = this.0.borrow().selected_path.clone();
+                if let Some(path) = current_path {
+                    this.update_search_index_for_active_doc(&path);
+                }
+                this.resume_deferred_navigation();
+                this.refresh_status_in_place();
+            } else {
+                this.render();
+            }
+        });
+    }
+
     fn execute_text_effect(&self, effect: TextClientEffect) {
         let this = self.clone();
         match effect {
             TextClientEffect::PersistLocalUpdate { update } => {
-                let doc_id = update.doc_id;
-                let update_id = update.update_id;
-                let storage_key = document_storage_key(this.0.borrow().workspace_id, doc_id);
-                let snapshot = this
-                    .0
-                    .borrow()
-                    .text_client_state
-                    .as_ref()
-                    .map(TextClientState::persistence_snapshot);
-                let text_document = this
-                    .0
-                    .borrow()
-                    .text_client_state
-                    .as_ref()
-                    .map(|state| state.document().clone());
-                wasm_bindgen_futures::spawn_local(async move {
-                    let Some(db) = this.0.borrow().db.clone() else {
-                        let effects = this
-                            .0
-                            .borrow_mut()
-                            .text_client_state
-                            .as_mut()
-                            .map(|state| {
-                                state.transition(TextClientEvent::LocalUpdatePersistenceFailed {
-                                    update_id,
-                                })
-                            })
-                            .unwrap_or_default();
-                        for effect in effects {
-                            this.execute_text_effect(effect);
-                        }
-                        this.render();
-                        return;
-                    };
-                    let result = db
-                        .update_document_record(&storage_key, move |current| {
-                            let mut record = current
-                                .map(|json| storage::deserialize_record(&json))
-                                .transpose()
-                                .map_err(|error| JsValue::from_str(&error.to_string()))?
-                                .unwrap_or_else(|| storage::new_record(doc_id));
-                            if let (Some(document), Some(snapshot)) = (text_document, snapshot) {
-                                storage::apply_text_checkpoint(
-                                    &mut record,
-                                    document,
-                                    snapshot,
-                                    vec![update],
-                                );
-                            } else {
-                                storage::append_pending_update(&mut record, update);
-                            }
-                            serde_json::to_string(&record)
-                                .map_err(|error| JsValue::from_str(&error.to_string()))
-                        })
-                        .await;
-                    let event = if result.is_ok() {
-                        TextClientEvent::LocalUpdatePersisted { update_id }
-                    } else {
-                        TextClientEvent::LocalUpdatePersistenceFailed { update_id }
-                    };
-                    let effects = this
-                        .0
-                        .borrow_mut()
-                        .text_client_state
-                        .as_mut()
-                        .map(|state| state.transition(event))
-                        .unwrap_or_default();
-                    for effect in effects {
-                        this.execute_text_effect(effect);
-                    }
-                    if result.is_ok() && !this.0.borrow().client_state.local_persistence_failed() {
-                        let mut inner = this.0.borrow_mut();
-                        inner.persistence_status = "Saved to IndexedDB".to_string();
-                        inner.local_persistence_error = None;
-                    }
-                    if result.is_ok() {
-                        let current_path = this.0.borrow().selected_path.clone();
-                        if let Some(path) = current_path {
-                            this.update_search_index_for_active_doc(&path);
-                        }
-                        this.resume_deferred_navigation();
-                    }
-                    this.render();
-                });
+                if self.structure_saving() {
+                    self.0.borrow_mut().deferred_text_persist = Some(update);
+                    return;
+                }
+                this.persist_text_update(update);
             }
+
             TextClientEffect::PersistRemoteMerge { token, checkpoint } => {
+                let echo = self
+                    .0
+                    .borrow()
+                    .text_client_state
+                    .as_ref()
+                    .is_some_and(|state| {
+                        state
+                            .pending_updates()
+                            .iter()
+                            .any(|update| update.update_id == checkpoint.merged_update_id)
+                    });
                 let doc_id = checkpoint.document.id;
                 let storage_key = document_storage_key(this.0.borrow().workspace_id, doc_id);
                 wasm_bindgen_futures::spawn_local(async move {
-                    let result = if let Some(db) = this.0.borrow().db.clone() {
+                    let db = this.0.borrow().db.clone();
+                    let result = if let Some(db) = db {
                         db.update_document_record(&storage_key, move |current| {
                             let mut record = current
                                 .map(|json| storage::deserialize_record(&json))
@@ -8297,8 +9186,10 @@ impl Driver {
                                 &mut record,
                                 checkpoint.document,
                                 checkpoint.text_snapshot,
-                                checkpoint.pending_updates,
+                                Vec::new(),
+                                Some(checkpoint.merged_update_id),
                             );
+                            storage::note_edit(&mut record, js_sys::Date::now() as i64);
                             serde_json::to_string(&record)
                                 .map_err(|error| JsValue::from_str(&error.to_string()))
                         })
@@ -8327,12 +9218,18 @@ impl Driver {
                             .remote_selection_queue
                             .pop_front()
                             .flatten();
-                        this.0.borrow_mut().pending_relative_selection = selection;
+                        if !echo {
+                            this.0.borrow_mut().pending_relative_selection = selection;
+                        }
                     }
                     for effect in effects {
                         this.execute_text_effect(effect);
                     }
-                    this.render();
+                    if echo && result.is_ok() {
+                        this.refresh_status_in_place();
+                    } else {
+                        this.render();
+                    }
                 });
             }
             TextClientEffect::SendUpdate(update) => self.execute_effect(Effect::SendUpdate(update)),
@@ -8362,6 +9259,49 @@ impl Driver {
             self.set_sync_error("This workspace is read-only".into());
             return;
         }
+        if let ClientEvent::LocalIntent { op, .. } = &event {
+            let structural = match op {
+                DocumentOp::InsertBlock { block, .. } => {
+                    !matches!(block.content, BlockContent::Ink { .. })
+                }
+                DocumentOp::ReplaceBlockContent { content, .. } => {
+                    !matches!(content, BlockContent::Ink { .. })
+                }
+                DocumentOp::DeleteBlock { .. } | DocumentOp::MoveBlock { .. } => true,
+                _ => false,
+            };
+            if structural {
+                self.record_change(page_history::ChangeKind::Structure);
+            }
+        }
+        let quiet = {
+            let mut inner = self.0.borrow_mut();
+            let quiet = match &event {
+                ClientEvent::SequencedUpdate { update, .. } => {
+                    let id = update.update_id;
+                    inner
+                        .client_state
+                        .pending_local()
+                        .iter()
+                        .any(|p| p.update_id == id)
+                        || inner.text_client_state.as_ref().is_some_and(|text| {
+                            text.pending_updates().iter().any(|p| p.update_id == id)
+                        })
+                }
+                ClientEvent::ConfirmationPersisted { .. } => inner.quiet_dispatch,
+                ClientEvent::LocalUpdatePersisted { .. } => matches!(
+                    inner.client_state.pending_intent_op(),
+                    Some(
+                        DocumentOp::ApplyPageInkUpdate { .. }
+                            | DocumentOp::SetInkAnchor { .. }
+                            | DocumentOp::RemoveInkAnchors { .. }
+                    )
+                ),
+                _ => false,
+            };
+            inner.quiet_dispatch = quiet && matches!(event, ClientEvent::SequencedUpdate { .. });
+            quiet
+        };
         let connected = matches!(event, ClientEvent::Ready { .. });
         let text_connection_event = match &event {
             ClientEvent::Ready { .. } => Some(TextClientEvent::Connected),
@@ -8371,11 +9311,28 @@ impl Driver {
             _ => None,
         };
 
+        let switches_document =
+            matches!(event, ClientEvent::OpenDocument { .. } | ClientEvent::Close);
+        if switches_document {
+            // A held text save still belongs to the note being left.
+            let deferred = self.0.borrow_mut().deferred_text_persist.take();
+            if let Some(update) = deferred {
+                self.persist_text_update(update);
+            }
+        }
         let effects = {
             let mut inner = self.0.borrow_mut();
             let effects = inner.client_state.transition(event);
             if connected && inner.client_state.phase() != SessionPhase::Error {
                 inner.sync_error = None;
+            }
+            if switches_document {
+                // The previous note's text must never take edits meant for
+                // the one opening; it gets its own once it has loaded.
+                inner.text_client_state = None;
+                inner.editing_block = None;
+                inner.pending_block_caret = None;
+                inner.slash_menu = None;
             }
             effects
         };
@@ -8400,11 +9357,50 @@ impl Driver {
         };
 
         if should_render {
-            self.render();
+            if quiet && self.0.borrow().client_state.phase() != SessionPhase::Error {
+                self.refresh_status_in_place();
+                let (view_doc, editable) = {
+                    let inner = self.0.borrow();
+                    (
+                        Driver::effective_document(&inner),
+                        can_edit_workspace(&inner) && inner.document_mode == DocumentMode::Edit,
+                    )
+                };
+                self.sync_page_surface(&view_doc, editable);
+            } else {
+                self.render();
+            }
         }
 
         for effect in effects {
             self.execute_effect(effect);
+        }
+        self.flush_deferred_text_persist();
+    }
+
+    /// Whether any edit has yet to reach this device's storage.
+    fn has_unsaved_edits(&self) -> bool {
+        self.structure_saving()
+            || self
+                .0
+                .borrow()
+                .text_client_state
+                .as_ref()
+                .is_some_and(TextClientState::has_pending_persistence)
+    }
+
+    fn structure_saving(&self) -> bool {
+        let inner = self.0.borrow();
+        inner.client_state.has_pending_intent() || inner.client_state.intent_queue_len() > 0
+    }
+
+    fn flush_deferred_text_persist(&self) {
+        if self.structure_saving() {
+            return;
+        }
+        let deferred = self.0.borrow_mut().deferred_text_persist.take();
+        if let Some(update) = deferred {
+            self.persist_text_update(update);
         }
     }
 
@@ -8430,9 +9426,8 @@ impl Driver {
 
                     let storage_key = document_storage_key(workspace_id, doc_id);
                     let mut record_result = db.get_document_record(&storage_key).await;
-                    if let (Some(workspace_id), Some(key)) =
-                        (workspace_id, this.0.borrow().workspace_key)
-                    {
+                    let workspace_key = this.0.borrow().workspace_key;
+                    if let (Some(workspace_id), Some(key)) = (workspace_id, workspace_key) {
                         let local_seq = record_result
                             .as_ref()
                             .ok()
@@ -8465,12 +9460,12 @@ impl Driver {
                                         == storage::SYNCED_DOCUMENT_SNAPSHOT_VERSION
                                         && snapshot_payload.document.id == doc_id =>
                                 {
-                                    let pending_updates = record_result
+                                    let (pending_updates, edited_at_ms) = record_result
                                         .as_ref()
                                         .ok()
                                         .and_then(|record| record.as_deref())
                                         .and_then(|json| storage::deserialize_record(json).ok())
-                                        .map(|record| record.pending_updates)
+                                        .map(|record| (record.pending_updates, record.edited_at_ms))
                                         .unwrap_or_default();
                                     let record = storage::LocalDocumentRecord {
                                         version: storage::LOCAL_DOCUMENT_RECORD_VERSION,
@@ -8480,6 +9475,7 @@ impl Driver {
                                         pending_updates,
                                         text_snapshot: Some(snapshot_payload.text_snapshot),
                                         text_projection: Some(snapshot_payload.document.clone()),
+                                        edited_at_ms,
                                     };
                                     if let Ok(json) = serde_json::to_string(&record) {
                                         if db.put_document_record(&storage_key, &json).await.is_ok()
@@ -8594,9 +9590,9 @@ impl Driver {
                                 let block_id = BlockId::new_v4();
                                 let block = inkstone_core::document::DocumentBlock::new(
                                     block_id,
+                                    // A new note is a blank page, ready to type into.
                                     inkstone_core::document::BlockContent::Markdown {
-                                        text: "# Welcome to Inkstone\n\nStart writing..."
-                                            .to_string(),
+                                        text: String::new(),
                                     },
                                 );
                                 this.dispatch(ClientEvent::LocalIntent {
@@ -8604,6 +9600,10 @@ impl Driver {
                                     update_id,
                                     applied_at_ms,
                                 });
+                                // A blank page has nothing to undo.
+                                this.clear_history();
+                                this.render();
+                                this.focus_new_note_title();
                             }
                         }
                         Err(e) => {
@@ -8618,7 +9618,6 @@ impl Driver {
                 });
             }
             Effect::PersistLocalUpdate { update_id, update } => {
-                this.0.borrow_mut().persistence_status = "Saving update...".to_string();
                 let doc_id = update.doc_id;
                 let storage_key = document_storage_key(this.0.borrow().workspace_id, doc_id);
                 let ink_block_id = match &update.op {
@@ -8692,7 +9691,7 @@ impl Driver {
                         Ok(()) => {
                             {
                                 let mut inner = this.0.borrow_mut();
-                                inner.persistence_status = "Saved to IndexedDB".to_string();
+                                inner.persistence_status = "Saved".to_string();
                                 inner.local_persistence_error = None;
                             }
                             this.finish_ink_update(
@@ -8725,7 +9724,6 @@ impl Driver {
                 });
             }
             Effect::PersistConfirmation { token, checkpoint } => {
-                this.0.borrow_mut().persistence_status = "Saving confirmation...".to_string();
                 let lifecycle = this.0.borrow().client_state.lifecycle_id();
                 let storage_key =
                     document_storage_key(this.0.borrow().workspace_id, checkpoint.doc_id);
@@ -8763,8 +9761,6 @@ impl Driver {
                         .await;
                     match result {
                         Ok(()) => {
-                            this.0.borrow_mut().persistence_status =
-                                "Saved confirmation".to_string();
                             let is_current = this
                                 .0
                                 .borrow()
@@ -9132,6 +10128,38 @@ impl Driver {
         }
     }
 
+    /// While text is focused the page is not rebuilt; status that changes
+    /// on its own (sync phase, saving, Live mode) is updated where it is.
+    fn refresh_status_in_place(&self) {
+        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+            return;
+        };
+        let inner = self.0.borrow();
+        let phase = inner.client_state.phase();
+        if let Ok(Some(badge)) = document.query_selector(".phase-badge") {
+            badge.set_class_name(&format!("phase-badge phase-{phase:?}").to_lowercase());
+            badge.set_text_content(Some(&format!("{phase:?}")));
+        }
+        if let Ok(Some(status)) = document.query_selector(".sync-status") {
+            status.set_text_content(Some(sync_status_text(&inner, phase)));
+        }
+        if let Ok(Some(save)) = document.query_selector(".topbar-save-status") {
+            match save_label(&inner) {
+                Some(label) => {
+                    save.set_text_content(Some(&label));
+                    let _ = save.set_attribute("data-state", persistence_state(&label));
+                }
+                None => {
+                    let _ = save.set_attribute("data-state", "pending");
+                }
+            }
+        }
+        drop(inner);
+        if let Ok(Some(button)) = document.query_selector(".live-toggle-btn") {
+            set_live_toggle_state(&button, live::enabled(), self.live_direct_count());
+        }
+    }
+
     fn reconcile_focused_text_controls(&self) -> bool {
         let Some(document) = web_sys::window().and_then(|window| window.document()) else {
             return false;
@@ -9144,10 +10172,17 @@ impl Driver {
         if !active_is_title && !active_is_block {
             return false;
         }
+        let focused = active.clone();
 
-        let (view, composing, relative_selection, disabled) = {
+        let (view, composing, relative_selection, disabled, local_ahead) = {
             let mut inner = self.0.borrow_mut();
             let composing = inner.composing_text_target;
+            // Edits still queued for persistence are in the DOM but not yet in
+            // the view document; writing the view back would drop them.
+            let local_ahead = inner
+                .text_client_state
+                .as_ref()
+                .is_some_and(TextClientState::has_pending_persistence);
             let relative_selection = if composing.is_none() {
                 inner.pending_relative_selection.take()
             } else {
@@ -9158,12 +10193,13 @@ impl Driver {
                 composing,
                 relative_selection,
                 inner.local_persistence_error.is_some(),
+                local_ahead,
             )
         };
         if let Ok(Some(element)) = document.query_selector(".document-title-input") {
             let input: web_sys::HtmlInputElement = element.unchecked_into();
             input.set_disabled(disabled);
-            if !(active_is_title && composing == Some(TextTarget::Title)) {
+            if !(active_is_title && (composing == Some(TextTarget::Title) || local_ahead)) {
                 if input.value() != view.title {
                     input.set_value(&view.title);
                 }
@@ -9192,7 +10228,7 @@ impl Driver {
             };
             let is_active = active_is_block
                 && textarea.get_attribute("data-block-id") == active.get_attribute("data-block-id");
-            if !(is_active && composing == Some(target)) {
+            if !(is_active && (composing == Some(target) || local_ahead)) {
                 if textarea.value() != value {
                     textarea.set_value(value);
                 }
@@ -9234,16 +10270,22 @@ impl Driver {
                 }
             }
         }
+        self.reconcile_page_blocks(&document, &focused);
         true
     }
 
-    fn hydrate_markdown_assets(&self, document: &web_sys::Document, generation: u64) {
-        let Some(workspace_db) = self.0.borrow().workspace_db.clone() else {
+    fn hydrate_markdown_assets(&self, document: &web_sys::Document) {
+        let (Some(workspace_db), workspace_id) = ({
+            let inner = self.0.borrow();
+            (inner.workspace_db.clone(), inner.workspace_id)
+        }) else {
             return;
         };
         let Ok(nodes) = document.query_selector_all("img[data-asset-path]") else {
             return;
         };
+        let now = js_sys::Date::now();
+        let mut pending = Vec::new();
         for index in 0..nodes.length() {
             let Some(element) = nodes
                 .item(index)
@@ -9254,31 +10296,99 @@ impl Driver {
             let Some(path_value) = element.get_attribute("data-asset-path") else {
                 continue;
             };
+            if pdf_pages::is_pdf(&path_value) {
+                self.mount_pdf(&element, &path_value);
+                continue;
+            }
+            let key = format!("{workspace_id:?}/{path_value}");
+            let check = ASSET_URLS.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                match cache.get_mut(&key) {
+                    Some(entry) => {
+                        if element.get_attribute("src").as_deref() != Some(&entry.url) {
+                            let _ = element.set_attribute("src", &entry.url);
+                        }
+                        if entry.checking || now - entry.checked_at_ms < ASSET_RECHECK_MS {
+                            false
+                        } else {
+                            entry.checking = true;
+                            true
+                        }
+                    }
+                    None => true,
+                }
+            });
+            if check && !pending.iter().any(|(pending_key, _)| pending_key == &key) {
+                pending.push((key, path_value));
+            }
+        }
+        for (key, path_value) in pending {
             let Ok(path) = WorkspacePath::new(&path_value) else {
                 continue;
             };
-            let this = self.clone();
+            ASSET_URLS.with(|cache| {
+                if let Some(entry) = cache.borrow_mut().get_mut(&key) {
+                    entry.checking = true;
+                }
+            });
             let workspace_db = workspace_db.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let Ok(Some(bytes)) = workspace_db.read_file(&path).await else {
+                let bytes = workspace_db.read_file(&path).await.ok().flatten();
+                let Some(bytes) = bytes else {
+                    ASSET_URLS.with(|cache| {
+                        if let Some(entry) = cache.borrow_mut().get_mut(&key) {
+                            entry.checking = false;
+                        }
+                    });
                     return;
                 };
-                let Ok(url) = create_blob_url(&bytes, &asset_media_type(path.as_str())) else {
-                    return;
+                let fingerprint = asset_fingerprint(&bytes);
+                let now = js_sys::Date::now();
+                let unchanged = ASSET_URLS.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    match cache.get_mut(&key) {
+                        Some(entry) if entry.fingerprint == fingerprint => {
+                            entry.checking = false;
+                            entry.checked_at_ms = now;
+                            Some(entry.url.clone())
+                        }
+                        _ => None,
+                    }
+                });
+                let url = match unchanged {
+                    Some(url) => url,
+                    None => {
+                        let Ok(url) = create_blob_url(&bytes, &asset_media_type(path.as_str()))
+                        else {
+                            return;
+                        };
+                        let previous = ASSET_URLS.with(|cache| {
+                            cache.borrow_mut().insert(
+                                key.clone(),
+                                AssetUrl {
+                                    url: url.clone(),
+                                    fingerprint,
+                                    checked_at_ms: now,
+                                    checking: false,
+                                },
+                            )
+                        });
+                        if let Some(previous) = previous {
+                            let _ = web_sys::Url::revoke_object_url(&previous.url);
+                        }
+                        url
+                    }
                 };
-                let mut inner = this.0.borrow_mut();
-                if inner.asset_blob_generation != generation {
-                    let _ = web_sys::Url::revoke_object_url(&url);
-                    return;
+                if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+                    set_asset_src(&document, &path_value, &url);
                 }
-                let _ = element.set_attribute("src", &url);
-                inner.asset_blob_urls.push(url);
             });
         }
     }
 
     fn render(&self) {
         if self.reconcile_focused_text_controls() {
+            self.refresh_status_in_place();
             return;
         }
         RENDERING.with(|rendering| rendering.set(true));
@@ -9288,14 +10398,6 @@ impl Driver {
         let root = document
             .get_element_by_id("root")
             .expect("No element with id 'root' found");
-        let asset_blob_generation = {
-            let mut inner = self.0.borrow_mut();
-            for url in inner.asset_blob_urls.drain(..) {
-                let _ = web_sys::Url::revoke_object_url(&url);
-            }
-            inner.asset_blob_generation = inner.asset_blob_generation.wrapping_add(1);
-            inner.asset_blob_generation
-        };
 
         let active_element = document.active_element();
         let control_focus_key = active_element
@@ -9351,6 +10453,25 @@ impl Driver {
             }
         });
 
+        // Full renders rebuild every scroller; keep where the reader was.
+        let scroll_positions = RETAINED_SCROLLERS
+            .iter()
+            .filter_map(|selector| {
+                let element = document.query_selector(selector).ok().flatten()?;
+                let top = element.scroll_top();
+                (top > 0).then(|| (*selector, top, element.get_attribute("data-scroll-key")))
+            })
+            .collect::<Vec<_>>();
+        let held_page_height = scroll_positions
+            .iter()
+            .find(|(selector, _, _)| *selector == ".main-content")
+            .and_then(|(_, _, key)| {
+                let surface = document.query_selector(".page-surface").ok().flatten()?;
+                Some((key.clone(), surface.get_bounding_client_rect().height()))
+            });
+
+        // Forms are rebuilt on every render: keep what was typed.
+        let typed = auth_field_values(&root);
         root.set_inner_html("");
 
         let requested_focus = self.0.borrow_mut().pending_focus_key.take();
@@ -9376,13 +10497,21 @@ impl Driver {
         let mut inner = self.0.borrow().clone();
         if !inner.local_mode && inner.auth_phase != AuthPhase::Ready {
             self.render_auth_screen(&document, &root);
+            restore_auth_field_values(&root, &typed);
+            if let Some(element) = requested_focus.as_deref().and_then(|key| {
+                root.query_selector(&format!("[data-focus-key=\"{}\"]", key.replace('"', "")))
+                    .ok()
+                    .flatten()
+                    .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+            }) {
+                let _ = element.focus();
+            }
             RENDERING.with(|rendering| rendering.set(false));
             return;
         }
         let client_state = &inner.client_state;
         let view_doc = Driver::effective_document(&inner);
         let phase = client_state.phase();
-        let persistence_status = &inner.persistence_status;
         let storage_error = &inner.storage_error;
         let entries = &inner.entries;
         let selected_path = &inner.selected_path;
@@ -9424,36 +10553,29 @@ impl Driver {
             sidebar.set_attribute("inert", "").unwrap();
             sidebar.set_attribute("aria-hidden", "true").unwrap();
         }
-        let brand = document.create_element("div").unwrap();
-        brand.set_class_name("brand");
-        brand.set_text_content(Some("Inkstone"));
-        sidebar.append_child(&brand).unwrap();
-        let workspace_name = document.create_element("div").unwrap();
-        workspace_name.set_class_name("workspace-name");
-        workspace_name.set_text_content(Some(&inner.workspace_name));
-        sidebar.append_child(&workspace_name).unwrap();
-
-        if !inner.local_mode && inner.workspaces.len() > 1 {
-            let switcher = document.create_element("div").unwrap();
-            switcher.set_class_name("workspace-switcher");
-            for workspace in &inner.workspaces {
-                let button = document.create_element("button").unwrap();
-                button.set_class_name("workspace-switch-btn");
-                button
-                    .set_attribute("data-workspace-id", &workspace.id.to_string())
-                    .unwrap();
-                if Some(workspace.id) == inner.workspace_id {
-                    button.set_attribute("aria-current", "true").unwrap();
-                }
-                button.set_text_content(Some(if Some(workspace.id) == inner.workspace_id {
-                    inner.workspace_name.as_str()
-                } else {
-                    "Encrypted workspace"
-                }));
-                switcher.append_child(&button).unwrap();
-            }
-            sidebar.append_child(&switcher).unwrap();
+        let switcher_wrap = document.create_element("div").unwrap();
+        switcher_wrap.set_class_name("vault-switcher-wrap");
+        switcher_wrap
+            .append_child(&vaults::render_switcher(&document, &inner))
+            .unwrap();
+        if inner.vault_menu_open {
+            switcher_wrap
+                .append_child(&vaults::render_menu(&document, &inner))
+                .unwrap();
         }
+        sidebar.append_child(&switcher_wrap).unwrap();
+        let home_link = document.create_element("button").unwrap();
+        home_link.set_class_name("sidebar-home-btn");
+        home_link
+            .append_child(&icons::icon(&document, "home"))
+            .unwrap();
+        let home_label = document.create_element("span").unwrap();
+        home_label.set_text_content(Some("Home"));
+        home_link.append_child(&home_label).unwrap();
+        if inner.selected_path.is_none() {
+            home_link.set_attribute("aria-current", "page").unwrap();
+        }
+        sidebar.append_child(&home_link).unwrap();
 
         // Search Input
         let search_container = document.create_element("div").unwrap();
@@ -9482,7 +10604,7 @@ impl Driver {
         let search_input: web_sys::HtmlInputElement = search_input.unchecked_into();
         search_input.set_type("text");
         search_input.set_class_name("search-input");
-        search_input.set_placeholder("Search notes...");
+        search_input.set_placeholder("Search notes");
         search_input
             .set_attribute("aria-label", "Search notes")
             .unwrap();
@@ -9509,7 +10631,17 @@ impl Driver {
             .set_attribute("data-focus-key", "search-input")
             .unwrap();
         search_input.set_value(&inner.search_query);
-        search_container.append_child(&search_input).unwrap();
+        let search_field = document.create_element("div").unwrap();
+        search_field.set_class_name("search-field");
+        search_field
+            .append_child(&icons::icon(&document, "search"))
+            .unwrap();
+        search_field.append_child(&search_input).unwrap();
+        let search_shortcut = document.create_element("span").unwrap();
+        search_shortcut.set_class_name("kbd");
+        search_shortcut.set_text_content(Some(shortcut_label("K").as_str()));
+        search_field.append_child(&search_shortcut).unwrap();
+        search_container.append_child(&search_field).unwrap();
 
         if inner.search_indexing {
             let status = document.create_element("div").unwrap();
@@ -9525,7 +10657,11 @@ impl Driver {
             if count == 0 {
                 status.set_text_content(Some("No matching notes"));
             } else {
-                status.set_text_content(Some(&format!("{} results", count)));
+                status.set_text_content(Some(&if count == 1 {
+                    "1 result".to_string()
+                } else {
+                    format!("{} results", count)
+                }));
             }
             search_container.append_child(&status).unwrap();
         }
@@ -9575,10 +10711,12 @@ impl Driver {
                 name_span.set_text_content(Some(&file_name));
                 recent_item.append_child(&name_span).unwrap();
 
-                let path_span = document.create_element("span").unwrap();
-                path_span.set_class_name("recent-item-path");
-                path_span.set_text_content(Some(path));
-                recent_item.append_child(&path_span).unwrap();
+                if let Some((folder, _)) = path.rsplit_once('/') {
+                    let path_span = document.create_element("span").unwrap();
+                    path_span.set_class_name("recent-item-path");
+                    path_span.set_text_content(Some(folder));
+                    recent_item.append_child(&path_span).unwrap();
+                }
 
                 recent_list.append_child(&recent_item).unwrap();
             }
@@ -9588,7 +10726,40 @@ impl Driver {
 
         let sidebar_heading = document.create_element("div").unwrap();
         sidebar_heading.set_class_name("sidebar-heading");
-        sidebar_heading.set_text_content(Some("Files"));
+        let heading_label = document.create_element("span").unwrap();
+        heading_label.set_text_content(Some(if is_search_active { "Results" } else { "Files" }));
+        sidebar_heading.append_child(&heading_label).unwrap();
+        if !is_search_active && !inner.show_create && can_edit_workspace {
+            let actions = document.create_element("div").unwrap();
+            actions.set_class_name("sidebar-heading-actions");
+            let new_btn = document.create_element("button").unwrap();
+            new_btn.set_class_name("explorer-new-btn");
+            icons::icon_button_content(&document, &new_btn, "file-plus", "New file");
+            new_btn.set_attribute("data-focus-key", "new-file").unwrap();
+            actions.append_child(&new_btn).unwrap();
+            let folder_btn = document.create_element("button").unwrap();
+            folder_btn.set_class_name("explorer-new-folder-btn");
+            icons::icon_button_content(&document, &folder_btn, "folder-plus", "New folder");
+            folder_btn
+                .set_attribute("data-focus-key", "new-folder")
+                .unwrap();
+            actions.append_child(&folder_btn).unwrap();
+            let import_label = document.create_element("label").unwrap();
+            import_label.set_class_name("asset-import-label");
+            import_label.set_attribute("title", "Import asset").unwrap();
+            import_label
+                .append_child(&icons::icon(&document, "upload"))
+                .unwrap();
+            let import = document.create_element("input").unwrap();
+            import.set_class_name("asset-import-input");
+            import.set_attribute("type", "file").unwrap();
+            import
+                .set_attribute("aria-label", "Import encrypted asset")
+                .unwrap();
+            import_label.append_child(&import).unwrap();
+            actions.append_child(&import_label).unwrap();
+            sidebar_heading.append_child(&actions).unwrap();
+        }
         sidebar.append_child(&sidebar_heading).unwrap();
 
         let file_list = document.create_element("div").unwrap();
@@ -9690,35 +10861,11 @@ impl Driver {
                 create_input.set_value(&inner.create_value);
                 create_row.append_child(&create_input).unwrap();
                 file_list.append_child(&create_row).unwrap();
-            } else if can_edit_workspace {
-                let new_btn = document.create_element("button").unwrap();
-                new_btn.set_class_name("explorer-new-btn");
-                new_btn.set_text_content(Some("+ New File"));
-                new_btn.set_attribute("data-focus-key", "new-file").unwrap();
-                file_list.append_child(&new_btn).unwrap();
-                let folder_btn = document.create_element("button").unwrap();
-                folder_btn.set_class_name("explorer-new-folder-btn");
-                folder_btn.set_text_content(Some("+ New Folder"));
-                folder_btn
-                    .set_attribute("data-focus-key", "new-folder")
-                    .unwrap();
-                file_list.append_child(&folder_btn).unwrap();
-                let import_label = document.create_element("label").unwrap();
-                import_label.set_class_name("asset-import-label");
-                import_label.set_text_content(Some("Import asset"));
-                let import = document.create_element("input").unwrap();
-                import.set_class_name("asset-import-input");
-                import.set_attribute("type", "file").unwrap();
-                import
-                    .set_attribute("aria-label", "Import encrypted asset")
-                    .unwrap();
-                import_label.append_child(&import).unwrap();
-                file_list.append_child(&import_label).unwrap();
             }
 
             let flat_tree = explorer::build_flat_tree(entries, &inner.expanded_folders);
             for flat_node in &flat_tree {
-                let indent_px = 8 + flat_node.depth * 20;
+                let indent_px = 6 + flat_node.depth * 16;
                 if flat_node.is_folder {
                     let folder_row = document.create_element("div").unwrap();
                     folder_row.set_class_name("explorer-folder-row");
@@ -9755,11 +10902,9 @@ impl Driver {
                         .unwrap();
                     let toggle = document.create_element("span").unwrap();
                     toggle.set_class_name("explorer-toggle");
-                    toggle.set_text_content(Some(if flat_node.is_expanded {
-                        "\u{25bc}"
-                    } else {
-                        "\u{25b6}"
-                    }));
+                    toggle
+                        .append_child(&icons::icon(&document, "chevron-right"))
+                        .unwrap();
                     folder_div.append_child(&toggle).unwrap();
                     let name_span = document.create_element("span").unwrap();
                     name_span.set_class_name("folder-name");
@@ -9772,35 +10917,32 @@ impl Driver {
                         create_in_folder
                             .set_attribute("data-path", &flat_node.path)
                             .unwrap();
-                        create_in_folder
-                            .set_attribute(
-                                "aria-label",
-                                &format!("Create file in {}", flat_node.name),
-                            )
-                            .unwrap();
-                        create_in_folder.set_text_content(Some("+"));
+                        icons::icon_button_content(
+                            &document,
+                            &create_in_folder,
+                            "plus",
+                            &format!("Create file in {}", flat_node.name),
+                        );
                         folder_row.append_child(&create_in_folder).unwrap();
                         let rename = document.create_element("button").unwrap();
                         rename.set_class_name("folder-rename-btn");
                         rename.set_attribute("data-path", &flat_node.path).unwrap();
-                        rename
-                            .set_attribute(
-                                "aria-label",
-                                &format!("Rename or move {}", flat_node.name),
-                            )
-                            .unwrap();
-                        rename.set_text_content(Some("Move"));
+                        icons::icon_button_content(
+                            &document,
+                            &rename,
+                            "pencil",
+                            &format!("Rename or move {}", flat_node.name),
+                        );
                         folder_row.append_child(&rename).unwrap();
                         let delete = document.create_element("button").unwrap();
                         delete.set_class_name("folder-delete-btn");
                         delete.set_attribute("data-path", &flat_node.path).unwrap();
-                        delete
-                            .set_attribute(
-                                "aria-label",
-                                &format!("Delete folder {}", flat_node.name),
-                            )
-                            .unwrap();
-                        delete.set_text_content(Some("Delete"));
+                        icons::icon_button_content(
+                            &document,
+                            &delete,
+                            "trash",
+                            &format!("Delete folder {}", flat_node.name),
+                        );
                         folder_row.append_child(&delete).unwrap();
                     }
                     file_list.append_child(&folder_row).unwrap();
@@ -9845,6 +10987,9 @@ impl Driver {
                         if is_active {
                             select_file.set_attribute("aria-current", "page").unwrap();
                         }
+                        select_file
+                            .append_child(&icons::icon(&document, "file"))
+                            .unwrap();
                         let file_name = document.create_element("span").unwrap();
                         file_name.set_class_name("file-name");
                         file_name.set_text_content(Some(&flat_node.name));
@@ -9864,10 +11009,12 @@ impl Driver {
                         rename_btn
                             .set_attribute("data-focus-key", &format!("rename:{}", flat_node.path))
                             .unwrap();
-                        rename_btn.set_text_content(Some("Rename"));
-                        rename_btn
-                            .set_attribute("aria-label", &format!("Rename {}", flat_node.name))
-                            .unwrap();
+                        icons::icon_button_content(
+                            &document,
+                            &rename_btn,
+                            "pencil",
+                            &format!("Rename {}", flat_node.name),
+                        );
                         file_actions.append_child(&rename_btn).unwrap();
 
                         let delete_btn = document.create_element("button").unwrap();
@@ -9875,10 +11022,12 @@ impl Driver {
                         delete_btn
                             .set_attribute("data-path", &flat_node.path)
                             .unwrap();
-                        delete_btn.set_text_content(Some("Delete"));
-                        delete_btn
-                            .set_attribute("aria-label", &format!("Delete {}", flat_node.name))
-                            .unwrap();
+                        icons::icon_button_content(
+                            &document,
+                            &delete_btn,
+                            "trash",
+                            &format!("Delete {}", flat_node.name),
+                        );
                         file_actions.append_child(&delete_btn).unwrap();
 
                         file_entry.append_child(&file_actions).unwrap();
@@ -9892,35 +11041,33 @@ impl Driver {
         let sidebar_footer = document.create_element("div").unwrap();
         sidebar_footer.set_class_name("sidebar-footer");
 
-        let phase_badge = document.create_element("span").unwrap();
-        phase_badge.set_class_name(&format!("phase-badge phase-{:?}", phase).to_lowercase());
-        phase_badge.set_text_content(Some(&format!("{:?}", phase)));
-        sidebar_footer.append_child(&phase_badge).unwrap();
-
-        let status_area = document.create_element("div").unwrap();
-        status_area.set_class_name("status-area");
-        status_area.set_text_content(Some(persistence_status));
-        sidebar_footer.append_child(&status_area).unwrap();
+        let vault_status = document.create_element("div").unwrap();
+        vault_status.set_class_name("vault-status");
+        if inner.local_mode {
+            let dot = document.create_element("span").unwrap();
+            dot.set_class_name("status-dot");
+            dot.set_attribute(
+                "data-state",
+                persistence_state(&save_label(&inner).unwrap_or_default()),
+            )
+            .unwrap();
+            vault_status.append_child(&dot).unwrap();
+            let label = document.create_element("span").unwrap();
+            label.set_text_content(Some("Stored on this device"));
+            vault_status.append_child(&label).unwrap();
+        } else {
+            let phase_badge = document.create_element("span").unwrap();
+            phase_badge.set_class_name(&format!("phase-badge phase-{:?}", phase).to_lowercase());
+            phase_badge.set_text_content(Some(&format!("{:?}", phase)));
+            vault_status.append_child(&phase_badge).unwrap();
+        }
+        sidebar_footer.append_child(&vault_status).unwrap();
 
         if !inner.local_mode {
             let sync_status = document.create_element("div").unwrap();
             sync_status.set_class_name("sync-status");
             sync_status.set_attribute("role", "status").unwrap();
-            sync_status.set_text_content(Some(
-                if inner.sync_error.is_some() || inner.auth_error.is_some() {
-                    "Sync needs attention"
-                } else {
-                    match phase {
-                        SessionPhase::Live => "Encrypted sync is live",
-                        SessionPhase::CatchingUp => "Decrypting remote changes...",
-                        SessionPhase::Connecting => "Connecting encrypted sync...",
-                        SessionPhase::Offline => "Offline; changes stay local",
-                        SessionPhase::Error => "Sync needs attention",
-                        SessionPhase::HydratingLocal => "Loading local encrypted state...",
-                        SessionPhase::Closed => "No document connected",
-                    }
-                },
-            ));
+            sync_status.set_text_content(Some(sync_status_text(&inner, phase)));
             sidebar_footer.append_child(&sync_status).unwrap();
             if let Some(error) = inner.sync_error.as_ref().or(inner.auth_error.as_ref()) {
                 let error_element = document.create_element("div").unwrap();
@@ -9943,10 +11090,12 @@ impl Driver {
                 sidebar_footer.append_child(&index_error).unwrap();
             }
 
-            let logout = document.create_element("button").unwrap();
-            logout.set_class_name("logout-btn text-btn");
-            logout.set_text_content(Some("Sign out"));
-            sidebar_footer.append_child(&logout).unwrap();
+            if inner.public_view.is_none() {
+                let logout = document.create_element("button").unwrap();
+                logout.set_class_name("logout-btn text-btn");
+                logout.set_text_content(Some("Sign out"));
+                sidebar_footer.append_child(&logout).unwrap();
+            }
         }
 
         let settings = document.create_element("button").unwrap();
@@ -9955,13 +11104,20 @@ impl Driver {
         settings
             .set_attribute("data-focus-key", "settings-open")
             .unwrap();
-        settings.set_text_content(Some("Vault settings"));
-        sidebar_footer.append_child(&settings).unwrap();
+        icons::icon_button_content(&document, &settings, "settings", "Vault settings");
+        if inner.public_view.is_none() {
+            sidebar_footer
+                .insert_before(&settings, vault_status.next_sibling().as_ref())
+                .unwrap();
+        }
 
         sidebar.append_child(&sidebar_footer).unwrap();
         app_container.append_child(&sidebar).unwrap();
 
         let main_content = document.create_element("div").unwrap();
+        main_content
+            .set_attribute("data-scroll-key", &format!("{}", inner.selected_doc_id))
+            .unwrap();
         main_content.set_class_name(if inner.document_mode == DocumentMode::Preview {
             "main-content preview-mode"
         } else {
@@ -9972,10 +11128,12 @@ impl Driver {
         topbar.set_class_name("workspace-topbar");
         let nav_toggle = document.create_element("button").unwrap();
         nav_toggle.set_class_name("sidebar-toggle-btn");
-        nav_toggle.set_text_content(Some("Workspace"));
-        nav_toggle
-            .set_attribute("aria-label", "Toggle workspace navigation")
-            .unwrap();
+        icons::icon_button_content(
+            &document,
+            &nav_toggle,
+            "panel-left",
+            "Toggle workspace navigation",
+        );
         nav_toggle
             .set_attribute("aria-controls", "workspace-navigation")
             .unwrap();
@@ -9991,22 +11149,72 @@ impl Driver {
         topbar.append_child(&nav_toggle).unwrap();
         let breadcrumb = document.create_element("div").unwrap();
         breadcrumb.set_class_name("breadcrumb");
-        breadcrumb.set_text_content(Some(selected_path.as_deref().unwrap_or("Workspace")));
+        let crumb_path = selected_path.as_deref().unwrap_or("Home");
+        breadcrumb.set_attribute("title", crumb_path).unwrap();
+        let crumbs = crumb_path.split('/').collect::<Vec<_>>();
+        for (index, crumb) in crumbs.iter().enumerate() {
+            if index > 0 {
+                let separator = document.create_element("span").unwrap();
+                separator.set_class_name("crumb-sep");
+                separator.set_text_content(Some("/"));
+                breadcrumb.append_child(&separator).unwrap();
+            }
+            let segment = document.create_element("span").unwrap();
+            segment.set_class_name(if index + 1 == crumbs.len() {
+                "crumb-current"
+            } else {
+                "crumb"
+            });
+            segment.set_text_content(Some(crumb));
+            breadcrumb.append_child(&segment).unwrap();
+        }
         topbar.append_child(&breadcrumb).unwrap();
         let topbar_actions = document.create_element("div").unwrap();
         topbar_actions.set_class_name("topbar-actions");
         let quick_search = document.create_element("button").unwrap();
         quick_search.set_class_name("topbar-search-btn");
-        quick_search.set_text_content(Some("Search pages"));
+        quick_search
+            .append_child(&icons::icon(&document, "search"))
+            .unwrap();
+        let quick_search_label = document.create_element("span").unwrap();
+        quick_search_label.set_text_content(Some("Search"));
+        quick_search.append_child(&quick_search_label).unwrap();
+        let quick_search_kbd = document.create_element("span").unwrap();
+        quick_search_kbd.set_class_name("kbd");
+        quick_search_kbd.set_text_content(Some(shortcut_label("K").as_str()));
+        quick_search.append_child(&quick_search_kbd).unwrap();
+        quick_search
+            .set_attribute("aria-label", "Search pages")
+            .unwrap();
         quick_search
             .set_attribute("data-focus-key", "quick-search")
             .unwrap();
         topbar_actions.append_child(&quick_search).unwrap();
         let save_status = document.create_element("span").unwrap();
         save_status.set_class_name("topbar-save-status");
-        save_status.set_text_content(Some(persistence_status));
+        let save_text = save_label(&inner).unwrap_or_else(|| "Saving…".into());
+        save_status.set_text_content(Some(&save_text));
+        save_status
+            .set_attribute("data-state", persistence_state(&save_text))
+            .unwrap();
         save_status.set_attribute("role", "status").unwrap();
-        topbar_actions.append_child(&save_status).unwrap();
+        if selected_path.is_some() || inner.local_persistence_error.is_some() {
+            topbar_actions.append_child(&save_status).unwrap();
+        }
+        if selected_path.is_some() && !inner.local_mode {
+            let live_on = live::enabled();
+            let direct = self.live_direct_count();
+            let live_btn = document.create_element("button").unwrap();
+            live_btn.set_class_name("live-toggle-btn");
+            live_btn
+                .append_child(&document.create_element("span").unwrap())
+                .unwrap();
+            set_live_toggle_state(&live_btn, live_on, direct);
+            live_btn
+                .set_attribute("data-focus-key", "live-toggle")
+                .unwrap();
+            topbar_actions.append_child(&live_btn).unwrap();
+        }
         let collaborator_states = inner
             .remote_presence
             .values()
@@ -10053,9 +11261,6 @@ impl Driver {
             if inner.document_mode == DocumentMode::Edit {
                 edit_btn.set_attribute("data-active", "true").unwrap();
             }
-            if can_edit_workspace {
-                mode_bar.append_child(&edit_btn).unwrap();
-            }
             let preview_btn = document.create_element("button").unwrap();
             preview_btn.set_class_name("mode-toggle-btn");
             preview_btn.set_attribute("data-mode", "preview").unwrap();
@@ -10076,10 +11281,9 @@ impl Driver {
             if inner.document_mode == DocumentMode::Preview {
                 preview_btn.set_attribute("data-active", "true").unwrap();
             }
-            mode_bar.append_child(&preview_btn).unwrap();
             let inspector_toggle = document.create_element("button").unwrap();
             inspector_toggle.set_class_name("mode-toggle-btn toggle-inspector-btn");
-            inspector_toggle.set_text_content(Some("Inspector"));
+            icons::icon_button_content(&document, &inspector_toggle, "panel-right", "Inspector");
             inspector_toggle
                 .set_attribute("aria-controls", "document-inspector")
                 .unwrap();
@@ -10096,6 +11300,12 @@ impl Driver {
             inspector_toggle
                 .set_attribute("data-focus-key", "inspector-toggle")
                 .unwrap();
+            mode_bar
+                .append_child(&page_export::render_button(
+                    &document,
+                    inner.export_menu_open,
+                ))
+                .unwrap();
             mode_bar.append_child(&inspector_toggle).unwrap();
             topbar_actions.append_child(&mode_bar).unwrap();
         }
@@ -10103,10 +11313,9 @@ impl Driver {
         main_content.append_child(&topbar).unwrap();
 
         if selected_path.is_none() && storage_error.is_none() {
-            let empty_state = document.create_element("div").unwrap();
-            empty_state.set_class_name("empty-state");
-            empty_state.set_text_content(Some("Select a file or create a new one."));
-            main_content.append_child(&empty_state).unwrap();
+            main_content
+                .append_child(&self.render_home(&document))
+                .unwrap();
         }
 
         if let Some(err) = &inner.document_error {
@@ -10156,7 +11365,7 @@ impl Driver {
             recovery.set_class_name("conflict-recovery");
             recovery.set_attribute("role", "status").unwrap();
             recovery.set_text_content(Some(
-                "Some local edits conflict with newer structure. They remain stored locally for retry or recovery.",
+                "Some edits clashed with newer changes. They're kept safe on this device.",
             ));
             for conflict in client_state.pending_conflicts() {
                 let detail = document.create_element("div").unwrap();
@@ -10290,7 +11499,9 @@ impl Driver {
                     title_input
                         .set_attribute("aria-label", "Document title")
                         .unwrap();
-                    title_input.set_disabled(inner.local_persistence_error.is_some());
+                    title_input.set_disabled(
+                        inner.local_persistence_error.is_some() || !document_ready(&inner),
+                    );
                     title_input.set_value(&view_doc.title);
                     title_input
                         .set_attribute("data-canonical-value", &view_doc.title)
@@ -10324,7 +11535,7 @@ impl Driver {
                     .iter()
                     .map(|block| block.updated_at_ms)
                     .max();
-                let mut metadata_values = vec![
+                let metadata_values = vec![
                     (
                         "Created",
                         created_at
@@ -10338,9 +11549,6 @@ impl Driver {
                             .unwrap_or_else(|| "No edits yet".to_string()),
                     ),
                 ];
-                if inner.document_mode == DocumentMode::Edit {
-                    metadata_values.push(("Blocks", view_doc.blocks.len().to_string()));
-                }
                 for (label, value) in metadata_values {
                     let item = document.create_element("div").unwrap();
                     item.set_class_name("metadata-item");
@@ -10356,22 +11564,13 @@ impl Driver {
                 }
                 let tags_item = document.create_element("div").unwrap();
                 tags_item.set_class_name("metadata-item metadata-tags");
-                let tags_label = document.create_element("span").unwrap();
-                tags_label.set_class_name("metadata-label");
-                tags_label.set_text_content(Some("Tags"));
-                tags_item.append_child(&tags_label).unwrap();
                 let mut current_tags: Vec<String> = selected_path
                     .as_ref()
                     .and_then(|path| inner.knowledge.path_to_tags.get(path))
                     .map(|tags| tags.iter().cloned().collect())
                     .unwrap_or_default();
                 current_tags.sort();
-                if current_tags.is_empty() {
-                    let empty = document.create_element("span").unwrap();
-                    empty.set_class_name("metadata-value metadata-empty");
-                    empty.set_text_content(Some("No parsed tags"));
-                    tags_item.append_child(&empty).unwrap();
-                } else {
+                if !current_tags.is_empty() {
                     for tag in current_tags {
                         let chip = document.create_element("button").unwrap();
                         chip.set_class_name("metadata-tag");
@@ -10379,8 +11578,8 @@ impl Driver {
                         chip.set_text_content(Some(&format!("#{}", tag)));
                         tags_item.append_child(&chip).unwrap();
                     }
+                    metadata.append_child(&tags_item).unwrap();
                 }
-                metadata.append_child(&tags_item).unwrap();
                 document_header.append_child(&metadata).unwrap();
                 if inner.document_mode == DocumentMode::Preview {
                     let rule = document.create_element("hr").unwrap();
@@ -10389,413 +11588,27 @@ impl Driver {
                 }
                 editor_container.append_child(&document_header).unwrap();
 
-                if inner.document_mode == DocumentMode::Edit {
-                    let block_list = document.create_element("div").unwrap();
-                    block_list.set_class_name("block-list");
-
-                    for (block_index, block) in view_doc.blocks.iter().enumerate() {
-                        let block_id = block.id;
-                        let (kind, label) = match &block.content {
-                            BlockContent::Markdown { .. } => ("markdown", "MARKDOWN"),
-                            BlockContent::Math { .. } => ("math", "MATH"),
-                            BlockContent::Ink { .. } => ("ink", "INK"),
-                            BlockContent::Divider => ("divider", "DIVIDER"),
-                        };
-                        let block_wrapper = document.create_element("article").unwrap();
-                        let expanded = inner.expanded_ink_block == Some(block_id);
-                        let wrapper_class = if expanded {
-                            format!("block-wrapper block-{} expanded", kind)
-                        } else {
-                            format!("block-wrapper block-{}", kind)
-                        };
-                        block_wrapper.set_class_name(&wrapper_class);
-                        block_wrapper
-                            .set_attribute("data-block-id", &block_id.to_string())
-                            .unwrap();
-                        block_wrapper
-                            .set_attribute("data-block-type", kind)
-                            .unwrap();
-
-                        let block_header = document.create_element("header").unwrap();
-                        block_header.set_class_name("block-header");
-                        let block_label = document.create_element("span").unwrap();
-                        block_label.set_class_name("block-label");
-                        block_label.set_text_content(Some(label));
-                        block_header.append_child(&block_label).unwrap();
-                        let block_actions = document.create_element("div").unwrap();
-                        block_actions.set_class_name("block-actions");
-                        for (action, text, disabled) in [
-                            ("move-up", "Up", block_index == 0),
-                            (
-                                "move-down",
-                                "Down",
-                                block_index + 1 == view_doc.blocks.len(),
-                            ),
-                            ("delete", "Delete", false),
-                        ] {
-                            let button = document.create_element("button").unwrap();
-                            button.set_class_name("block-action-btn");
-                            button.set_attribute("data-block-action", action).unwrap();
-                            button
-                                .set_attribute("data-block-id", &block_id.to_string())
-                                .unwrap();
-                            button.set_text_content(Some(text));
-                            if disabled {
-                                button.set_attribute("disabled", "").unwrap();
-                            }
-                            block_actions.append_child(&button).unwrap();
-                        }
-                        block_header.append_child(&block_actions).unwrap();
-                        block_wrapper.append_child(&block_header).unwrap();
-
-                        match &block.content {
-                            BlockContent::Markdown { text } => {
-                                let textarea = document.create_element("textarea").unwrap();
-                                let textarea: web_sys::HtmlTextAreaElement =
-                                    textarea.unchecked_into();
-                                textarea.set_class_name("block-textarea markdown-source-input");
-                                textarea.set_placeholder("Write Markdown...");
-                                textarea
-                                    .set_attribute(
-                                        "aria-label",
-                                        &format!("Markdown block {}", block_index + 1),
-                                    )
-                                    .unwrap();
-                                textarea.set_disabled(inner.local_persistence_error.is_some());
-                                textarea
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                textarea
-                                    .set_attribute("data-block-kind", "markdown")
-                                    .unwrap();
-                                textarea.set_value(text);
-                                textarea
-                                    .set_attribute("data-canonical-value", text)
-                                    .unwrap();
-                                block_wrapper.append_child(&textarea).unwrap();
-                            }
-                            BlockContent::Math { source } => {
-                                let textarea = document.create_element("textarea").unwrap();
-                                let textarea: web_sys::HtmlTextAreaElement =
-                                    textarea.unchecked_into();
-                                textarea.set_class_name("block-textarea math-source-input");
-                                textarea.set_placeholder("Enter TeX or mathematical source...");
-                                textarea
-                                    .set_attribute(
-                                        "aria-label",
-                                        &format!("Math source block {}", block_index + 1),
-                                    )
-                                    .unwrap();
-                                textarea.set_disabled(inner.local_persistence_error.is_some());
-                                textarea
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                textarea.set_attribute("data-block-kind", "math").unwrap();
-                                textarea.set_value(source);
-                                textarea
-                                    .set_attribute("data-canonical-value", source)
-                                    .unwrap();
-                                block_wrapper.append_child(&textarea).unwrap();
-                                let source_preview = document.create_element("div").unwrap();
-                                source_preview.set_class_name("math-source-preview");
-                                source_preview.set_text_content(Some(if source.is_empty() {
-                                    "Mathematical source preview"
-                                } else {
-                                    source
-                                }));
-                                block_wrapper.append_child(&source_preview).unwrap();
-                            }
-                            BlockContent::Ink { .. } => {
-                                let ink_block = document.create_element("div").unwrap();
-                                ink_block.set_class_name("ink-block");
-                                ink_block
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                let toolbar = document.create_element("div").unwrap();
-                                toolbar.set_class_name("ink-toolbar");
-                                for (tool, text) in [
-                                    ("pen", "Pen"),
-                                    ("eraser", "Eraser"),
-                                    ("lasso", "Lasso"),
-                                    ("select", "Select"),
-                                ] {
-                                    let button = document.create_element("button").unwrap();
-                                    button.set_class_name(if inner.ink_tool == tool {
-                                        "ink-tool-btn active"
-                                    } else {
-                                        "ink-tool-btn"
-                                    });
-                                    button.set_attribute("data-ink-action", "tool").unwrap();
-                                    button.set_attribute("data-tool", tool).unwrap();
-                                    button
-                                        .set_attribute("data-block-id", &block_id.to_string())
-                                        .unwrap();
-                                    button.set_text_content(Some(text));
-                                    toolbar.append_child(&button).unwrap();
-                                }
-                                for (action, text) in [("undo", "Undo"), ("redo", "Redo")] {
-                                    let button = document.create_element("button").unwrap();
-                                    button.set_class_name("ink-action-btn");
-                                    button.set_attribute("data-ink-action", action).unwrap();
-                                    button
-                                        .set_attribute("data-block-id", &block_id.to_string())
-                                        .unwrap();
-                                    button.set_text_content(Some(text));
-                                    toolbar.append_child(&button).unwrap();
-                                }
-                                let width = document.create_element("input").unwrap();
-                                let width: web_sys::HtmlInputElement = width.unchecked_into();
-                                width.set_type("range");
-                                width.set_class_name("ink-width-input");
-                                width.set_min("1");
-                                width.set_max("24");
-                                width.set_step("1");
-                                width.set_value(&inner.ink_brush_width.to_string());
-                                width.set_attribute("aria-label", "Brush width").unwrap();
-                                width.set_attribute("data-ink-action", "width").unwrap();
-                                width
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                toolbar.append_child(&width).unwrap();
-                                for (name, rgb) in [
-                                    ("Ink", "31,41,55"),
-                                    ("Blue", "37,99,235"),
-                                    ("Red", "190,52,52"),
-                                ] {
-                                    let color = document.create_element("button").unwrap();
-                                    color.set_class_name("ink-color-btn");
-                                    color.set_attribute("data-ink-action", "color").unwrap();
-                                    color.set_attribute("data-color", rgb).unwrap();
-                                    color
-                                        .set_attribute("data-block-id", &block_id.to_string())
-                                        .unwrap();
-                                    color.set_attribute("aria-label", name).unwrap();
-                                    color.set_attribute("title", name).unwrap();
-                                    toolbar.append_child(&color).unwrap();
-                                }
-                                let expand = document.create_element("button").unwrap();
-                                expand.set_class_name("ink-action-btn ink-expand-btn");
-                                expand.set_attribute("data-ink-action", "expand").unwrap();
-                                expand
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                expand
-                                    .set_attribute(
-                                        "aria-label",
-                                        if expanded {
-                                            "Collapse Ink drawing"
-                                        } else {
-                                            "Expand Ink drawing"
-                                        },
-                                    )
-                                    .unwrap();
-                                expand
-                                    .set_attribute(
-                                        "aria-expanded",
-                                        if expanded { "true" } else { "false" },
-                                    )
-                                    .unwrap();
-                                expand.set_text_content(Some(if expanded {
-                                    "Collapse"
-                                } else {
-                                    "Expand"
-                                }));
-                                toolbar.append_child(&expand).unwrap();
-                                let save_state = document.create_element("span").unwrap();
-                                save_state.set_class_name("ink-save-state");
-                                save_state.set_attribute("role", "status").unwrap();
-                                save_state
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                let save_phase =
-                                    inner.ink_save_tracker.phase(view_doc.id, block_id);
-                                save_state
-                                    .set_attribute("data-state", save_phase.state())
-                                    .unwrap();
-                                save_state.set_text_content(Some(save_phase.label()));
-                                toolbar.append_child(&save_state).unwrap();
-                                ink_block.append_child(&toolbar).unwrap();
-                                let canvas_host = document.create_element("div").unwrap();
-                                canvas_host.set_class_name("ink-canvas-host");
-                                let canvas = document.create_element("canvas").unwrap();
-                                canvas.set_id(&format!("ink-canvas-{}", block_id));
-                                canvas.set_attribute("tabindex", "0").unwrap();
-                                canvas
-                                    .set_attribute("data-block-id", &block_id.to_string())
-                                    .unwrap();
-                                canvas
-                                    .set_attribute("aria-label", "Stonepen drawing canvas")
-                                    .unwrap();
-                                canvas_host.append_child(&canvas).unwrap();
-                                ink_block.append_child(&canvas_host).unwrap();
-                                block_wrapper.append_child(&ink_block).unwrap();
-                            }
-                            BlockContent::Divider => {
-                                let divider = document.create_element("hr").unwrap();
-                                divider.set_class_name("document-divider");
-                                block_wrapper.append_child(&divider).unwrap();
-                            }
-                        }
-                        block_list.append_child(&block_wrapper).unwrap();
+                let page_editable = can_edit_workspace
+                    && inner.document_mode == DocumentMode::Edit
+                    && document_ready(&inner);
+                self.render_page_surface(
+                    &document,
+                    &editor_container,
+                    &inner,
+                    &view_doc,
+                    selected_path.as_deref().unwrap_or(""),
+                    page_editable,
+                );
+                if page_editable && !client_state.errors().is_empty() {
+                    let error_list = document.create_element("div").unwrap();
+                    error_list.set_class_name("error-list");
+                    for err in client_state.errors() {
+                        let err_item = document.create_element("div").unwrap();
+                        err_item.set_class_name("error-item");
+                        err_item.set_text_content(Some(err));
+                        error_list.append_child(&err_item).unwrap();
                     }
-
-                    if view_doc.blocks.is_empty() {
-                        let empty = document.create_element("div").unwrap();
-                        empty.set_class_name("document-empty-state");
-                        empty.set_text_content(Some(
-                            "Start with a Markdown, Math, Ink, or Divider block.",
-                        ));
-                        block_list.append_child(&empty).unwrap();
-                    }
-                    editor_container.append_child(&block_list).unwrap();
-
-                    let insert = document.create_element("div").unwrap();
-                    insert.set_class_name("block-insert-control");
-                    let insert_label = document.create_element("span").unwrap();
-                    insert_label.set_class_name("block-insert-label");
-                    insert_label.set_text_content(Some("Add block"));
-                    insert.append_child(&insert_label).unwrap();
-                    for (kind, text) in [
-                        ("markdown", "Markdown"),
-                        ("math", "Math"),
-                        ("ink", "Ink"),
-                        ("divider", "Divider"),
-                    ] {
-                        let button = document.create_element("button").unwrap();
-                        button.set_class_name("add-block-btn");
-                        button.set_attribute("data-block-type", kind).unwrap();
-                        button.set_text_content(Some(text));
-                        insert.append_child(&button).unwrap();
-                    }
-                    editor_container.append_child(&insert).unwrap();
-
-                    if !client_state.errors().is_empty() {
-                        let error_list = document.create_element("div").unwrap();
-                        error_list.set_class_name("error-list");
-                        for err in client_state.errors() {
-                            let err_item = document.create_element("div").unwrap();
-                            err_item.set_class_name("error-item");
-                            err_item.set_text_content(Some(err));
-                            error_list.append_child(&err_item).unwrap();
-                        }
-                        editor_container.append_child(&error_list).unwrap();
-                    }
-                } else {
-                    let preview_div = document.create_element("div").unwrap();
-                    preview_div.set_class_name("preview-content document-mode-preview");
-                    let mut heading_counts = std::collections::HashMap::new();
-                    for block in &view_doc.blocks {
-                        let preview_block = document.create_element("section").unwrap();
-                        preview_block.set_class_name("preview-block");
-                        preview_block
-                            .set_attribute("data-block-id", &block.id.to_string())
-                            .unwrap();
-                        match &block.content {
-                            BlockContent::Markdown { text } => {
-                                preview_block.set_class_name("preview-block preview-markdown");
-                                preview_block
-                                    .set_attribute("data-block-type", "markdown")
-                                    .unwrap();
-                                let html = markdown_render::render_with_knowledge_and_counts(
-                                    text,
-                                    selected_path.as_deref().unwrap_or(""),
-                                    &inner.knowledge,
-                                    &mut heading_counts,
-                                );
-                                preview_block.set_inner_html(&html);
-                            }
-                            BlockContent::Math { source } => {
-                                preview_block.set_class_name("preview-block preview-math");
-                                preview_block
-                                    .set_attribute("data-block-type", "math")
-                                    .unwrap();
-                                let label = document.create_element("span").unwrap();
-                                label.set_class_name("preview-block-label");
-                                label.set_text_content(Some("EQUATION"));
-                                let math = document.create_element("div").unwrap();
-                                math.set_class_name("math-display");
-                                math.set_inner_html(&math_render::render_mathml(source));
-                                preview_block.append_child(&label).unwrap();
-                                preview_block.append_child(&math).unwrap();
-                            }
-                            BlockContent::Ink { .. } => {
-                                let expanded = inner.expanded_ink_block == Some(block.id);
-                                preview_block.set_class_name(if expanded {
-                                    "preview-block preview-ink expanded"
-                                } else {
-                                    "preview-block preview-ink"
-                                });
-                                preview_block
-                                    .set_attribute("data-block-type", "ink")
-                                    .unwrap();
-                                let header = document.create_element("header").unwrap();
-                                header.set_class_name("preview-ink-header");
-                                let label = document.create_element("span").unwrap();
-                                label.set_class_name("preview-block-label");
-                                label.set_text_content(Some("INK"));
-                                header.append_child(&label).unwrap();
-                                let expand = document.create_element("button").unwrap();
-                                expand.set_class_name("preview-ink-expand");
-                                expand.set_attribute("data-ink-action", "expand").unwrap();
-                                expand
-                                    .set_attribute("data-block-id", &block.id.to_string())
-                                    .unwrap();
-                                expand
-                                    .set_attribute(
-                                        "aria-label",
-                                        if expanded {
-                                            "Collapse Ink drawing"
-                                        } else {
-                                            "Expand Ink drawing"
-                                        },
-                                    )
-                                    .unwrap();
-                                expand
-                                    .set_attribute(
-                                        "aria-expanded",
-                                        if expanded { "true" } else { "false" },
-                                    )
-                                    .unwrap();
-                                expand.set_text_content(Some(if expanded {
-                                    "Collapse"
-                                } else {
-                                    "Expand"
-                                }));
-                                header.append_child(&expand).unwrap();
-                                preview_block.append_child(&header).unwrap();
-                                let ink_block = document.create_element("div").unwrap();
-                                ink_block.set_class_name("ink-block ink-preview");
-                                ink_block
-                                    .set_attribute("data-block-id", &block.id.to_string())
-                                    .unwrap();
-                                let canvas_host = document.create_element("div").unwrap();
-                                canvas_host.set_class_name("ink-canvas-host");
-                                let canvas = document.create_element("canvas").unwrap();
-                                canvas.set_id(&format!("ink-canvas-{}", block.id));
-                                canvas
-                                    .set_attribute("data-block-id", &block.id.to_string())
-                                    .unwrap();
-                                canvas.set_attribute("role", "img").unwrap();
-                                canvas
-                                    .set_attribute("aria-label", "Read-only Stonepen drawing")
-                                    .unwrap();
-                                canvas_host.append_child(&canvas).unwrap();
-                                ink_block.append_child(&canvas_host).unwrap();
-                                preview_block.append_child(&ink_block).unwrap();
-                            }
-                            BlockContent::Divider => {
-                                preview_block.set_class_name("preview-block preview-divider");
-                                preview_block
-                                    .set_attribute("data-block-type", "divider")
-                                    .unwrap();
-                                let divider = document.create_element("hr").unwrap();
-                                divider.set_class_name("document-divider");
-                                preview_block.append_child(&divider).unwrap();
-                            }
-                        }
-                        preview_div.append_child(&preview_block).unwrap();
-                    }
-                    editor_container.append_child(&preview_div).unwrap();
+                    editor_container.append_child(&error_list).unwrap();
                 }
 
                 main_content.append_child(&editor_container).unwrap();
@@ -10833,7 +11646,7 @@ impl Driver {
         } else {
             inspector.set_class_name("inspector");
         }
-        if viewport_width <= 1180.0 && !inner.inspector_open {
+        if !inner.inspector_open {
             inspector.set_attribute("inert", "").unwrap();
             inspector.set_attribute("aria-hidden", "true").unwrap();
         }
@@ -10886,10 +11699,7 @@ impl Driver {
         inspector_header.append_child(&tabs_div).unwrap();
         let inspector_close = document.create_element("button").unwrap();
         inspector_close.set_class_name("toggle-inspector-btn inspector-close-btn");
-        inspector_close.set_text_content(Some("Hide"));
-        inspector_close
-            .set_attribute("aria-label", "Close document inspector")
-            .unwrap();
+        icons::icon_button_content(&document, &inspector_close, "x", "Close document inspector");
         inspector_header.append_child(&inspector_close).unwrap();
         inspector.append_child(&inspector_header).unwrap();
 
@@ -11131,27 +11941,21 @@ impl Driver {
                     .set_attribute("class", &format!("local-graph-node {}", kind))
                     .unwrap();
                 group.set_attribute("data-path", &node.path).unwrap();
+                let radius = graph_node_radius(node.kind);
                 let circle = document.create_element_ns(svg_ns, "circle").unwrap();
                 circle.set_attribute("cx", &node.x.to_string()).unwrap();
                 circle.set_attribute("cy", &node.y.to_string()).unwrap();
-                circle
-                    .set_attribute(
-                        "r",
-                        if node.kind == local_graph::GraphNodeKind::Active {
-                            "27"
-                        } else {
-                            "13"
-                        },
-                    )
-                    .unwrap();
+                circle.set_attribute("r", &radius.to_string()).unwrap();
                 group.append_child(&circle).unwrap();
+                let title = document.create_element_ns(svg_ns, "title").unwrap();
+                title.set_text_content(Some(&node.label));
+                group.append_child(&title).unwrap();
                 let text = document.create_element_ns(svg_ns, "text").unwrap();
                 text.set_attribute("x", &node.x.to_string()).unwrap();
-                text.set_attribute("y", &(node.y + 30.0).to_string())
+                text.set_attribute("y", &(node.y + radius + 14.0).to_string())
                     .unwrap();
                 text.set_attribute("text-anchor", "middle").unwrap();
-                let label: String = node.label.chars().take(18).collect();
-                text.set_text_content(Some(&label));
+                text.set_text_content(Some(&graph_label(&node.label)));
                 group.append_child(&text).unwrap();
                 svg.append_child(&group).unwrap();
             }
@@ -11176,20 +11980,15 @@ impl Driver {
                         },
                     )
                     .unwrap();
-                let size = if node.kind == local_graph::GraphNodeKind::Active {
-                    58
-                } else {
-                    32
-                };
+                let diameter = (graph_node_radius(node.kind) + 3.0) * 2.0;
                 hit_target
                     .set_attribute(
                         "style",
                         &format!(
-                            "left:{}%;top:{}%;width:{}px;height:{}px",
+                            "left:{}%;top:{}%;width:{}%",
                             node.x / 3.0,
                             node.y / 2.64,
-                            size,
-                            size
+                            diameter / 3.0
                         ),
                     )
                     .unwrap();
@@ -11208,13 +12007,17 @@ impl Driver {
                 .unwrap();
             app_container.append_child(&backdrop).unwrap();
         }
-        if inner.settings_open {
+        if inner.settings_open || inner.new_vault.is_some() {
             sidebar.set_attribute("inert", "").unwrap();
             main_content.set_attribute("inert", "").unwrap();
         }
         root.append_child(&app_container).unwrap();
         if inner.settings_open {
             root.append_child(&self.render_settings(&document)).unwrap();
+        }
+        if let Some(draft) = &inner.new_vault {
+            root.append_child(&vaults::render_new_vault_dialog(&document, draft))
+                .unwrap();
         }
         self.mount_ink_blocks(
             &view_doc,
@@ -11224,23 +12027,39 @@ impl Driver {
             inner.document_mode == DocumentMode::Preview,
             inner.device_id,
         );
+        self.hydrate_markdown_assets(&document);
+        if let Some((key, height)) = held_page_height {
+            hold_page_height(&document, key, height);
+        }
+        for (selector, top, key) in scroll_positions {
+            if let Ok(Some(element)) = document.query_selector(selector)
+                // A different note starts at its top.
+                && element.get_attribute("data-scroll-key") == key
+            {
+                element.set_scroll_top(top);
+            }
+        }
+        self.sync_page_surface(
+            &view_doc,
+            can_edit_workspace && inner.document_mode == DocumentMode::Edit,
+        );
 
         // Focus rename input if in rename mode
         if inner.renaming_path.is_some() {
             if let Some(el) = document.query_selector(".rename-input").unwrap() {
                 let input: web_sys::HtmlInputElement = el.unchecked_into();
-                let _ = input.focus();
+                page_driver::focus_in_place(&input);
             }
         } else if inner.show_create {
             if let Some(el) = document.query_selector(".explorer-create-input").unwrap() {
                 let input: web_sys::HtmlInputElement = el.unchecked_into();
-                let _ = input.focus();
+                page_driver::focus_in_place(&input);
             }
         } else if let Some(key) = requested_focus.or(control_focus_key) {
             let selector = format!("[data-focus-key=\"{}\"]", key.replace('"', "\\\""));
             if let Ok(Some(element)) = document.query_selector(&selector) {
                 if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
-                    let _ = element.focus();
+                    page_driver::focus_in_place(&element);
                 }
             }
         } else if let Some((target, start, end, direction, scroll_left, scroll_top)) = focus_info {
@@ -11248,7 +12067,7 @@ impl Driver {
                 // Restore search input focus and cursor
                 if let Some(el) = document.query_selector(".search-input").unwrap() {
                     let input: web_sys::HtmlInputElement = el.unchecked_into();
-                    let _ = input.focus();
+                    page_driver::focus_in_place(&input);
                     let _ = input.set_selection_start(Some(start));
                     let _ = input.set_selection_end(Some(end));
                     let _ = input.set_selection_direction(Some(&direction));
@@ -11259,7 +12078,7 @@ impl Driver {
                 if target == "title" {
                     if let Some(el) = document.query_selector(".document-title-input").unwrap() {
                         let input: web_sys::HtmlInputElement = el.unchecked_into();
-                        let _ = input.focus();
+                        page_driver::focus_in_place(&input);
                         let _ = input.set_selection_start(Some(start));
                         let _ = input.set_selection_end(Some(end));
                         let _ = input.set_selection_direction(Some(&direction));
@@ -11271,7 +12090,7 @@ impl Driver {
                     let selector = format!(".block-textarea[data-block-id=\"{}\"]", block_id);
                     if let Some(el) = document.query_selector(&selector).unwrap() {
                         let textarea: web_sys::HtmlTextAreaElement = el.unchecked_into();
-                        let _ = textarea.focus();
+                        page_driver::focus_in_place(&textarea);
                         let _ = textarea.set_selection_start(Some(start));
                         let _ = textarea.set_selection_end(Some(end));
                         let _ = textarea.set_selection_direction(Some(&direction));
@@ -11281,7 +12100,8 @@ impl Driver {
                 }
             }
         }
-        self.hydrate_markdown_assets(&document, asset_blob_generation);
+        self.focus_pending_block_caret(&document);
+        restore_auth_field_values(&root, &typed);
         RENDERING.with(|rendering| rendering.set(false));
     }
 
@@ -11459,6 +12279,21 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     return;
                 }
 
+                if class == "new-vault-name" {
+                    let input: &web_sys::HtmlInputElement = el.unchecked_ref();
+                    d_input.set_new_vault_name(input.value());
+                    return;
+                }
+
+                if class == "home-filter" {
+                    let input: &web_sys::HtmlInputElement = el.unchecked_ref();
+                    d_input.0.borrow_mut().home_filter = input.value();
+                    if let Some(home) = el.closest(".home").ok().flatten() {
+                        home::apply_filter(&home, &input.value());
+                    }
+                    return;
+                }
+
                 // ── Search input ─────────────────────────────────
                 if class == "search-input" {
                     let input: web_sys::HtmlInputElement = el.unchecked_into();
@@ -11597,6 +12432,9 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     root.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref())?;
     on_change.forget();
 
+    page_driver::install_page_listeners(driver, &window, &root)?;
+    page_files::install(driver, &window)?;
+
     let d_click = driver.clone();
     let click_document = document.clone();
     let visibility_document = document.clone();
@@ -11610,9 +12448,86 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Err(_) => return,
         };
         let class = el.get_attribute("class").unwrap_or_default();
+        if d_click.handle_export_click(&el) {
+            return;
+        }
+        if d_click.handle_vault_click(&el) {
+            return;
+        }
+        if el.closest(".sidebar-home-btn").ok().flatten().is_some() {
+            d_click.go_home();
+            return;
+        }
+        if let Some(target) = el.closest(".home [data-path]").ok().flatten() {
+            if let Some(path) = target.get_attribute("data-path") {
+                d_click.select_entry(&path);
+            }
+            return;
+        }
+        if let Some(target) = el
+            .closest("[data-home-sort], [data-home-view], [data-home-tag]")
+            .ok()
+            .flatten()
+        {
+            if let Some(sort) = target.get_attribute("data-home-sort") {
+                home::set_sort(&sort);
+            } else if let Some(view) = target.get_attribute("data-home-view") {
+                home::set_view(&view);
+            } else if let Some(tag) = target.get_attribute("data-home-tag") {
+                d_click.0.borrow_mut().home_tag = (!tag.is_empty()).then_some(tag);
+            }
+            d_click.render();
+            return;
+        }
+        if el.closest(".home-tasks-more").ok().flatten().is_some() {
+            if let Some(list) = el.closest(".home-section").ok().flatten() {
+                let _ = list.class_list().add_1("home-tasks-expanded");
+            }
+            let _ = el
+                .closest(".home-tasks-more")
+                .ok()
+                .flatten()
+                .map(|button| button.remove());
+            return;
+        }
+        if el.closest(".home-new-btn").ok().flatten().is_some() {
+            if d_click.0.borrow().client_state.has_pending_intent() {
+                return;
+            }
+            let mut inner = d_click.0.borrow_mut();
+            inner.show_create = true;
+            inner.create_value = String::new();
+            inner.create_folder = None;
+            inner.creating_folder = false;
+            inner.sidebar_open = true;
+            drop(inner);
+            d_click.render();
+            return;
+        }
+        if el.closest(".live-toggle-btn").ok().flatten().is_some() {
+            d_click.toggle_live_mode();
+            return;
+        }
         if let Some(choice) = el.get_attribute("data-theme-choice") {
             theme::persist_and_apply(theme::ThemePreference::parse(&choice));
             d_click.render();
+            return;
+        }
+        if let (Some(key), Some(value)) = (
+            el.get_attribute("data-pref-key"),
+            el.get_attribute("data-pref-value"),
+        ) {
+            if prefs::set(&key, &value) {
+                d_click.render();
+                d_click.layout_page();
+            }
+            return;
+        }
+        if class.contains("pref-reset") {
+            prefs::reset();
+            theme::persist_and_apply(theme::ThemePreference::System);
+            d_click.render();
+            d_click.layout_page();
             return;
         }
         if class == "owner-setup-btn" {
@@ -11704,8 +12619,8 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             d_click.request_current_account_email(action == "request-verification");
             return;
         }
-        if class == "change-vault-passphrase-btn" {
-            d_click.change_vault_passphrase();
+        if class == "change-password-btn" {
+            d_click.change_password();
             return;
         }
         if class == "export-vault-btn" {
@@ -11717,7 +12632,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
         if class.contains("create-workspace-btn") {
-            d_click.create_workspace();
+            d_click.open_new_vault();
             return;
         }
         if class.contains("delete-workspace-btn") {
@@ -12330,6 +13245,12 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if !editor_editing_allowed {
             return;
         }
+        if class == "add-block-btn"
+            && el.get_attribute("data-block-type").as_deref() == Some("image")
+        {
+            d_click.pick_files_for_note();
+            return;
+        }
         if class == "add-block-btn" {
             let update_id = UpdateId::new_v4();
             let applied_at_ms = js_sys::Date::now() as i64;
@@ -12344,10 +13265,21 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                 "ink" => inkstone_core::new_opaque_ink_content(800.0, 600.0, uuid::Uuid::new_v4())
                     .expect("Stonepen can initialize an empty Ink block"),
                 "divider" => BlockContent::Divider,
+                "space" => BlockContent::Space {
+                    min_height: inkstone_core::DEFAULT_SPACE_HEIGHT,
+                },
                 _ => BlockContent::Markdown {
                     text: String::new(),
                 },
             };
+            if matches!(
+                content,
+                BlockContent::Markdown { .. } | BlockContent::Math { .. }
+            ) {
+                let mut inner = d_click.0.borrow_mut();
+                inner.editing_block = Some(block_id);
+                inner.pending_block_caret = Some((block_id, 0));
+            }
             let block = inkstone_core::document::DocumentBlock {
                 id: block_id,
                 created_at_ms: applied_at_ms,
@@ -12509,9 +13441,32 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
     )?;
     on_visibility.forget();
 
+    // Closing or reloading while an edit is still being written to this
+    // device asks first.
+    let d_unload = driver.clone();
+    let on_before_unload = Closure::wrap(Box::new(move |event: web_sys::Event| {
+        if d_unload.has_unsaved_edits() {
+            event.prevent_default();
+            js_sys::Reflect::set(&event, &"returnValue".into(), &"".into()).ok();
+        }
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    web_sys::window()
+        .expect("No global window found")
+        .add_event_listener_with_callback(
+            "beforeunload",
+            on_before_unload.as_ref().unchecked_ref(),
+        )?;
+    on_before_unload.forget();
+
+    // Layout only depends on width. A phone keyboard changes just the height,
+    // and re-rendering then would replace the focused field and close it.
     let d_resize = driver.clone();
+    let rendered_width = std::cell::Cell::new(viewport_width());
     let on_resize = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-        d_resize.render();
+        let width = viewport_width();
+        if width != rendered_width.replace(width) {
+            d_resize.render();
+        }
     }) as Box<dyn FnMut(web_sys::Event)>);
     web_sys::window()
         .expect("No global window found")
@@ -12537,6 +13492,14 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     }
                 }
             }
+            return;
+        }
+        if event.key() == "Escape"
+            && (d_keydown.close_export_menu()
+                || d_keydown.close_new_vault()
+                || d_keydown.close_vault_menu())
+        {
+            event.prevent_default();
             return;
         }
         if event.key() == "Escape" {
@@ -12637,11 +13600,21 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         };
         let class = el.class_name();
 
+        if event.key() == "Enter" && class == "guest-name" {
+            event.prevent_default();
+            d_keydown.submit_guest_join();
+            return;
+        }
+        if event.key() == "Enter" && class == "new-vault-name" {
+            event.prevent_default();
+            d_keydown.submit_new_vault();
+            return;
+        }
+
         if event.key() == "Enter"
-            && (class == "owner-password"
-                || class == "owner-password-confirmation"
-                || class == "owner-vault-passphrase"
-                || class == "owner-vault-confirmation")
+            && (class == "owner-email"
+                || class == "owner-password"
+                || class == "owner-password-confirmation")
         {
             event.prevent_default();
             d_keydown.complete_owner_setup();
@@ -12650,11 +13623,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if event.key() == "Enter" && (class == "auth-email" || class == "auth-password") {
             event.prevent_default();
             d_keydown.auth_action("/api/auth/login");
-            return;
-        }
-        if event.key() == "Enter" && class == "auth-vault-passphrase" {
-            event.prevent_default();
-            d_keydown.auth_action("/api/auth/register");
             return;
         }
         if event.key() == "Enter" && class == "unlock-password" {
@@ -12806,10 +13774,90 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
 thread_local! {
     static DRIVER: RefCell<Option<Driver>> = RefCell::new(None);
+    static RESEND_SCHEDULED: Cell<bool> = const { Cell::new(false) };
 }
+
+const RATE_LIMITED: &str = "Durable update rate limit exceeded";
 
 fn workspace_key_metadata(workspace_id: uuid::Uuid) -> String {
     format!("\0workspace_key:{workspace_id}")
+}
+
+fn sync_status_text(inner: &DriverInner, phase: SessionPhase) -> &'static str {
+    if inner.sync_error.is_some() || inner.auth_error.is_some() {
+        return "Sync needs attention";
+    }
+    match phase {
+        SessionPhase::Live => "Encrypted sync is live",
+        SessionPhase::CatchingUp => "Decrypting remote changes...",
+        SessionPhase::Connecting => "Connecting encrypted sync...",
+        SessionPhase::Offline => "Offline; changes stay local",
+        SessionPhase::Error => "Sync needs attention",
+        SessionPhase::HydratingLocal => "Loading local encrypted state...",
+        SessionPhase::Closed => "No document connected",
+    }
+}
+
+/// Label and tooltip of the Live mode toggle.
+fn live_toggle_text(live_on: bool, direct: usize) -> (String, String) {
+    match (live_on, direct) {
+        (false, _) => (
+            "Live".into(),
+            "Live mode is off. Pen strokes and cursors reach others through the server.".into(),
+        ),
+        (true, 0) => (
+            "Live".into(),
+            "Live mode is on. Waiting for someone else on this note.".into(),
+        ),
+        (true, count) => (
+            format!("Live · {count}"),
+            format!(
+                "Live mode: pen strokes and cursors go straight to {count} other device(s), \
+                 without waiting for lost packets. Edits still sync through the server."
+            ),
+        ),
+    }
+}
+
+fn set_live_toggle_state(button: &web_sys::Element, live_on: bool, direct: usize) {
+    let (label, title) = live_toggle_text(live_on, direct);
+    if let Ok(Some(span)) = button.query_selector("span") {
+        span.set_text_content(Some(&label));
+    }
+    let _ = button.set_attribute("aria-pressed", if live_on { "true" } else { "false" });
+    let _ = button.set_attribute("data-direct", &direct.to_string());
+    let _ = button.set_attribute("title", &title);
+}
+
+/// Typed values of the auth form's text fields, keyed by class.
+fn auth_field_values(root: &web_sys::Element) -> Vec<(String, String)> {
+    let Ok(inputs) =
+        root.query_selector_all(".auth-card input, .settings-dialog input[type=password]")
+    else {
+        return Vec::new();
+    };
+    (0..inputs.length())
+        .filter_map(|index| inputs.item(index))
+        .filter_map(|node| node.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .filter(|input| input.type_() != "checkbox" && !input.value().is_empty())
+        .map(|input| (input.class_name(), input.value()))
+        .collect()
+}
+
+fn restore_auth_field_values(root: &web_sys::Element, typed: &[(String, String)]) {
+    for (class, value) in typed {
+        let selector = format!("input[class=\"{}\"]", class.replace('"', ""));
+        if let Some(input) = root
+            .query_selector(&selector)
+            .ok()
+            .flatten()
+            .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
+        {
+            if input.value().is_empty() {
+                input.set_value(value);
+            }
+        }
+    }
 }
 
 fn recovery_confirmation_checked(document: &web_sys::Document) -> bool {
@@ -12849,7 +13897,7 @@ fn append_recovery_ceremony(
     let warning = document.create_element("p").unwrap();
     warning.set_class_name("settings-warning");
     warning.set_text_content(Some(
-        "This is the only recovery path. Inkstone has no trusted-device or server escrow recovery.",
+        "This is the only way back to your notes if you forget your password. Keep it somewhere safe.",
     ));
     section.append_child(&warning).unwrap();
     let output = document.create_element("textarea").unwrap();
@@ -12932,6 +13980,50 @@ fn parse_account_token_fragment_from_window() -> Option<AccountTokenFlow> {
     Some(flow)
 }
 
+fn fragment_email(hash: &str) -> Option<String> {
+    let value = hash.trim_start_matches('#').split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "email" && !value.is_empty()).then_some(value)
+    })?;
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |at: usize| (bytes.get(at).copied()? as char).to_digit(16);
+        match (bytes[index], hex(index + 1), hex(index + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+            }
+            (byte, ..) => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn fragment_email_from_window() -> Option<String> {
+    fragment_email(&web_sys::window()?.location().hash().ok()?)
+}
+
+async fn remembered_vault_key(workspace_db: &WorkspaceDb, user_id: uuid::Uuid) -> Option<[u8; 32]> {
+    let value = workspace_db
+        .get_global_metadata(REMEMBERED_VAULT_KEY)
+        .await
+        .ok()??;
+    let (owner, key) = value.split_once(':')?;
+    if owner != user_id.to_string() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
 fn parse_owner_setup_fragment(hash: &str) -> Option<String> {
     hash.trim_start_matches('#').split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
@@ -12965,7 +14057,11 @@ fn clear_invite_fragment() {
     clear_sensitive_fragment();
 }
 
-fn download_bytes(file_name: &str, bytes: &[u8], media_type: &str) -> Result<(), String> {
+pub(crate) fn download_bytes(
+    file_name: &str,
+    bytes: &[u8],
+    media_type: &str,
+) -> Result<(), String> {
     let window = web_sys::window().ok_or_else(|| "Browser window is unavailable".to_string())?;
     let document = window
         .document()
@@ -12993,7 +14089,7 @@ fn download_bytes(file_name: &str, bytes: &[u8], media_type: &str) -> Result<(),
     result
 }
 
-fn asset_media_type(path: &str) -> String {
+pub(crate) fn asset_media_type(path: &str) -> String {
     match path
         .rsplit('.')
         .next()
@@ -13010,6 +14106,61 @@ fn asset_media_type(path: &str) -> String {
         _ => "application/octet-stream",
     }
     .into()
+}
+
+/// "Ctrl K" or "⌘K", whichever this platform's users expect.
+fn shortcut_label(key: &str) -> String {
+    let apple = web_sys::window()
+        .and_then(|window| window.navigator().platform().ok())
+        .is_some_and(|platform| platform.starts_with("Mac") || platform.starts_with("iP"));
+    if apple {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl {key}")
+    }
+}
+
+/// Classifies a save status message for the status dot.
+fn save_label(inner: &DriverInner) -> Option<String> {
+    if persistence_state(&inner.persistence_status) == "error" {
+        return Some(inner.persistence_status.clone());
+    }
+    let state = &inner.client_state;
+    let saving = state.has_pending_intent()
+        || state.intent_queue_len() > 0
+        || inner.deferred_text_persist.is_some()
+        || inner
+            .text_client_state
+            .as_ref()
+            .is_some_and(TextClientState::has_pending_persistence);
+    if saving {
+        None
+    } else if matches!(state.phase(), SessionPhase::Offline | SessionPhase::Error) {
+        Some("Offline – saved on this device".into())
+    } else {
+        Some("Saved".into())
+    }
+}
+
+fn persistence_state(status: &str) -> &'static str {
+    let lower = status.to_lowercase();
+    if lower.contains("fail") || lower.starts_with("error") {
+        "error"
+    } else if lower.starts_with("saved") || lower.starts_with("offline") {
+        "ok"
+    } else if lower.starts_with("initializing") {
+        "idle"
+    } else {
+        "pending"
+    }
+}
+
+/// Below this width the inspector overlays the page instead of docking.
+fn inspector_is_drawer() -> bool {
+    web_sys::window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|width| width.as_f64())
+        .is_some_and(|width| width <= 1180.0)
 }
 
 fn create_blob_url(bytes: &[u8], media_type: &str) -> Result<String, String> {
@@ -13070,7 +14221,57 @@ pub fn active_document_json_for_test() -> Option<String> {
     DRIVER.with(|driver| {
         let driver = driver.borrow();
         let driver = driver.as_ref()?;
-        serde_json::to_string(&Driver::effective_document(&driver.0.borrow())).ok()
+        let doc = Driver::effective_document(&driver.0.borrow());
+        let mut value = serde_json::to_value(&doc).ok()?;
+        if let (Some(layer), Some(ink)) = (doc.ink.as_ref(), value.get_mut("ink")) {
+            ink["stonepen_json"] = serde_json::Value::String(layer.stonepen_json());
+        }
+        serde_json::to_string(&value).ok()
+    })
+}
+
+#[wasm_bindgen]
+pub fn has_unsaved_edits_for_test() -> bool {
+    DRIVER.with(|driver| {
+        driver
+            .borrow()
+            .as_ref()
+            .is_some_and(Driver::has_unsaved_edits)
+    })
+}
+
+/// The open note's sync phase and errors, for tests.
+#[wasm_bindgen]
+pub fn sync_debug_for_test() -> String {
+    DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        let Some(driver) = driver.as_ref() else {
+            return String::new();
+        };
+        let inner = driver.0.borrow();
+        format!(
+            "{:?} {:?} sync_error={:?}",
+            inner.client_state.phase(),
+            inner.client_state.errors(),
+            inner.sync_error
+        )
+    })
+}
+
+/// `{"open": <direct channels>, "received": <frames taken from them>}`.
+#[wasm_bindgen]
+pub fn live_stats_for_test() -> String {
+    DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        let Some(driver) = driver.as_ref() else {
+            return "{}".into();
+        };
+        let handles = driver.2.borrow();
+        format!(
+            r#"{{"open":{},"received":{}}}"#,
+            handles.live.open_count(),
+            handles.live.received()
+        )
     })
 }
 
@@ -13089,6 +14290,7 @@ pub fn disconnect_sync_for_test() {
 pub fn start_app() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     theme::apply(theme::current());
+    prefs::apply_all();
 
     let driver = Driver::new(DocId::new_v4());
     let unauthorized_driver = driver.clone();
@@ -13137,6 +14339,11 @@ pub fn start_app() -> Result<(), JsValue> {
                         }
                     };
                 d.0.borrow_mut().device_id = Some(device_id);
+
+                if let Some((token, key)) = vaults::view_fragment_from_window() {
+                    d.start_public_view(token, key).await;
+                    return;
+                }
 
                 let local_mode = web_sys::window()
                     .and_then(|window| window.location().search().ok())
@@ -13209,6 +14416,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_files_without_an_extension_become_notes() {
+        assert!(!note_name_has_extension("Reading list"));
+        assert!(!note_name_has_extension("v1.2/Plan"));
+        assert!(!note_name_has_extension(".gitignore"));
+        assert!(note_name_has_extension("Plan.md"));
+        assert!(note_name_has_extension("papers/scan.pdf"));
+    }
+
+    #[test]
     fn production_build_ignores_local_mode_query() {
         assert_eq!(
             local_mode_requested("?local=1"),
@@ -13265,6 +14481,11 @@ mod tests {
             Some("token".into())
         );
         assert_eq!(parse_owner_setup_fragment("#owner-setup="), None);
+        assert_eq!(
+            fragment_email("#owner-setup=t&email=Owner%2Bx%40example.test"),
+            Some("Owner+x@example.test".into())
+        );
+        assert_eq!(fragment_email("#owner-setup=t"), None);
         assert_eq!(parse_owner_setup_fragment("#owner_setup=token"), None);
     }
 
