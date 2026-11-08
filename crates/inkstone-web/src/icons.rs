@@ -149,6 +149,24 @@ pub fn icon(document: &web_sys::Document, name: &str) -> web_sys::Element {
     svg
 }
 
+pub fn svg(name: &str, class: &'static str) -> impl leptos::IntoView + use<> {
+    use leptos::prelude::*;
+    view! {
+        <svg
+            class=class
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+            focusable="false"
+            inner_html=paths(name)
+        ></svg>
+    }
+}
+
 /// Replaces an element's content with an icon and gives it an accessible
 /// name and tooltip.
 pub fn icon_button_content(
