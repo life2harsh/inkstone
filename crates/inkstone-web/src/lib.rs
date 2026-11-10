@@ -30,6 +30,7 @@ mod page_drag;
 mod page_driver;
 mod page_editing;
 mod page_export;
+mod ui;
 mod page_files;
 mod page_history;
 pub mod page_surface;
