@@ -30,7 +30,6 @@ mod page_drag;
 mod page_driver;
 mod page_editing;
 mod page_export;
-mod ui;
 mod page_files;
 mod page_history;
 pub mod page_surface;
@@ -40,6 +39,8 @@ mod prefs;
 pub mod search;
 pub mod storage;
 mod theme;
+mod ui;
+use leptos::prelude::{GetUntracked, Set, Update};
 mod vaults;
 pub mod workspace_db;
 
@@ -85,7 +86,7 @@ use indexed_db::IndexedDb;
 use workspace_db::WorkspaceDb;
 
 /// Scroll containers whose position survives a full render.
-const RETAINED_SCROLLERS: [&str; 3] = [".main-content", ".sidebar", ".inspector"];
+const RETAINED_SCROLLERS: [&str; 2] = [".main-content", ".inspector"];
 
 thread_local! {
     // Replacing the DOM blurs active editors. Ignore that synthetic focusout while
@@ -665,31 +666,15 @@ pub struct DriverInner {
     pub entries: Vec<WorkspaceEntry>,
     pub selected_path: Option<String>,
     pub workspace_loaded: bool,
-    pub expanded_folders: HashSet<String>,
-    pub renaming_path: Option<String>,
-    pub rename_value: String,
-    pub show_create: bool,
-    pub create_value: String,
-    pub create_folder: Option<String>,
-    pub creating_folder: bool,
     pub document_mode: DocumentMode,
     pub link_message: Option<String>,
-    pub tag_filter: Option<String>,
-    pub search_query: String,
-    pub search_indexing: bool,
     pub search_index_revision: u64,
     pub index_error: Option<String>,
     pub search_documents: Vec<search::SearchDocument>,
     note_summaries: HashMap<String, home::NoteSummary>,
-    home_filter: String,
-    home_tag: Option<String>,
-    pub search_results: Vec<search::SearchResult>,
-    pub search_highlighted_index: Option<usize>,
     pub recent_notes: Vec<String>,
     pub knowledge: knowledge::KnowledgeIndex,
-    pub knowledge_tab: String,
     pub inspector_open: bool,
-    pub export_menu_open: bool,
     pub selection_revision: u64,
     pub pending_selection: Option<PendingSelection>,
     pub recent_notes_revision: u64,
@@ -719,6 +704,8 @@ pub struct DriverInner {
     pub sidebar_open: bool,
     pub settings_open: bool,
     pub settings_category: String,
+    home_filter: String,
+    home_tag: Option<String>,
     pub deferred_navigation: Option<String>,
     pub pending_focus_key: Option<String>,
     local_mode: bool,
@@ -742,7 +729,6 @@ pub struct DriverInner {
     workspace_description: String,
     workspace_public_link: Option<String>,
     vault_names: HashMap<uuid::Uuid, String>,
-    vault_menu_open: bool,
     new_vault: Option<vaults::NewVaultDraft>,
     public_view: Option<String>,
     public_view_error: Option<String>,
@@ -864,31 +850,15 @@ impl Driver {
                 entries: Vec::new(),
                 selected_path: None,
                 workspace_loaded: false,
-                expanded_folders: HashSet::new(),
-                renaming_path: None,
-                rename_value: String::new(),
-                show_create: false,
-                create_value: String::new(),
-                create_folder: None,
-                creating_folder: false,
                 document_mode: DocumentMode::Edit,
                 link_message: None,
-                tag_filter: None,
-                search_query: String::new(),
-                search_indexing: false,
                 search_index_revision: 0,
                 index_error: None,
                 search_documents: Vec::new(),
                 note_summaries: HashMap::new(),
-                home_filter: String::new(),
-                home_tag: None,
-                search_results: Vec::new(),
-                search_highlighted_index: None,
                 recent_notes: Vec::new(),
                 knowledge: knowledge::KnowledgeIndex::new(),
-                knowledge_tab: "Outline".to_string(),
                 inspector_open: false,
-                export_menu_open: false,
                 selection_revision: 0,
                 pending_selection: None,
                 recent_notes_revision: 0,
@@ -912,6 +882,8 @@ impl Driver {
                 migrated_docs: HashSet::new(),
                 sidebar_open: false,
                 settings_open: false,
+                home_filter: String::new(),
+                home_tag: None,
                 settings_category: "General".to_string(),
                 deferred_navigation: None,
                 pending_focus_key: None,
@@ -936,7 +908,6 @@ impl Driver {
                 workspace_description: String::new(),
                 workspace_public_link: None,
                 vault_names: HashMap::new(),
-                vault_menu_open: false,
                 new_vault: None,
                 public_view: None,
                 public_view_error: None,
@@ -1288,23 +1259,6 @@ impl Driver {
         RENDERING.with(|rendering| rendering.set(was_rendering));
     }
 
-    fn set_document_mode(&self, mode: DocumentMode) {
-        if mode == DocumentMode::Edit && !can_edit_workspace(&self.0.borrow()) {
-            return;
-        }
-        if self.0.borrow().document_mode == mode {
-            return;
-        }
-        self.flush_ink_before_transition();
-        {
-            let mut inner = self.0.borrow_mut();
-            inner.document_mode = mode;
-            inner.expanded_ink_block = None;
-            inner.link_message = None;
-        }
-        self.render();
-    }
-
     fn mount_ink_blocks(
         &self,
         document: &InkstoneDocument,
@@ -1422,19 +1376,14 @@ impl Driver {
             inner.document_error = None;
             revoke_asset_preview(&mut inner.asset_preview_url);
             inner.asset_preview_type.clear();
-            inner.renaming_path = None;
-            inner.show_create = false;
-            inner.create_folder = None;
             inner.sidebar_open = false;
             inner.inspector_open &= !inspector_is_drawer();
             inner.editing_block = None;
             inner.pending_block_caret = None;
-            let ancestors = markdown_render::ancestor_folders(&path_str);
-            for folder in &ancestors {
-                inner.expanded_folders.insert(folder.clone());
-            }
             inner.selection_revision
         };
+        ui::state().reset_explorer();
+        ui::state().reveal(&path_str);
 
         let is_asset = {
             let inner = self.0.borrow();
@@ -1566,15 +1515,13 @@ impl Driver {
         if name.is_empty() {
             return;
         }
-        if !self.0.borrow().creating_folder && !note_name_has_extension(&name) {
+        let create = ui::state().create.get_untracked().unwrap_or_default();
+        if !create.folder && !note_name_has_extension(&name) {
             name.push_str(".md");
         }
-        let full_path = {
-            let inner = self.0.borrow();
-            match &inner.create_folder {
-                Some(folder) => format!("{}/{}", folder, name),
-                None => name.clone(),
-            }
+        let full_path = match &create.parent {
+            Some(folder) => format!("{folder}/{name}"),
+            None => name.clone(),
         };
         let path = match WorkspacePath::new(&full_path) {
             Ok(p) => p,
@@ -1586,7 +1533,7 @@ impl Driver {
             }
         };
         let path_str = path.as_str().to_string();
-        if self.0.borrow().creating_folder {
+        if create.folder {
             self.create_folder_entry(path);
             return;
         }
@@ -1617,18 +1564,10 @@ impl Driver {
                 Ok(()) => match ws.set_doc_id(&path_str, doc_id.0).await {
                     Ok(()) => {
                         this.0.borrow_mut().locally_new_docs.insert(doc_id);
-                        this.0.borrow_mut().create_folder = None;
                         if let Err(error) =
                             this.associate_active_path(&path_str, Some(doc_id)).await
                         {
                             this.0.borrow_mut().sync_error = Some(error);
-                        }
-                        let ancestors = markdown_render::ancestor_folders(&path_str);
-                        {
-                            let mut inner = this.0.borrow_mut();
-                            for folder in &ancestors {
-                                inner.expanded_folders.insert(folder.clone());
-                            }
                         }
                         this.refresh_entries();
                         this.index_workspace();
@@ -1726,13 +1665,11 @@ impl Driver {
                     .set_metadata(&folder_version_metadata(path.as_str()), "1")
                     .await;
             }
-            {
-                let mut inner = this.0.borrow_mut();
-                inner.show_create = false;
-                inner.creating_folder = false;
-                inner.create_folder = None;
-                inner.expanded_folders.insert(path.as_str().into());
-            }
+            let ui = ui::state();
+            ui.create.set(None);
+            ui.expanded.update(|expanded| {
+                expanded.insert(path.as_str().into());
+            });
             this.refresh_entries();
             this.render();
         });
@@ -1974,8 +1911,10 @@ impl Driver {
                             .insert(format!("{}{suffix}", destination.as_str()), id);
                     }
                 }
-                inner.expanded_folders.remove(source.as_str());
-                inner.expanded_folders.insert(destination.as_str().into());
+                ui::state().expanded.update(|expanded| {
+                    expanded.remove(source.as_str());
+                    expanded.insert(destination.as_str().into());
+                });
             }
             this.refresh_entries();
             this.index_workspace();
@@ -2231,7 +2170,7 @@ impl Driver {
             Err(_) => {
                 self.0.borrow_mut().storage_error =
                     Some(format!("Invalid file name: {}", new_name));
-                self.0.borrow_mut().renaming_path = None;
+                ui::state().renaming.set(None);
                 self.render();
                 return;
             }
@@ -2239,7 +2178,7 @@ impl Driver {
         let old_path_wp = match WorkspacePath::new(&old_path) {
             Ok(p) => p,
             Err(_) => {
-                self.0.borrow_mut().renaming_path = None;
+                ui::state().renaming.set(None);
                 return;
             }
         };
@@ -2338,7 +2277,7 @@ impl Driver {
                     if is_selected {
                         this.0.borrow_mut().selected_path = Some(new_name.clone());
                     }
-                    this.0.borrow_mut().renaming_path = None;
+                    ui::state().renaming.set(None);
                     let workspace_id = {
                         let mut inner = this.0.borrow_mut();
                         if inner.local_mode {
@@ -2377,7 +2316,7 @@ impl Driver {
                 }
                 Err(e) => {
                     this.0.borrow_mut().storage_error = Some(format!("Rename failed: {:?}", e));
-                    this.0.borrow_mut().renaming_path = None;
+                    ui::state().renaming.set(None);
                     this.render();
                 }
             }
@@ -2395,13 +2334,6 @@ impl Driver {
         };
         match entry {
             Some(e) if e.kind == WorkspaceEntryKind::Markdown => {
-                let ancestors = markdown_render::ancestor_folders(target_path);
-                {
-                    let mut inner = self.0.borrow_mut();
-                    for folder in &ancestors {
-                        inner.expanded_folders.insert(folder.clone());
-                    }
-                }
                 self.select_entry(target_path);
             }
             Some(_) => {
@@ -2529,7 +2461,7 @@ impl Driver {
         };
 
         let this = self.clone();
-        this.0.borrow_mut().search_indexing = true;
+        ui::state().indexing.set(true);
         this.0.borrow_mut().index_error = None;
         this.render();
 
@@ -2542,7 +2474,7 @@ impl Driver {
                         d
                     }
                     Err(e) => {
-                        this.0.borrow_mut().search_indexing = false;
+                        ui::state().indexing.set(false);
                         this.0.borrow_mut().storage_error =
                             Some(format!("Search index fail-closed (db open): {:?}", e));
                         this.render();
@@ -2730,9 +2662,10 @@ impl Driver {
                 inner.search_documents = search_docs;
                 inner.note_summaries = summaries;
                 inner.knowledge = new_knowledge;
-                inner.search_indexing = false;
+                ui::state().indexing.set(false);
             }
-            this.perform_search_and_render();
+            ui::state().rank(&this.0.borrow().search_documents);
+            this.render();
         });
     }
 
@@ -2745,10 +2678,10 @@ impl Driver {
             );
             inner.note_summaries.insert(path.to_string(), summary);
         }
-        let updated = {
+        {
             let mut inner = self.0.borrow_mut();
             inner.search_index_revision += 1;
-            inner.search_indexing = false;
+            ui::state().indexing.set(false);
             if let Some(pos) = inner
                 .search_documents
                 .iter()
@@ -2770,8 +2703,6 @@ impl Driver {
                 inner
                     .knowledge
                     .index_document(path, &md_blocks_for_knowledge);
-
-                !inner.search_query.trim().is_empty()
             } else {
                 let effective_doc = Driver::effective_document(&inner);
                 let blocks = effective_doc
@@ -2797,106 +2728,11 @@ impl Driver {
                 inner
                     .knowledge
                     .index_document(path, &md_blocks_for_knowledge);
-                !inner.search_query.trim().is_empty() || inner.tag_filter.is_some()
-            }
-        };
-        if updated {
-            self.perform_search_and_render();
-        }
-    }
-
-    fn update_search_query(&self, val: &str) {
-        {
-            let mut inner = self.0.borrow_mut();
-            inner.search_query = val.to_string();
-            if val.trim().is_empty() {
-                inner.search_results.clear();
-                inner.search_highlighted_index = None;
             }
         }
-        self.perform_search_and_render();
-    }
-
-    fn perform_search_and_render(&self) {
-        // Compute results, update state, then render – all in separate borrow windows
-        let (query, search_docs) = {
-            let inner = self.0.borrow();
-            (inner.search_query.clone(), inner.search_documents.clone())
-        };
-        let results = search::rank_results(&search_docs, &query);
-        {
-            let mut inner = self.0.borrow_mut();
-            let highlighted = if results.is_empty() {
-                None
-            } else {
-                let current = inner.search_highlighted_index.unwrap_or(0);
-                Some(if current >= results.len() { 0 } else { current })
-            };
-            inner.search_results = results;
-            inner.search_highlighted_index = highlighted;
+        if ui::state().searching() {
+            ui::state().rank(&self.0.borrow().search_documents);
         }
-        self.render();
-    }
-
-    fn search_move_highlight(&self, delta: isize) {
-        let mut inner = self.0.borrow_mut();
-        let len = inner.search_results.len();
-        if len == 0 {
-            return;
-        }
-        let current = inner.search_highlighted_index.unwrap_or(0) as isize;
-        let mut next = current + delta;
-        if next < 0 {
-            next = (len - 1) as isize;
-        } else if next >= len as isize {
-            next = 0;
-        }
-        inner.search_highlighted_index = Some(next as usize);
-        drop(inner);
-        self.render();
-    }
-
-    fn search_open_highlighted(&self) {
-        let path_opt = {
-            let inner = self.0.borrow();
-            inner
-                .search_highlighted_index
-                .and_then(|idx| inner.search_results.get(idx))
-                .map(|r| r.path.clone())
-        };
-        if let Some(path) = path_opt {
-            self.select_entry(&path);
-            self.search_clear_query_only();
-        }
-    }
-
-    fn search_clear(&self) {
-        let mut inner = self.0.borrow_mut();
-        inner.search_query.clear();
-        inner.tag_filter = None;
-        inner.search_results.clear();
-        inner.search_highlighted_index = None;
-        drop(inner);
-        self.render();
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                if let Some(search_el) = document.query_selector(".search-input").unwrap() {
-                    if let Ok(search_input) = search_el.dyn_into::<web_sys::HtmlInputElement>() {
-                        let _ = search_input.blur();
-                    }
-                }
-            }
-        }
-    }
-
-    fn search_clear_query_only(&self) {
-        let mut inner = self.0.borrow_mut();
-        inner.search_query.clear();
-        inner.tag_filter = None;
-        inner.search_results.clear();
-        inner.search_highlighted_index = None;
-        drop(inner);
-        self.render();
     }
 
     fn clean_and_set_recent_notes(&self, mut recents: Vec<String>) {
@@ -10132,33 +9968,7 @@ impl Driver {
     /// While text is focused the page is not rebuilt; status that changes
     /// on its own (sync phase, saving, Live mode) is updated where it is.
     fn refresh_status_in_place(&self) {
-        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-            return;
-        };
-        let inner = self.0.borrow();
-        let phase = inner.client_state.phase();
-        if let Ok(Some(badge)) = document.query_selector(".phase-badge") {
-            badge.set_class_name(&format!("phase-badge phase-{phase:?}").to_lowercase());
-            badge.set_text_content(Some(&format!("{phase:?}")));
-        }
-        if let Ok(Some(status)) = document.query_selector(".sync-status") {
-            status.set_text_content(Some(sync_status_text(&inner, phase)));
-        }
-        if let Ok(Some(save)) = document.query_selector(".topbar-save-status") {
-            match save_label(&inner) {
-                Some(label) => {
-                    save.set_text_content(Some(&label));
-                    let _ = save.set_attribute("data-state", persistence_state(&label));
-                }
-                None => {
-                    let _ = save.set_attribute("data-state", "pending");
-                }
-            }
-        }
-        drop(inner);
-        if let Ok(Some(button)) = document.query_selector(".live-toggle-btn") {
-            set_live_toggle_state(&button, live::enabled(), self.live_direct_count());
-        }
+        ui::publish(self, &self.0.borrow());
     }
 
     fn reconcile_focused_text_controls(&self) -> bool {
@@ -10435,20 +10245,6 @@ impl Driver {
                     textarea.scroll_left(),
                     textarea.scroll_top(),
                 ))
-            } else if class == "search-input" {
-                let input: web_sys::HtmlInputElement = el.unchecked_into();
-                Some((
-                    "search".to_string(),
-                    input.selection_start().ok().flatten().unwrap_or(0),
-                    input.selection_end().ok().flatten().unwrap_or(0),
-                    input
-                        .selection_direction()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "none".into()),
-                    input.scroll_left(),
-                    input.scroll_top(),
-                ))
             } else {
                 None
             }
@@ -10471,9 +10267,15 @@ impl Driver {
                 Some((key.clone(), surface.get_bounding_client_rect().height()))
             });
 
-        // Forms are rebuilt on every render: keep what was typed.
         let typed = auth_field_values(&root);
-        root.set_inner_html("");
+        let app_container = ui::shell(&root);
+        let mut stale = root.first_child();
+        while let Some(node) = stale {
+            stale = node.next_sibling();
+            if !node.is_same_node(Some(&app_container)) {
+                root.remove_child(&node).unwrap();
+            }
+        }
 
         let requested_focus = self.0.borrow_mut().pending_focus_key.take();
         let relative_focus = self
@@ -10496,7 +10298,9 @@ impl Driver {
             });
         let focus_info = relative_focus.or(focus_info);
         let mut inner = self.0.borrow().clone();
-        if !inner.local_mode && inner.auth_phase != AuthPhase::Ready {
+        ui::publish(self, &inner);
+        app_container.set_hidden(!inner.local_mode && inner.auth_phase != AuthPhase::Ready);
+        if app_container.hidden() {
             self.render_auth_screen(&document, &root);
             restore_auth_field_values(&root, &typed);
             if let Some(element) = requested_focus.as_deref().and_then(|key| {
@@ -10516,11 +10320,6 @@ impl Driver {
         let storage_error = &inner.storage_error;
         let entries = &inner.entries;
         let selected_path = &inner.selected_path;
-        let viewport_width = window
-            .inner_width()
-            .ok()
-            .and_then(|width| width.as_f64())
-            .unwrap_or(1440.0);
 
         let can_read_workspace = can_read_workspace(&inner);
         let can_edit_workspace = can_edit_workspace(&inner);
@@ -10533,815 +10332,44 @@ impl Driver {
             && phase != SessionPhase::Closed
             && phase != SessionPhase::Error;
 
-        let app_container = document.create_element("div").unwrap();
-        let mut app_classes = vec!["app-container"];
-        if inner.sidebar_open {
-            app_classes.push("sidebar-open");
+        let main_content = app_container.children().item(1).unwrap();
+        let page = main_content.last_element_child().unwrap();
+        page.set_text_content(None);
+        if selected_path.is_none() && storage_error.is_none() {
+            page.append_child(&self.render_home(&document)).unwrap();
         }
-        if inner.local_persistence_error.is_some() {
-            app_classes.push("save-failed");
-        }
-        app_container.set_class_name(&app_classes.join(" "));
-
-        let sidebar = document.create_element("div").unwrap();
-        sidebar.set_class_name("sidebar");
-        sidebar.set_id("workspace-navigation");
-        sidebar.set_attribute("role", "navigation").unwrap();
-        sidebar
-            .set_attribute("aria-label", "Workspace navigation")
-            .unwrap();
-        if viewport_width <= 760.0 && !inner.sidebar_open {
-            sidebar.set_attribute("inert", "").unwrap();
-            sidebar.set_attribute("aria-hidden", "true").unwrap();
-        }
-        let switcher_wrap = document.create_element("div").unwrap();
-        switcher_wrap.set_class_name("vault-switcher-wrap");
-        switcher_wrap
-            .append_child(&vaults::render_switcher(&document, &inner))
-            .unwrap();
-        if inner.vault_menu_open {
-            switcher_wrap
-                .append_child(&vaults::render_menu(&document, &inner))
-                .unwrap();
-        }
-        sidebar.append_child(&switcher_wrap).unwrap();
-        let home_link = document.create_element("button").unwrap();
-        home_link.set_class_name("sidebar-home-btn");
-        home_link
-            .append_child(&icons::icon(&document, "home"))
-            .unwrap();
-        let home_label = document.create_element("span").unwrap();
-        home_label.set_text_content(Some("Home"));
-        home_link.append_child(&home_label).unwrap();
-        if inner.selected_path.is_none() {
-            home_link.set_attribute("aria-current", "page").unwrap();
-        }
-        sidebar.append_child(&home_link).unwrap();
-
-        // Search Input
-        let search_container = document.create_element("div").unwrap();
-        search_container.set_class_name("search-container");
-
-        if let Some(ref tag) = inner.tag_filter {
-            let active_tag_div = document.create_element("div").unwrap();
-            active_tag_div.set_class_name("active-tag-filter");
-
-            let tag_label = document.create_element("span").unwrap();
-            tag_label.set_text_content(Some(&format!("#{}", tag)));
-
-            let clear_btn = document.create_element("button").unwrap();
-            clear_btn.set_class_name("clear-tag-btn");
-            clear_btn.set_text_content(Some("×"));
-            clear_btn
-                .set_attribute("aria-label", "Clear tag filter")
-                .unwrap();
-
-            active_tag_div.append_child(&tag_label).unwrap();
-            active_tag_div.append_child(&clear_btn).unwrap();
-            search_container.append_child(&active_tag_div).unwrap();
-        }
-
-        let search_input = document.create_element("input").unwrap();
-        let search_input: web_sys::HtmlInputElement = search_input.unchecked_into();
-        search_input.set_type("text");
-        search_input.set_class_name("search-input");
-        search_input.set_placeholder("Search notes");
-        search_input
-            .set_attribute("aria-label", "Search notes")
-            .unwrap();
-        search_input.set_attribute("role", "combobox").unwrap();
-        search_input
-            .set_attribute("aria-controls", "workspace-results")
-            .unwrap();
-        search_input
-            .set_attribute(
-                "aria-expanded",
-                if inner.search_results.is_empty() {
-                    "false"
-                } else {
-                    "true"
-                },
-            )
-            .unwrap();
-        if let Some(index) = inner.search_highlighted_index {
-            search_input
-                .set_attribute("aria-activedescendant", &format!("search-option-{}", index))
-                .unwrap();
-        }
-        search_input
-            .set_attribute("data-focus-key", "search-input")
-            .unwrap();
-        search_input.set_value(&inner.search_query);
-        let search_field = document.create_element("div").unwrap();
-        search_field.set_class_name("search-field");
-        search_field
-            .append_child(&icons::icon(&document, "search"))
-            .unwrap();
-        search_field.append_child(&search_input).unwrap();
-        let search_shortcut = document.create_element("span").unwrap();
-        search_shortcut.set_class_name("kbd");
-        search_shortcut.set_text_content(Some(shortcut_label("K").as_str()));
-        search_field.append_child(&search_shortcut).unwrap();
-        search_container.append_child(&search_field).unwrap();
-
-        if inner.search_indexing {
-            let status = document.create_element("div").unwrap();
-            status.set_class_name("search-status");
-            status.set_attribute("role", "status").unwrap();
-            status.set_text_content(Some("Indexing notes..."));
-            search_container.append_child(&status).unwrap();
-        } else if !inner.search_query.trim().is_empty() {
-            let status = document.create_element("div").unwrap();
-            status.set_class_name("search-status");
-            status.set_attribute("role", "status").unwrap();
-            let count = inner.search_results.len();
-            if count == 0 {
-                status.set_text_content(Some("No matching notes"));
-            } else {
-                status.set_text_content(Some(&if count == 1 {
-                    "1 result".to_string()
-                } else {
-                    format!("{} results", count)
-                }));
-            }
-            search_container.append_child(&status).unwrap();
-        }
-        sidebar.append_child(&search_container).unwrap();
-
-        let is_search_active = !inner.search_query.trim().is_empty() || inner.tag_filter.is_some();
-
-        if !is_search_active && !inner.recent_notes.is_empty() {
-            let recent_heading = document.create_element("div").unwrap();
-            recent_heading.set_class_name("sidebar-heading recent-heading");
-
-            let recent_title = document.create_element("span").unwrap();
-            recent_title.set_text_content(Some("Recent"));
-            recent_heading.append_child(&recent_title).unwrap();
-
-            let clear_btn = document.create_element("button").unwrap();
-            clear_btn.set_class_name("recent-clear-btn");
-            clear_btn.set_text_content(Some("Clear"));
-            recent_heading.append_child(&clear_btn).unwrap();
-
-            sidebar.append_child(&recent_heading).unwrap();
-
-            let recent_list = document.create_element("div").unwrap();
-            recent_list.set_class_name("recent-list");
-
-            for path in &inner.recent_notes {
-                let recent_item = document.create_element("button").unwrap();
-                let is_active = selected_path.as_deref() == Some(path);
-                let recent_class = if is_active {
-                    "recent-item active"
-                } else {
-                    "recent-item"
-                };
-                recent_item.set_class_name(recent_class);
-                recent_item.set_attribute("data-path", path).unwrap();
-                recent_item
-                    .set_attribute("data-focus-key", &format!("recent:{}", path))
-                    .unwrap();
-                if is_active {
-                    recent_item.set_attribute("aria-current", "page").unwrap();
-                }
-
-                let file_name = explorer::file_name_only(path).to_string();
-
-                let name_span = document.create_element("span").unwrap();
-                name_span.set_class_name("recent-item-name");
-                name_span.set_text_content(Some(&file_name));
-                recent_item.append_child(&name_span).unwrap();
-
-                if let Some((folder, _)) = path.rsplit_once('/') {
-                    let path_span = document.create_element("span").unwrap();
-                    path_span.set_class_name("recent-item-path");
-                    path_span.set_text_content(Some(folder));
-                    recent_item.append_child(&path_span).unwrap();
-                }
-
-                recent_list.append_child(&recent_item).unwrap();
-            }
-
-            sidebar.append_child(&recent_list).unwrap();
-        }
-
-        let sidebar_heading = document.create_element("div").unwrap();
-        sidebar_heading.set_class_name("sidebar-heading");
-        let heading_label = document.create_element("span").unwrap();
-        heading_label.set_text_content(Some(if is_search_active { "Results" } else { "Files" }));
-        sidebar_heading.append_child(&heading_label).unwrap();
-        if !is_search_active && !inner.show_create && can_edit_workspace {
-            let actions = document.create_element("div").unwrap();
-            actions.set_class_name("sidebar-heading-actions");
-            let new_btn = document.create_element("button").unwrap();
-            new_btn.set_class_name("explorer-new-btn");
-            icons::icon_button_content(&document, &new_btn, "file-plus", "New file");
-            new_btn.set_attribute("data-focus-key", "new-file").unwrap();
-            actions.append_child(&new_btn).unwrap();
-            let folder_btn = document.create_element("button").unwrap();
-            folder_btn.set_class_name("explorer-new-folder-btn");
-            icons::icon_button_content(&document, &folder_btn, "folder-plus", "New folder");
-            folder_btn
-                .set_attribute("data-focus-key", "new-folder")
-                .unwrap();
-            actions.append_child(&folder_btn).unwrap();
-            let import_label = document.create_element("label").unwrap();
-            import_label.set_class_name("asset-import-label");
-            import_label.set_attribute("title", "Import asset").unwrap();
-            import_label
-                .append_child(&icons::icon(&document, "upload"))
-                .unwrap();
-            let import = document.create_element("input").unwrap();
-            import.set_class_name("asset-import-input");
-            import.set_attribute("type", "file").unwrap();
-            import
-                .set_attribute("aria-label", "Import encrypted asset")
-                .unwrap();
-            import_label.append_child(&import).unwrap();
-            actions.append_child(&import_label).unwrap();
-            sidebar_heading.append_child(&actions).unwrap();
-        }
-        sidebar.append_child(&sidebar_heading).unwrap();
-
-        let file_list = document.create_element("div").unwrap();
-        file_list.set_id("workspace-results");
-        file_list.set_class_name("file-list");
-        if is_search_active {
-            file_list.set_attribute("role", "listbox").unwrap();
-        }
-
-        if is_search_active {
-            let tag_paths = inner
-                .tag_filter
-                .as_ref()
-                .and_then(|tag| inner.knowledge.tag_to_paths.get(tag));
-            if inner.search_query.trim().is_empty() && tag_paths.is_some() {
-                for path in tag_paths.unwrap() {
-                    let item_div = document.create_element("button").unwrap();
-                    item_div.set_class_name("search-result-item");
-                    item_div.set_attribute("data-path", path).unwrap();
-                    item_div.set_attribute("role", "option").unwrap();
-                    item_div.set_text_content(Some(path));
-                    file_list.append_child(&item_div).unwrap();
-                }
-            } else if inner.search_results.is_empty() {
-                let empty_results = document.create_element("div").unwrap();
-                empty_results.set_class_name("search-no-results");
-                empty_results.set_text_content(Some("No matching notes"));
-                file_list.append_child(&empty_results).unwrap();
-            } else {
-                for (idx, result) in inner.search_results.iter().enumerate() {
-                    let item_div = document.create_element("button").unwrap();
-                    let is_active = selected_path.as_deref() == Some(&result.path);
-                    let is_highlighted = inner.search_highlighted_index == Some(idx);
-
-                    let mut class_name = "search-result-item".to_string();
-                    if is_active {
-                        class_name.push_str(" active");
-                    }
-                    if is_highlighted {
-                        class_name.push_str(" highlighted");
-                    }
-                    item_div.set_class_name(&class_name);
-                    item_div.set_id(&format!("search-option-{}", idx));
-                    item_div.set_attribute("role", "option").unwrap();
-                    item_div
-                        .set_attribute(
-                            "aria-selected",
-                            if is_highlighted { "true" } else { "false" },
-                        )
-                        .unwrap();
-                    item_div.set_attribute("data-path", &result.path).unwrap();
-                    item_div
-                        .set_attribute("data-focus-key", &format!("search-result:{}", result.path))
-                        .unwrap();
-                    if is_active {
-                        item_div.set_attribute("aria-current", "page").unwrap();
-                    }
-
-                    let name_el = document.create_element("div").unwrap();
-                    name_el.set_class_name("search-result-name");
-                    Driver::highlight_text_into(&name_el, &result.file_name, &inner.search_query);
-                    item_div.append_child(&name_el).unwrap();
-
-                    let path_el = document.create_element("div").unwrap();
-                    path_el.set_class_name("search-result-path");
-                    Driver::highlight_text_into(&path_el, &result.path, &inner.search_query);
-                    item_div.append_child(&path_el).unwrap();
-
-                    if let Some(ref snippet) = result.snippet {
-                        let snippet_el = document.create_element("div").unwrap();
-                        snippet_el.set_class_name("search-result-snippet");
-                        Driver::highlight_text_into(&snippet_el, snippet, &inner.search_query);
-                        item_div.append_child(&snippet_el).unwrap();
-                    } else if !result.title.is_empty() {
-                        let title_el = document.create_element("div").unwrap();
-                        title_el.set_class_name("search-result-snippet");
-                        Driver::highlight_text_into(&title_el, &result.title, &inner.search_query);
-                        item_div.append_child(&title_el).unwrap();
-                    }
-
-                    file_list.append_child(&item_div).unwrap();
-                }
-            }
-        } else {
-            if inner.show_create && can_edit_workspace {
-                let create_row = document.create_element("div").unwrap();
-                create_row.set_class_name("explorer-create-row");
-                let create_input = document.create_element("input").unwrap();
-                let create_input: web_sys::HtmlInputElement = create_input.unchecked_into();
-                create_input.set_class_name("explorer-create-input");
-                create_input.set_placeholder(if inner.creating_folder {
-                    "Folder name"
-                } else {
-                    "filename.md"
-                });
-                create_input
-                    .set_attribute("aria-label", "New file path")
-                    .unwrap();
-                create_input.set_value(&inner.create_value);
-                create_row.append_child(&create_input).unwrap();
-                file_list.append_child(&create_row).unwrap();
-            }
-
-            let flat_tree = explorer::build_flat_tree(entries, &inner.expanded_folders);
-            for flat_node in &flat_tree {
-                let indent_px = 6 + flat_node.depth * 16;
-                if flat_node.is_folder {
-                    let folder_row = document.create_element("div").unwrap();
-                    folder_row.set_class_name("explorer-folder-row");
-                    folder_row
-                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
-                        .unwrap();
-                    let folder_div = document.create_element("button").unwrap();
-                    let is_target = inner.create_folder.as_deref() == Some(&flat_node.path);
-                    let folder_class = match (flat_node.is_expanded, is_target) {
-                        (true, true) => "explorer-folder expanded active-target",
-                        (true, false) => "explorer-folder expanded",
-                        (false, true) => "explorer-folder active-target",
-                        (false, false) => "explorer-folder",
-                    };
-                    folder_div.set_class_name(folder_class);
-                    folder_div
-                        .set_attribute("data-path", &flat_node.path)
-                        .unwrap();
-                    folder_div
-                        .set_attribute("data-depth", &flat_node.depth.to_string())
-                        .unwrap();
-                    folder_div
-                        .set_attribute(
-                            "aria-expanded",
-                            if flat_node.is_expanded {
-                                "true"
-                            } else {
-                                "false"
-                            },
-                        )
-                        .unwrap();
-                    folder_div
-                        .set_attribute("data-focus-key", &format!("folder:{}", flat_node.path))
-                        .unwrap();
-                    let toggle = document.create_element("span").unwrap();
-                    toggle.set_class_name("explorer-toggle");
-                    toggle
-                        .append_child(&icons::icon(&document, "chevron-right"))
-                        .unwrap();
-                    folder_div.append_child(&toggle).unwrap();
-                    let name_span = document.create_element("span").unwrap();
-                    name_span.set_class_name("folder-name");
-                    name_span.set_text_content(Some(&flat_node.name));
-                    folder_div.append_child(&name_span).unwrap();
-                    folder_row.append_child(&folder_div).unwrap();
-                    if can_edit_workspace {
-                        let create_in_folder = document.create_element("button").unwrap();
-                        create_in_folder.set_class_name("folder-create-btn");
-                        create_in_folder
-                            .set_attribute("data-path", &flat_node.path)
-                            .unwrap();
-                        icons::icon_button_content(
-                            &document,
-                            &create_in_folder,
-                            "plus",
-                            &format!("Create file in {}", flat_node.name),
-                        );
-                        folder_row.append_child(&create_in_folder).unwrap();
-                        let rename = document.create_element("button").unwrap();
-                        rename.set_class_name("folder-rename-btn");
-                        rename.set_attribute("data-path", &flat_node.path).unwrap();
-                        icons::icon_button_content(
-                            &document,
-                            &rename,
-                            "pencil",
-                            &format!("Rename or move {}", flat_node.name),
-                        );
-                        folder_row.append_child(&rename).unwrap();
-                        let delete = document.create_element("button").unwrap();
-                        delete.set_class_name("folder-delete-btn");
-                        delete.set_attribute("data-path", &flat_node.path).unwrap();
-                        icons::icon_button_content(
-                            &document,
-                            &delete,
-                            "trash",
-                            &format!("Delete folder {}", flat_node.name),
-                        );
-                        folder_row.append_child(&delete).unwrap();
-                    }
-                    file_list.append_child(&folder_row).unwrap();
-                } else {
-                    let is_active = selected_path.as_deref() == Some(&flat_node.path);
-                    let is_renaming = inner.renaming_path.as_deref() == Some(&flat_node.path);
-                    let file_entry = document.create_element("div").unwrap();
-                    let entry_class = if is_active {
-                        "file-entry active"
-                    } else {
-                        "file-entry"
-                    };
-                    file_entry.set_class_name(entry_class);
-                    file_entry
-                        .set_attribute("data-path", &flat_node.path)
-                        .unwrap();
-                    file_entry
-                        .set_attribute("data-depth", &flat_node.depth.to_string())
-                        .unwrap();
-                    file_entry
-                        .set_attribute("style", &format!("padding-left: {}px", indent_px))
-                        .unwrap();
-
-                    if is_renaming {
-                        let rename_input = document.create_element("input").unwrap();
-                        let rename_input: web_sys::HtmlInputElement = rename_input.unchecked_into();
-                        rename_input.set_class_name("rename-input");
-                        rename_input.set_value(&inner.rename_value);
-                        rename_input
-                            .set_attribute("aria-label", &format!("Rename {}", flat_node.name))
-                            .unwrap();
-                        file_entry.append_child(&rename_input).unwrap();
-                    } else {
-                        let select_file = document.create_element("button").unwrap();
-                        select_file.set_class_name("file-select-btn");
-                        select_file
-                            .set_attribute("data-path", &flat_node.path)
-                            .unwrap();
-                        select_file
-                            .set_attribute("data-focus-key", &format!("file:{}", flat_node.path))
-                            .unwrap();
-                        if is_active {
-                            select_file.set_attribute("aria-current", "page").unwrap();
-                        }
-                        select_file
-                            .append_child(&icons::icon(&document, "file"))
-                            .unwrap();
-                        let file_name = document.create_element("span").unwrap();
-                        file_name.set_class_name("file-name");
-                        file_name.set_text_content(Some(&flat_node.name));
-                        select_file.append_child(&file_name).unwrap();
-                        file_entry.append_child(&select_file).unwrap();
-                    }
-
-                    if can_edit_workspace {
-                        let file_actions = document.create_element("span").unwrap();
-                        file_actions.set_class_name("file-actions");
-
-                        let rename_btn = document.create_element("button").unwrap();
-                        rename_btn.set_class_name("rename-btn");
-                        rename_btn
-                            .set_attribute("data-path", &flat_node.path)
-                            .unwrap();
-                        rename_btn
-                            .set_attribute("data-focus-key", &format!("rename:{}", flat_node.path))
-                            .unwrap();
-                        icons::icon_button_content(
-                            &document,
-                            &rename_btn,
-                            "pencil",
-                            &format!("Rename {}", flat_node.name),
-                        );
-                        file_actions.append_child(&rename_btn).unwrap();
-
-                        let delete_btn = document.create_element("button").unwrap();
-                        delete_btn.set_class_name("delete-btn");
-                        delete_btn
-                            .set_attribute("data-path", &flat_node.path)
-                            .unwrap();
-                        icons::icon_button_content(
-                            &document,
-                            &delete_btn,
-                            "trash",
-                            &format!("Delete {}", flat_node.name),
-                        );
-                        file_actions.append_child(&delete_btn).unwrap();
-
-                        file_entry.append_child(&file_actions).unwrap();
-                    }
-                    file_list.append_child(&file_entry).unwrap();
-                }
-            }
-        }
-        sidebar.append_child(&file_list).unwrap();
-
-        let sidebar_footer = document.create_element("div").unwrap();
-        sidebar_footer.set_class_name("sidebar-footer");
-
-        let vault_status = document.create_element("div").unwrap();
-        vault_status.set_class_name("vault-status");
-        if inner.local_mode {
-            let dot = document.create_element("span").unwrap();
-            dot.set_class_name("status-dot");
-            dot.set_attribute(
-                "data-state",
-                persistence_state(&save_label(&inner).unwrap_or_default()),
-            )
-            .unwrap();
-            vault_status.append_child(&dot).unwrap();
-            let label = document.create_element("span").unwrap();
-            label.set_text_content(Some("Stored on this device"));
-            vault_status.append_child(&label).unwrap();
-        } else {
-            let phase_badge = document.create_element("span").unwrap();
-            phase_badge.set_class_name(&format!("phase-badge phase-{:?}", phase).to_lowercase());
-            phase_badge.set_text_content(Some(&format!("{:?}", phase)));
-            vault_status.append_child(&phase_badge).unwrap();
-        }
-        sidebar_footer.append_child(&vault_status).unwrap();
-
-        if !inner.local_mode {
-            let sync_status = document.create_element("div").unwrap();
-            sync_status.set_class_name("sync-status");
-            sync_status.set_attribute("role", "status").unwrap();
-            sync_status.set_text_content(Some(sync_status_text(&inner, phase)));
-            sidebar_footer.append_child(&sync_status).unwrap();
-            if let Some(error) = inner.sync_error.as_ref().or(inner.auth_error.as_ref()) {
-                let error_element = document.create_element("div").unwrap();
-                error_element.set_class_name("sync-error");
-                error_element.set_attribute("role", "alert").unwrap();
-                error_element.set_text_content(Some(error));
-                sidebar_footer.append_child(&error_element).unwrap();
-                if phase == SessionPhase::Offline && inner.auth_error.is_none() {
-                    let retry = document.create_element("button").unwrap();
-                    retry.set_class_name("retry-sync-btn text-btn");
-                    retry.set_text_content(Some("Retry sync now"));
-                    sidebar_footer.append_child(&retry).unwrap();
-                }
-            }
-            if let Some(error) = &inner.index_error {
-                let index_error = document.create_element("div").unwrap();
-                index_error.set_class_name("index-error");
-                index_error.set_attribute("role", "status").unwrap();
-                index_error.set_text_content(Some(error));
-                sidebar_footer.append_child(&index_error).unwrap();
-            }
-
-            if inner.public_view.is_none() {
-                let logout = document.create_element("button").unwrap();
-                logout.set_class_name("logout-btn text-btn");
-                logout.set_text_content(Some("Sign out"));
-                sidebar_footer.append_child(&logout).unwrap();
-            }
-        }
-
-        let settings = document.create_element("button").unwrap();
-        settings.set_class_name("settings-open-btn");
-        settings.set_attribute("aria-haspopup", "dialog").unwrap();
-        settings
-            .set_attribute("data-focus-key", "settings-open")
-            .unwrap();
-        icons::icon_button_content(&document, &settings, "settings", "Vault settings");
-        if inner.public_view.is_none() {
-            sidebar_footer
-                .insert_before(&settings, vault_status.next_sibling().as_ref())
-                .unwrap();
-        }
-
-        sidebar.append_child(&sidebar_footer).unwrap();
-        app_container.append_child(&sidebar).unwrap();
-
-        let main_content = document.create_element("div").unwrap();
-        main_content
-            .set_attribute("data-scroll-key", &format!("{}", inner.selected_doc_id))
-            .unwrap();
+        let _ = main_content.set_attribute("data-scroll-key", &inner.selected_doc_id.to_string());
         main_content.set_class_name(if inner.document_mode == DocumentMode::Preview {
             "main-content preview-mode"
         } else {
             "main-content"
         });
-
-        let topbar = document.create_element("header").unwrap();
-        topbar.set_class_name("workspace-topbar");
-        let nav_toggle = document.create_element("button").unwrap();
-        nav_toggle.set_class_name("sidebar-toggle-btn");
-        icons::icon_button_content(
-            &document,
-            &nav_toggle,
-            "panel-left",
-            "Toggle workspace navigation",
-        );
-        nav_toggle
-            .set_attribute("aria-controls", "workspace-navigation")
-            .unwrap();
-        nav_toggle
-            .set_attribute(
-                "aria-expanded",
-                if inner.sidebar_open { "true" } else { "false" },
-            )
-            .unwrap();
-        nav_toggle
-            .set_attribute("data-focus-key", "sidebar-toggle")
-            .unwrap();
-        topbar.append_child(&nav_toggle).unwrap();
-        let breadcrumb = document.create_element("div").unwrap();
-        breadcrumb.set_class_name("breadcrumb");
-        let crumb_path = selected_path.as_deref().unwrap_or("Home");
-        breadcrumb.set_attribute("title", crumb_path).unwrap();
-        let crumbs = crumb_path.split('/').collect::<Vec<_>>();
-        for (index, crumb) in crumbs.iter().enumerate() {
-            if index > 0 {
-                let separator = document.create_element("span").unwrap();
-                separator.set_class_name("crumb-sep");
-                separator.set_text_content(Some("/"));
-                breadcrumb.append_child(&separator).unwrap();
-            }
-            let segment = document.create_element("span").unwrap();
-            segment.set_class_name(if index + 1 == crumbs.len() {
-                "crumb-current"
-            } else {
-                "crumb"
-            });
-            segment.set_text_content(Some(crumb));
-            breadcrumb.append_child(&segment).unwrap();
-        }
-        topbar.append_child(&breadcrumb).unwrap();
-        let topbar_actions = document.create_element("div").unwrap();
-        topbar_actions.set_class_name("topbar-actions");
-        let quick_search = document.create_element("button").unwrap();
-        quick_search.set_class_name("topbar-search-btn");
-        quick_search
-            .append_child(&icons::icon(&document, "search"))
-            .unwrap();
-        let quick_search_label = document.create_element("span").unwrap();
-        quick_search_label.set_text_content(Some("Search"));
-        quick_search.append_child(&quick_search_label).unwrap();
-        let quick_search_kbd = document.create_element("span").unwrap();
-        quick_search_kbd.set_class_name("kbd");
-        quick_search_kbd.set_text_content(Some(shortcut_label("K").as_str()));
-        quick_search.append_child(&quick_search_kbd).unwrap();
-        quick_search
-            .set_attribute("aria-label", "Search pages")
-            .unwrap();
-        quick_search
-            .set_attribute("data-focus-key", "quick-search")
-            .unwrap();
-        topbar_actions.append_child(&quick_search).unwrap();
-        let save_status = document.create_element("span").unwrap();
-        save_status.set_class_name("topbar-save-status");
-        let save_text = save_label(&inner).unwrap_or_else(|| "Saving…".into());
-        save_status.set_text_content(Some(&save_text));
-        save_status
-            .set_attribute("data-state", persistence_state(&save_text))
-            .unwrap();
-        save_status.set_attribute("role", "status").unwrap();
-        if selected_path.is_some() || inner.local_persistence_error.is_some() {
-            topbar_actions.append_child(&save_status).unwrap();
-        }
-        if selected_path.is_some() && !inner.local_mode {
-            let live_on = live::enabled();
-            let direct = self.live_direct_count();
-            let live_btn = document.create_element("button").unwrap();
-            live_btn.set_class_name("live-toggle-btn");
-            live_btn
-                .append_child(&document.create_element("span").unwrap())
-                .unwrap();
-            set_live_toggle_state(&live_btn, live_on, direct);
-            live_btn
-                .set_attribute("data-focus-key", "live-toggle")
-                .unwrap();
-            topbar_actions.append_child(&live_btn).unwrap();
-        }
-        let collaborator_states = inner
-            .remote_presence
-            .values()
-            .filter(|presence| !matches!(presence.payload.state, PresenceKind::Idle))
-            .collect::<Vec<_>>();
-        if !collaborator_states.is_empty() {
-            let indicator = document.create_element("span").unwrap();
-            indicator.set_class_name("collaborator-presence");
-            let ink_count = collaborator_states
-                .iter()
-                .filter(|presence| matches!(presence.payload.state, PresenceKind::Ink { .. }))
-                .count();
-            let label = if ink_count > 0 {
-                format!(
-                    "{} collaborator(s) active · {} pointing in Ink",
-                    collaborator_states.len(),
-                    ink_count
-                )
-            } else {
-                format!("{} collaborator(s) editing text", collaborator_states.len())
-            };
-            indicator.set_text_content(Some(&label));
-            topbar_actions.append_child(&indicator).unwrap();
-        }
-        if selected_path.is_some() {
-            let mode_bar = document.create_element("div").unwrap();
-            mode_bar.set_class_name("mode-bar");
-            let edit_btn = document.create_element("button").unwrap();
-            edit_btn.set_class_name("mode-toggle-btn");
-            edit_btn.set_text_content(Some("Edit"));
-            edit_btn
-                .set_attribute("data-focus-key", "mode-edit")
-                .unwrap();
-            edit_btn
-                .set_attribute(
-                    "aria-pressed",
-                    if inner.document_mode == DocumentMode::Edit {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .unwrap();
-            if inner.document_mode == DocumentMode::Edit {
-                edit_btn.set_attribute("data-active", "true").unwrap();
-            }
-            let preview_btn = document.create_element("button").unwrap();
-            preview_btn.set_class_name("mode-toggle-btn");
-            preview_btn.set_attribute("data-mode", "preview").unwrap();
-            preview_btn.set_text_content(Some("Preview"));
-            preview_btn
-                .set_attribute("data-focus-key", "mode-preview")
-                .unwrap();
-            preview_btn
-                .set_attribute(
-                    "aria-pressed",
-                    if inner.document_mode == DocumentMode::Preview {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .unwrap();
-            if inner.document_mode == DocumentMode::Preview {
-                preview_btn.set_attribute("data-active", "true").unwrap();
-            }
-            let inspector_toggle = document.create_element("button").unwrap();
-            inspector_toggle.set_class_name("mode-toggle-btn toggle-inspector-btn");
-            icons::icon_button_content(&document, &inspector_toggle, "panel-right", "Inspector");
-            inspector_toggle
-                .set_attribute("aria-controls", "document-inspector")
-                .unwrap();
-            inspector_toggle
-                .set_attribute(
-                    "aria-expanded",
-                    if inner.inspector_open {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .unwrap();
-            inspector_toggle
-                .set_attribute("data-focus-key", "inspector-toggle")
-                .unwrap();
-            mode_bar
-                .append_child(&page_export::render_button(
-                    &document,
-                    inner.export_menu_open,
-                ))
-                .unwrap();
-            mode_bar.append_child(&inspector_toggle).unwrap();
-            topbar_actions.append_child(&mode_bar).unwrap();
-        }
-        topbar.append_child(&topbar_actions).unwrap();
-        main_content.append_child(&topbar).unwrap();
-
-        if selected_path.is_none() && storage_error.is_none() {
-            main_content
-                .append_child(&self.render_home(&document))
-                .unwrap();
-        }
+        let _ = main_content
+            .toggle_attribute_with_force("inert", inner.settings_open || inner.new_vault.is_some());
 
         if let Some(err) = &inner.document_error {
             let err_div = document.create_element("div").unwrap();
             err_div.set_class_name("document-error");
             err_div.set_attribute("role", "alert").unwrap();
             err_div.set_text_content(Some(err));
-            main_content.append_child(&err_div).unwrap();
+            page.append_child(&err_div).unwrap();
         } else if let Some(err) = storage_error {
             let err_div = document.create_element("div").unwrap();
             err_div.set_class_name("storage-error");
             let err_p = document.create_element("p").unwrap();
             err_p.set_text_content(Some(&format!("Local storage error: {}", err)));
             err_div.append_child(&err_p).unwrap();
-            main_content.append_child(&err_div).unwrap();
+            page.append_child(&err_div).unwrap();
         } else if phase == SessionPhase::HydratingLocal {
             let loading_div = document.create_element("div").unwrap();
             loading_div.set_class_name("loading-state");
             loading_div.set_text_content(Some("Loading local document..."));
-            main_content.append_child(&loading_div).unwrap();
+            page.append_child(&loading_div).unwrap();
         } else if phase == SessionPhase::Closed && selected_path.is_some() {
             let closed_div = document.create_element("div").unwrap();
             closed_div.set_class_name("closed-state");
             closed_div.set_text_content(Some("No document open."));
-            main_content.append_child(&closed_div).unwrap();
+            page.append_child(&closed_div).unwrap();
         }
 
         if let Some(error) = &inner.local_persistence_error {
@@ -11358,7 +10386,7 @@ impl Driver {
             retry.set_text_content(Some("Retry save"));
             recovery.append_child(&message).unwrap();
             recovery.append_child(&retry).unwrap();
-            main_content.append_child(&recovery).unwrap();
+            page.append_child(&recovery).unwrap();
         }
 
         if !client_state.pending_conflicts().is_empty() {
@@ -11376,7 +10404,7 @@ impl Driver {
                 )));
                 recovery.append_child(&detail).unwrap();
             }
-            main_content.append_child(&recovery).unwrap();
+            page.append_child(&recovery).unwrap();
         }
 
         if document_available && selected_path.is_some() {
@@ -11436,7 +10464,7 @@ impl Driver {
                         asset_view.append_child(&download).unwrap();
                     }
                 }
-                main_content.append_child(&asset_view).unwrap();
+                page.append_child(&asset_view).unwrap();
             } else {
                 let editor_container = document.create_element("div").unwrap();
                 editor_container.set_class_name(if inner.document_mode == DocumentMode::Preview {
@@ -11612,7 +10640,7 @@ impl Driver {
                     editor_container.append_child(&error_list).unwrap();
                 }
 
-                main_content.append_child(&editor_container).unwrap();
+                page.append_child(&editor_container).unwrap();
             }
         } else if phase == SessionPhase::Error {
             let err_state = document.create_element("div").unwrap();
@@ -11631,388 +10659,9 @@ impl Driver {
                 }
                 err_state.append_child(&ul).unwrap();
             }
-            main_content.append_child(&err_state).unwrap();
+            page.append_child(&err_state).unwrap();
         }
 
-        app_container.append_child(&main_content).unwrap();
-
-        let inspector = document.create_element("div").unwrap();
-        inspector.set_id("document-inspector");
-        inspector.set_attribute("role", "complementary").unwrap();
-        inspector
-            .set_attribute("aria-label", "Document inspector")
-            .unwrap();
-        if inner.inspector_open {
-            inspector.set_class_name("inspector open");
-        } else {
-            inspector.set_class_name("inspector");
-        }
-        if !inner.inspector_open {
-            inspector.set_attribute("inert", "").unwrap();
-            inspector.set_attribute("aria-hidden", "true").unwrap();
-        }
-
-        let inspector_header = document.create_element("div").unwrap();
-        inspector_header.set_class_name("inspector-header");
-        let tabs_div = document.create_element("div").unwrap();
-        tabs_div.set_class_name("inspector-tabs");
-        tabs_div.set_attribute("role", "tablist").unwrap();
-        tabs_div
-            .set_attribute("aria-label", "Inspector sections")
-            .unwrap();
-
-        for tab_name in &["Backlinks", "Outline", "Tags", "Graph"] {
-            let tab = document.create_element("button").unwrap();
-            if &inner.knowledge_tab == tab_name {
-                tab.set_class_name("inspector-tab active");
-            } else {
-                tab.set_class_name("inspector-tab");
-            }
-            tab.set_attribute("data-tab", tab_name).unwrap();
-            let tab_id = format!("inspector-tab-{}", tab_name.to_lowercase());
-            tab.set_id(&tab_id);
-            tab.set_attribute("role", "tab").unwrap();
-            tab.set_attribute("aria-controls", "inspector-panel")
-                .unwrap();
-            tab.set_attribute(
-                "aria-selected",
-                if &inner.knowledge_tab == tab_name {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .unwrap();
-            tab.set_attribute(
-                "tabindex",
-                if &inner.knowledge_tab == tab_name {
-                    "0"
-                } else {
-                    "-1"
-                },
-            )
-            .unwrap();
-            tab.set_attribute("data-focus-key", &format!("inspector-tab:{}", tab_name))
-                .unwrap();
-            tab.set_text_content(Some(tab_name));
-            tabs_div.append_child(&tab).unwrap();
-        }
-        inspector_header.append_child(&tabs_div).unwrap();
-        let inspector_close = document.create_element("button").unwrap();
-        inspector_close.set_class_name("toggle-inspector-btn inspector-close-btn");
-        icons::icon_button_content(&document, &inspector_close, "x", "Close document inspector");
-        inspector_header.append_child(&inspector_close).unwrap();
-        inspector.append_child(&inspector_header).unwrap();
-
-        let section = document.create_element("div").unwrap();
-        section.set_id("inspector-panel");
-        section.set_class_name("inspector-section");
-        section.set_attribute("role", "tabpanel").unwrap();
-        section
-            .set_attribute(
-                "aria-labelledby",
-                &format!("inspector-tab-{}", inner.knowledge_tab.to_lowercase()),
-            )
-            .unwrap();
-        section
-            .set_attribute("data-section", &inner.knowledge_tab.to_lowercase())
-            .unwrap();
-
-        if inner.knowledge_tab == "Outline" {
-            if let Some(path) = selected_path {
-                if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
-                    for heading in &knowledge.headings {
-                        let item = document.create_element("button").unwrap();
-                        item.set_class_name("outline-item");
-                        item.set_text_content(Some(&heading.text));
-                        item.set_attribute("data-anchor", &heading.anchor).unwrap();
-                        item.set_attribute("data-block-id", &heading.block_id.to_string())
-                            .unwrap();
-                        item.set_attribute("data-heading-line", &heading.line.to_string())
-                            .unwrap();
-                        item.set_attribute("data-heading-level", &heading.level.to_string())
-                            .unwrap();
-                        let pad = if heading.level > 0 {
-                            (heading.level - 1) * 12
-                        } else {
-                            0
-                        };
-                        item.set_attribute("style", &format!("padding-left: {}px", pad))
-                            .unwrap();
-                        section.append_child(&item).unwrap();
-                    }
-                    if knowledge.headings.is_empty() {
-                        let empty = document.create_element("div").unwrap();
-                        empty.set_class_name("outline-item");
-                        empty.set_text_content(Some("No headings"));
-                        empty
-                            .set_attribute("style", "color: var(--text-muted); cursor: default;")
-                            .unwrap();
-                        section.append_child(&empty).unwrap();
-                    }
-                }
-            }
-        } else if inner.knowledge_tab == "Backlinks" {
-            // Outgoing Links
-            let out_header = document.create_element("h4").unwrap();
-            out_header.set_text_content(Some("Outgoing Links"));
-            section.append_child(&out_header).unwrap();
-
-            if let Some(path) = selected_path {
-                if let Some(knowledge) = inner.knowledge.path_to_doc.get(path) {
-                    let mut has_links = false;
-                    for outlink in &knowledge.outgoing_links {
-                        has_links = true;
-                        let item = document.create_element("button").unwrap();
-                        let resolved_path = if outlink.is_wikilink {
-                            inner.knowledge.resolve_wikilink(path, &outlink.target_raw)
-                        } else {
-                            inner
-                                .knowledge
-                                .resolve_markdown_link(path, &outlink.target_raw)
-                        };
-                        if let knowledge::WikilinkResolution::Resolved(resolved) = resolved_path {
-                            item.set_class_name("link-item");
-                            item.set_text_content(Some(
-                                outlink.alias.as_deref().unwrap_or(&outlink.target_raw),
-                            ));
-                            item.set_attribute("data-path", &resolved).unwrap();
-                        } else if matches!(
-                            resolved_path,
-                            knowledge::WikilinkResolution::Ambiguous(_)
-                        ) {
-                            item.set_class_name("link-item ambiguous");
-                            item.set_text_content(Some(
-                                outlink.alias.as_deref().unwrap_or(&outlink.target_raw),
-                            ));
-                        } else {
-                            item.set_class_name("link-item missing");
-                            item.set_text_content(Some(&outlink.target_raw));
-                            item.set_attribute("data-missing-target", &outlink.target_raw)
-                                .unwrap();
-                        }
-                        section.append_child(&item).unwrap();
-                    }
-                    if !has_links {
-                        let empty = document.create_element("div").unwrap();
-                        empty.set_class_name("outline-item");
-                        empty.set_text_content(Some("No outgoing links"));
-                        empty
-                            .set_attribute("style", "color: var(--text-muted); cursor: default;")
-                            .unwrap();
-                        section.append_child(&empty).unwrap();
-                    }
-                }
-            }
-
-            // Backlinks
-            let back_header = document.create_element("h4").unwrap();
-            back_header.set_text_content(Some("Backlinks"));
-            section.append_child(&back_header).unwrap();
-
-            if let Some(path) = selected_path {
-                let backlinks = inner.knowledge.get_backlinks(path);
-                if backlinks.is_empty() {
-                    let empty = document.create_element("div").unwrap();
-                    empty.set_class_name("outline-item");
-                    empty.set_text_content(Some("No backlinks"));
-                    empty
-                        .set_attribute("style", "color: var(--text-muted); cursor: default;")
-                        .unwrap();
-                    section.append_child(&empty).unwrap();
-                } else {
-                    for backlink in backlinks {
-                        let item = document.create_element("button").unwrap();
-                        item.set_class_name("link-item");
-                        item.set_text_content(Some(&backlink.source_name));
-                        item.set_attribute("data-path", &backlink.source_path)
-                            .unwrap();
-                        let detail = document.create_element("span").unwrap();
-                        detail.set_class_name("backlink-context");
-                        detail.set_text_content(Some(&format!(
-                            "{}\n{}",
-                            backlink.source_path,
-                            backlink.context_snippet.unwrap_or_default()
-                        )));
-                        item.append_child(&detail).unwrap();
-                        section.append_child(&item).unwrap();
-                    }
-                }
-            }
-        } else if inner.knowledge_tab == "Tags" {
-            let current = selected_path
-                .as_ref()
-                .and_then(|path| inner.knowledge.path_to_tags.get(path));
-            let current_header = document.create_element("h4").unwrap();
-            current_header.set_text_content(Some("Current Note Tags"));
-            section.append_child(&current_header).unwrap();
-            if let Some(tags) = current {
-                let mut tags: Vec<&String> = tags.iter().collect();
-                tags.sort();
-                for tag in tags {
-                    let item = document.create_element("button").unwrap();
-                    item.set_class_name("tag-item");
-                    item.set_attribute("data-tag", tag).unwrap();
-                    item.set_text_content(Some(&format!("#{}", tag)));
-                    section.append_child(&item).unwrap();
-                }
-            }
-            let workspace_header = document.create_element("h4").unwrap();
-            workspace_header.set_text_content(Some("Workspace Tags"));
-            section.append_child(&workspace_header).unwrap();
-            let tags = inner.knowledge.get_all_tags_with_counts();
-            if tags.is_empty() {
-                let empty = document.create_element("div").unwrap();
-                empty.set_class_name("outline-item");
-                empty.set_text_content(Some("No tags in workspace"));
-                empty
-                    .set_attribute("style", "color: var(--text-muted); cursor: default;")
-                    .unwrap();
-                section.append_child(&empty).unwrap();
-            } else {
-                for (tag, count) in tags {
-                    let item = document.create_element("button").unwrap();
-                    item.set_class_name("tag-item");
-                    item.set_attribute("data-tag", &tag).unwrap();
-
-                    let name_span = document.create_element("span").unwrap();
-                    name_span.set_class_name("tag-name");
-                    name_span.set_text_content(Some(&format!("#{}", tag)));
-
-                    let count_span = document.create_element("span").unwrap();
-                    count_span.set_class_name("tag-count");
-                    count_span.set_text_content(Some(&count.to_string()));
-
-                    item.append_child(&name_span).unwrap();
-                    item.append_child(&count_span).unwrap();
-                    section.append_child(&item).unwrap();
-                }
-            }
-        } else if inner.knowledge_tab == "Graph" {
-            let graph = selected_path
-                .as_ref()
-                .map(|path| local_graph::build_local_graph(&inner.knowledge, path))
-                .unwrap_or_default();
-            let graph_header = document.create_element("div").unwrap();
-            graph_header.set_class_name("graph-header");
-            graph_header.set_text_content(Some("Active note neighborhood"));
-            section.append_child(&graph_header).unwrap();
-            if graph.nodes.len() <= 1 {
-                let empty = document.create_element("div").unwrap();
-                empty.set_class_name("graph-empty-state");
-                empty.set_text_content(Some("No linked notes yet. Add a link or backlink."));
-                section.append_child(&empty).unwrap();
-            }
-
-            let svg_ns = Some("http://www.w3.org/2000/svg");
-            let graph_wrap = document.create_element("div").unwrap();
-            graph_wrap.set_class_name("local-graph-wrap");
-            let svg = document.create_element_ns(svg_ns, "svg").unwrap();
-            svg.set_attribute("class", "local-graph").unwrap();
-            svg.set_attribute("viewBox", "0 0 300 264").unwrap();
-            svg.set_attribute("role", "img").unwrap();
-            svg.set_attribute("aria-label", "Linked note graph")
-                .unwrap();
-            for edge in &graph.edges {
-                let Some(source) = graph.nodes.iter().find(|node| node.path == edge.source) else {
-                    continue;
-                };
-                let Some(target) = graph.nodes.iter().find(|node| node.path == edge.target) else {
-                    continue;
-                };
-                let line = document.create_element_ns(svg_ns, "line").unwrap();
-                line.set_attribute("class", "local-graph-edge").unwrap();
-                line.set_attribute("x1", &source.x.to_string()).unwrap();
-                line.set_attribute("y1", &source.y.to_string()).unwrap();
-                line.set_attribute("x2", &target.x.to_string()).unwrap();
-                line.set_attribute("y2", &target.y.to_string()).unwrap();
-                line.set_attribute("data-source", &edge.source).unwrap();
-                line.set_attribute("data-target", &edge.target).unwrap();
-                svg.append_child(&line).unwrap();
-            }
-            for node in &graph.nodes {
-                let group = document.create_element_ns(svg_ns, "g").unwrap();
-                let kind = match node.kind {
-                    local_graph::GraphNodeKind::Active => "active",
-                    local_graph::GraphNodeKind::Outgoing => "outgoing",
-                    local_graph::GraphNodeKind::Backlink => "backlink",
-                    local_graph::GraphNodeKind::Connected => "connected",
-                };
-                group
-                    .set_attribute("class", &format!("local-graph-node {}", kind))
-                    .unwrap();
-                group.set_attribute("data-path", &node.path).unwrap();
-                let radius = graph_node_radius(node.kind);
-                let circle = document.create_element_ns(svg_ns, "circle").unwrap();
-                circle.set_attribute("cx", &node.x.to_string()).unwrap();
-                circle.set_attribute("cy", &node.y.to_string()).unwrap();
-                circle.set_attribute("r", &radius.to_string()).unwrap();
-                group.append_child(&circle).unwrap();
-                let title = document.create_element_ns(svg_ns, "title").unwrap();
-                title.set_text_content(Some(&node.label));
-                group.append_child(&title).unwrap();
-                let text = document.create_element_ns(svg_ns, "text").unwrap();
-                text.set_attribute("x", &node.x.to_string()).unwrap();
-                text.set_attribute("y", &(node.y + radius + 14.0).to_string())
-                    .unwrap();
-                text.set_attribute("text-anchor", "middle").unwrap();
-                text.set_text_content(Some(&graph_label(&node.label)));
-                group.append_child(&text).unwrap();
-                svg.append_child(&group).unwrap();
-            }
-            graph_wrap.append_child(&svg).unwrap();
-            for node in &graph.nodes {
-                let hit_target = document.create_element("button").unwrap();
-                hit_target.set_class_name("graph-node-hit");
-                hit_target
-                    .set_attribute("data-graph-path", &node.path)
-                    .unwrap();
-                hit_target.set_attribute("data-path", &node.path).unwrap();
-                hit_target
-                    .set_attribute("data-focus-key", &format!("graph:{}", node.path))
-                    .unwrap();
-                hit_target
-                    .set_attribute(
-                        "aria-label",
-                        &if node.kind == local_graph::GraphNodeKind::Active {
-                            format!("Open {} (current note)", node.label)
-                        } else {
-                            format!("Open {}", node.label)
-                        },
-                    )
-                    .unwrap();
-                let diameter = (graph_node_radius(node.kind) + 3.0) * 2.0;
-                hit_target
-                    .set_attribute(
-                        "style",
-                        &format!(
-                            "left:{}%;top:{}%;width:{}%",
-                            node.x / 3.0,
-                            node.y / 2.64,
-                            diameter / 3.0
-                        ),
-                    )
-                    .unwrap();
-                graph_wrap.append_child(&hit_target).unwrap();
-            }
-            section.append_child(&graph_wrap).unwrap();
-        }
-
-        inspector.append_child(&section).unwrap();
-        app_container.append_child(&inspector).unwrap();
-        if inner.sidebar_open || inner.inspector_open {
-            let backdrop = document.create_element("button").unwrap();
-            backdrop.set_class_name("drawer-backdrop");
-            backdrop
-                .set_attribute("aria-label", "Close panels")
-                .unwrap();
-            app_container.append_child(&backdrop).unwrap();
-        }
-        if inner.settings_open || inner.new_vault.is_some() {
-            sidebar.set_attribute("inert", "").unwrap();
-            main_content.set_attribute("inert", "").unwrap();
-        }
-        root.append_child(&app_container).unwrap();
         if inner.settings_open {
             root.append_child(&self.render_settings(&document)).unwrap();
         }
@@ -12045,18 +10694,7 @@ impl Driver {
             can_edit_workspace && inner.document_mode == DocumentMode::Edit,
         );
 
-        // Focus rename input if in rename mode
-        if inner.renaming_path.is_some() {
-            if let Some(el) = document.query_selector(".rename-input").unwrap() {
-                let input: web_sys::HtmlInputElement = el.unchecked_into();
-                page_driver::focus_in_place(&input);
-            }
-        } else if inner.show_create {
-            if let Some(el) = document.query_selector(".explorer-create-input").unwrap() {
-                let input: web_sys::HtmlInputElement = el.unchecked_into();
-                page_driver::focus_in_place(&input);
-            }
-        } else if let Some(key) = requested_focus.or(control_focus_key) {
+        if let Some(key) = requested_focus.or(control_focus_key) {
             let selector = format!("[data-focus-key=\"{}\"]", key.replace('"', "\\\""));
             if let Ok(Some(element)) = document.query_selector(&selector) {
                 if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
@@ -12064,18 +10702,7 @@ impl Driver {
                 }
             }
         } else if let Some((target, start, end, direction, scroll_left, scroll_top)) = focus_info {
-            if target == "search" {
-                // Restore search input focus and cursor
-                if let Some(el) = document.query_selector(".search-input").unwrap() {
-                    let input: web_sys::HtmlInputElement = el.unchecked_into();
-                    page_driver::focus_in_place(&input);
-                    let _ = input.set_selection_start(Some(start));
-                    let _ = input.set_selection_end(Some(end));
-                    let _ = input.set_selection_direction(Some(&direction));
-                    input.set_scroll_left(scroll_left);
-                    input.set_scroll_top(scroll_top);
-                }
-            } else if can_edit_workspace && document_available {
+            if can_edit_workspace && document_available {
                 if target == "title" {
                     if let Some(el) = document.query_selector(".document-title-input").unwrap() {
                         let input: web_sys::HtmlInputElement = el.unchecked_into();
@@ -12110,37 +10737,6 @@ impl Driver {
         let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
         let iso = String::from(date.to_iso_string());
         iso.chars().take(16).collect::<String>().replace('T', " ")
-    }
-
-    // Safe DOM text helper – appends text nodes and <mark> elements; no innerHTML.
-    // Unicode-safe: uses char_indices so byte slicing is always on valid boundaries.
-    fn highlight_text_into(el: &web_sys::Element, text: &str, query: &str) {
-        let document = match web_sys::window().and_then(|w| w.document()) {
-            Some(d) => d,
-            None => return,
-        };
-        if query.is_empty() {
-            let _ = el.append_child(&document.create_text_node(text));
-            return;
-        }
-        let query_lower = query.to_lowercase();
-        let mut byte_pos: usize = 0;
-        for (start, end) in search::find_case_insensitive_ranges(text, &query_lower) {
-            if start > byte_pos {
-                let _ = el.append_child(&document.create_text_node(&text[byte_pos..start]));
-            }
-            let mark = match document.create_element("mark") {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            mark.set_class_name("search-highlight");
-            let _ = mark.append_child(&document.create_text_node(&text[start..end]));
-            let _ = el.append_child(&mark);
-            byte_pos = end;
-        }
-        if byte_pos < text.len() {
-            let _ = el.append_child(&document.create_text_node(&text[byte_pos..]));
-        }
     }
 }
 
@@ -12266,20 +10862,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
                 let class = el.class_name();
 
-                // ── Explorer rename input ────────────────────────
-                if class == "rename-input" {
-                    let input: web_sys::HtmlInputElement = el.unchecked_into();
-                    d_input.0.borrow_mut().rename_value = input.value();
-                    return;
-                }
-
-                // ── Explorer create input ────────────────────────
-                if class == "explorer-create-input" {
-                    let input: web_sys::HtmlInputElement = el.unchecked_into();
-                    d_input.0.borrow_mut().create_value = input.value();
-                    return;
-                }
-
                 if class == "new-vault-name" {
                     let input: &web_sys::HtmlInputElement = el.unchecked_ref();
                     d_input.set_new_vault_name(input.value());
@@ -12292,13 +10874,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     if let Some(home) = el.closest(".home").ok().flatten() {
                         home::apply_filter(&home, &input.value());
                     }
-                    return;
-                }
-
-                // ── Search input ─────────────────────────────────
-                if class == "search-input" {
-                    let input: web_sys::HtmlInputElement = el.unchecked_into();
-                    d_input.update_search_query(&input.value());
                     return;
                 }
 
@@ -12418,12 +10993,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         else {
             return;
         };
-        if input.class_name() == "asset-import-input"
-            && let Some(file) = input.files().and_then(|files| files.get(0))
-        {
-            d_change.import_asset(file);
-            input.set_value("");
-        } else if input.class_name() == "vault-import-input"
+        if input.class_name() == "vault-import-input"
             && let Some(file) = input.files().and_then(|files| files.get(0))
         {
             d_change.import_vault(file);
@@ -12449,14 +11019,16 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             Err(_) => return,
         };
         let class = el.get_attribute("class").unwrap_or_default();
-        if d_click.handle_export_click(&el) {
-            return;
-        }
+        d_click.close_export_menu(Some(&el));
         if d_click.handle_vault_click(&el) {
             return;
         }
-        if el.closest(".sidebar-home-btn").ok().flatten().is_some() {
-            d_click.go_home();
+        if el
+            .closest(".sidebar, .workspace-topbar, .inspector")
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return;
         }
         if let Some(target) = el.closest(".home [data-path]").ok().flatten() {
@@ -12495,13 +11067,8 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             if d_click.0.borrow().client_state.has_pending_intent() {
                 return;
             }
-            let mut inner = d_click.0.borrow_mut();
-            inner.show_create = true;
-            inner.create_value = String::new();
-            inner.create_folder = None;
-            inner.creating_folder = false;
-            inner.sidebar_open = true;
-            drop(inner);
+            ui::state().create.set(Some(ui::Create::default()));
+            d_click.0.borrow_mut().sidebar_open = true;
             d_click.render();
             return;
         }
@@ -12557,15 +11124,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
         if class.contains("auth-register-btn") {
             d_click.auth_action("/api/auth/register");
-            return;
-        }
-        if class == "settings-open-btn" {
-            let mut inner = d_click.0.borrow_mut();
-            inner.settings_open = true;
-            inner.pending_focus_key = Some("settings-content".into());
-            drop(inner);
-            d_click.render();
-            d_click.refresh_settings_data();
             return;
         }
         if class == "settings-close-btn" || class == "settings-backdrop" {
@@ -12672,232 +11230,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if class.contains("retry-sync-btn") {
             d_click.0.borrow_mut().sync_error = None;
             d_click.dispatch(ClientEvent::RetrySync);
-            return;
-        }
-
-        if let Some(path) = el.get_attribute("data-graph-path") {
-            d_click.select_entry(&path);
-            return;
-        }
-
-        if class == "sidebar-toggle-btn" {
-            let mut inner = d_click.0.borrow_mut();
-            inner.sidebar_open = !inner.sidebar_open;
-            inner.pending_focus_key = Some(if inner.sidebar_open {
-                "search-input".to_string()
-            } else {
-                "sidebar-toggle".to_string()
-            });
-            drop(inner);
-            d_click.render();
-            return;
-        }
-        if class == "drawer-backdrop" {
-            let mut inner = d_click.0.borrow_mut();
-            inner.pending_focus_key = Some(if inner.inspector_open {
-                "inspector-toggle".to_string()
-            } else {
-                "sidebar-toggle".to_string()
-            });
-            inner.sidebar_open = false;
-            inner.inspector_open = false;
-            drop(inner);
-            d_click.render();
-            return;
-        }
-        if class == "topbar-search-btn" {
-            let mobile = web_sys::window()
-                .and_then(|window| window.inner_width().ok())
-                .and_then(|width| width.as_f64())
-                .is_some_and(|width| width <= 760.0);
-            if mobile {
-                d_click.0.borrow_mut().sidebar_open = true;
-                d_click.render();
-            }
-            if let Ok(Some(search)) = click_document.query_selector(".search-input") {
-                if let Ok(input) = search.dyn_into::<web_sys::HtmlInputElement>() {
-                    let _ = input.focus();
-                    let _ = input.select();
-                }
-            }
-            return;
-        }
-
-        // ── Search & Recent Clicks ──────────────────────────────
-        if class.contains("search-result-item")
-            || el
-                .parent_element()
-                .map(|p| p.class_name().contains("search-result-item"))
-                .unwrap_or(false)
-        {
-            let path = el.get_attribute("data-path").or_else(|| {
-                el.parent_element()
-                    .and_then(|p| p.get_attribute("data-path"))
-            });
-            if let Some(p) = path {
-                d_click.select_entry(&p);
-                d_click.search_clear_query_only();
-            }
-            return;
-        }
-        if class.contains("recent-item")
-            || el
-                .parent_element()
-                .map(|p| p.class_name().contains("recent-item"))
-                .unwrap_or(false)
-        {
-            let path = el.get_attribute("data-path").or_else(|| {
-                el.parent_element()
-                    .and_then(|p| p.get_attribute("data-path"))
-            });
-            if let Some(p) = path {
-                d_click.select_entry(&p);
-            }
-            return;
-        }
-        if class == "recent-clear-btn" {
-            d_click.clear_recent_notes();
-            return;
-        }
-
-        // ── Explorer: new file button (root level) ─────────────
-        if class == "explorer-new-btn" {
-            if d_click.0.borrow().client_state.has_pending_intent() {
-                return;
-            }
-            let mut inner = d_click.0.borrow_mut();
-            inner.show_create = true;
-            inner.create_value = String::new();
-            inner.create_folder = None;
-            inner.creating_folder = false;
-            drop(inner);
-            d_click.render();
-            return;
-        }
-
-        if class == "explorer-new-folder-btn" {
-            let mut inner = d_click.0.borrow_mut();
-            inner.show_create = true;
-            inner.create_value.clear();
-            inner.create_folder = None;
-            inner.creating_folder = true;
-            drop(inner);
-            d_click.render();
-            return;
-        }
-
-        if class == "folder-create-btn" {
-            if let Some(path) = el.get_attribute("data-path") {
-                let mut inner = d_click.0.borrow_mut();
-                inner.expanded_folders.insert(path.clone());
-                inner.create_folder = Some(path);
-                inner.show_create = true;
-                inner.create_value = String::new();
-                inner.creating_folder = false;
-                drop(inner);
-                d_click.render();
-            }
-            return;
-        }
-        if class == "folder-rename-btn" {
-            if let Some(path) = el.get_attribute("data-path") {
-                if let Some(destination) = web_sys::window()
-                    .and_then(|window| {
-                        window
-                            .prompt_with_message_and_default("New folder path", &path)
-                            .ok()
-                    })
-                    .flatten()
-                {
-                    d_click.rename_folder_tree(&path, &destination);
-                }
-            }
-            return;
-        }
-        if class == "folder-delete-btn" {
-            if let Some(path) = el.get_attribute("data-path") {
-                let confirmed = web_sys::window()
-                    .and_then(|window| {
-                        window
-                            .confirm_with_message(&format!(
-                                "Delete {path} and everything inside it?"
-                            ))
-                            .ok()
-                    })
-                    .unwrap_or(false);
-                if confirmed {
-                    d_click.delete_folder_tree(&path);
-                }
-            }
-            return;
-        }
-        if let Ok(Some(folder)) = el.closest(".explorer-folder") {
-            if let Some(path) = folder.get_attribute("data-path") {
-                let mut inner = d_click.0.borrow_mut();
-                if inner.expanded_folders.contains(&path) {
-                    inner.expanded_folders.remove(&path);
-                } else {
-                    inner.expanded_folders.insert(path.clone());
-                }
-                inner.pending_focus_key = Some(format!("folder:{}", path));
-                drop(inner);
-                d_click.render();
-            }
-            return;
-        }
-
-        // ── Workspace: file entry click (select) ──────────────────
-        if class == "file-entry"
-            || class == "file-entry active"
-            || class == "file-name"
-            || class == "file-select-btn"
-        {
-            let path = el.get_attribute("data-path").or_else(|| {
-                el.closest("[data-path]")
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.get_attribute("data-path"))
-            });
-            if let Some(p) = path {
-                d_click.select_entry(&p);
-            }
-            return;
-        }
-
-        // ── Workspace: rename button (inline rename) ─────────────
-        if class == "rename-btn" {
-            if d_click.0.borrow().client_state.has_pending_intent() {
-                return;
-            }
-            if let Some(path) = el.get_attribute("data-path") {
-                let mut inner = d_click.0.borrow_mut();
-                let file_name = explorer::file_name_only(&path);
-                inner.renaming_path = Some(path);
-                inner.rename_value = file_name;
-                drop(inner);
-                d_click.render();
-            }
-            return;
-        }
-
-        // ── Workspace: delete button ──────────────────────────────
-        if class == "delete-btn" {
-            if d_click.0.borrow().client_state.has_pending_intent() {
-                return;
-            }
-            if let Some(path) = el.get_attribute("data-path") {
-                if let Some(window) = web_sys::window() {
-                    let confirmed = window
-                        .confirm_with_message(&format!(
-                            "Delete \"{}\"? This cannot be undone.",
-                            path
-                        ))
-                        .unwrap_or(false);
-                    if confirmed {
-                        d_click.delete_entry(&path);
-                    }
-                }
-            }
             return;
         }
 
@@ -13056,33 +11388,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
 
-        // ── Mode toggle ────────────────────────────────────
-        if class == "mode-toggle-btn" {
-            let is_preview = el.get_attribute("data-mode").as_deref() == Some("preview");
-            d_click.set_document_mode(if is_preview {
-                DocumentMode::Preview
-            } else {
-                DocumentMode::Edit
-            });
-            return;
-        }
-
-        if class
-            .split_whitespace()
-            .any(|name| name == "toggle-inspector-btn")
-        {
-            let mut inner = d_click.0.borrow_mut();
-            inner.inspector_open = !inner.inspector_open;
-            inner.pending_focus_key = Some(if inner.inspector_open {
-                format!("inspector-tab:{}", inner.knowledge_tab)
-            } else {
-                "inspector-toggle".to_string()
-            });
-            drop(inner);
-            d_click.render();
-            return;
-        }
-
         // ── Preview internal link ─────────────────────────
         let workspace_path = el.get_attribute("data-workspace-path").or_else(|| {
             el.closest("[data-workspace-path]")
@@ -13113,69 +11418,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if class == "link-message-dismiss" {
             d_click.0.borrow_mut().link_message = None;
             d_click.render();
-            return;
-        }
-
-        // ── Inspector Tab Switch ───────────────────────────
-        if class == "inspector-tab" || class == "inspector-tab active" {
-            if let Some(tab_name) = el.get_attribute("data-tab") {
-                let mut inner = d_click.0.borrow_mut();
-                inner.knowledge_tab = tab_name;
-                inner.pending_focus_key = Some(format!("inspector-tab:{}", inner.knowledge_tab));
-                drop(inner);
-                d_click.render();
-            }
-            return;
-        }
-
-        if class == "clear-tag-btn" {
-            d_click.search_clear();
-            return;
-        }
-
-        // ── Inspector Outline Click ────────────────────────
-        if class == "outline-item" {
-            let inner = d_click.0.borrow();
-            let is_preview = inner.document_mode == DocumentMode::Preview;
-            drop(inner);
-
-            if is_preview {
-                if let Some(anchor) = el.get_attribute("data-anchor") {
-                    if let Some(heading_el) = document.get_element_by_id(&anchor) {
-                        heading_el.scroll_into_view();
-                    }
-                }
-            } else {
-                if let Some(block_id) = el.get_attribute("data-block-id") {
-                    let selector = format!(".block-textarea[data-block-id=\"{}\"]", block_id);
-                    if let Ok(Some(textarea_el)) = click_document.query_selector(&selector) {
-                        textarea_el.scroll_into_view();
-                        if let Ok(textarea) = textarea_el.dyn_into::<web_sys::HtmlTextAreaElement>()
-                        {
-                            let _ = textarea.focus();
-                            if let Some(line_str) = el.get_attribute("data-heading-line") {
-                                if let Ok(line) = line_str.parse::<usize>() {
-                                    let text = textarea.value();
-                                    let mut current_line = 0;
-                                    let mut offset = 0;
-                                    for ch in text.chars() {
-                                        if current_line == line {
-                                            break;
-                                        }
-                                        offset += ch.len_utf16() as u32;
-                                        if ch == '\n' {
-                                            current_line += 1;
-                                        }
-                                    }
-                                    let _ = textarea.set_selection_start(Some(offset));
-                                    let _ = textarea.set_selection_end(Some(offset));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            el.set_class_name("outline-item active");
             return;
         }
 
@@ -13210,22 +11452,13 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         }
 
         // ── Inspector Tag Click ────────────────────────────
-        if class == "tag-item"
-            || class == "tag-name"
-            || class == "tag-count"
-            || class == "metadata-tag"
-        {
+        if class == "metadata-tag" {
             let tag = el.get_attribute("data-tag").or_else(|| {
                 el.parent_element()
                     .and_then(|p| p.get_attribute("data-tag"))
             });
-            if let Some(t) = tag {
-                let mut inner = d_click.0.borrow_mut();
-                inner.tag_filter = Some(t.to_lowercase());
-                inner.search_query.clear();
-                inner.search_results.clear();
-                drop(inner);
-                d_click.render();
+            if let Some(tag) = tag {
+                ui::filter_tag(&tag);
             }
             return;
         }
@@ -13496,7 +11729,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
         if event.key() == "Escape"
-            && (d_keydown.close_export_menu()
+            && (d_keydown.close_export_menu(None)
                 || d_keydown.close_new_vault()
                 || d_keydown.close_vault_menu())
         {
@@ -13572,22 +11805,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         let is_ctrl_cmd = event.ctrl_key() || event.meta_key();
         if is_ctrl_cmd && is_k {
             event.prevent_default();
-            let mut inner = d_keydown.0.borrow_mut();
-            inner.sidebar_open = true;
-            inner.pending_focus_key = Some("search-input".to_string());
-            drop(inner);
-            d_keydown.render();
-            if let Some(window) = web_sys::window() {
-                if let Some(document) = window.document() {
-                    if let Some(search_el) = document.query_selector(".search-input").unwrap() {
-                        if let Ok(search_input) = search_el.dyn_into::<web_sys::HtmlInputElement>()
-                        {
-                            let _ = search_input.focus();
-                            let _ = search_input.select();
-                        }
-                    }
-                }
-            }
+            ui::quick_search(true);
             return;
         }
 
@@ -13629,102 +11847,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
         if event.key() == "Enter" && class == "unlock-password" {
             event.prevent_default();
             d_keydown.unlock_workspace();
-            return;
-        }
-
-        if el.class_list().contains("inspector-tab") {
-            let tabs = ["Backlinks", "Outline", "Tags", "Graph"];
-            let current = el
-                .get_attribute("data-tab")
-                .and_then(|name| tabs.iter().position(|tab| *tab == name))
-                .unwrap_or(0);
-            let next = match event.key().as_str() {
-                "ArrowRight" => Some((current + 1) % tabs.len()),
-                "ArrowLeft" => Some((current + tabs.len() - 1) % tabs.len()),
-                "Home" => Some(0),
-                "End" => Some(tabs.len() - 1),
-                _ => None,
-            };
-            if let Some(next) = next {
-                event.prevent_default();
-                let mut inner = d_keydown.0.borrow_mut();
-                inner.knowledge_tab = tabs[next].to_string();
-                inner.pending_focus_key = Some(format!("inspector-tab:{}", tabs[next]));
-                drop(inner);
-                d_keydown.render();
-            }
-            return;
-        }
-
-        // ── Search input keydown ──────────────────────────────────
-        if class == "search-input" {
-            if event.key() == "ArrowDown" {
-                event.prevent_default();
-                d_keydown.search_move_highlight(1);
-            } else if event.key() == "ArrowUp" {
-                event.prevent_default();
-                d_keydown.search_move_highlight(-1);
-            } else if event.key() == "Enter" {
-                event.prevent_default();
-                d_keydown.search_open_highlighted();
-            } else if event.key() == "Escape" {
-                event.prevent_default();
-                d_keydown.search_clear();
-            }
-            return;
-        }
-
-        // ── Create input ──────────────────────────────────────────
-        if class == "explorer-create-input" {
-            let input: web_sys::HtmlInputElement = el.unchecked_into();
-            if event.key() == "Enter" {
-                event.prevent_default();
-                let val = input.value();
-                if !val.trim().is_empty() {
-                    d_keydown.create_file(&val);
-                }
-            } else if event.key() == "Escape" {
-                event.prevent_default();
-                d_keydown.0.borrow_mut().show_create = false;
-                d_keydown.0.borrow_mut().create_value = String::new();
-                d_keydown.0.borrow_mut().create_folder = None;
-                d_keydown.0.borrow_mut().pending_focus_key = Some("new-file".to_string());
-                d_keydown.render();
-            }
-            return;
-        }
-
-        // ── Rename input ─────────────────────────────────────────
-        if class == "rename-input" {
-            let input: web_sys::HtmlInputElement = el.unchecked_into();
-            if event.key() == "Enter" {
-                event.prevent_default();
-                let new_name = input.value();
-                let old_path = d_keydown.0.borrow().renaming_path.clone();
-                if let Some(ref path) = old_path {
-                    if !new_name.trim().is_empty() {
-                        // Update path using parent folder
-                        let full_new_path = if let Some(parent) = explorer::parent_folder(path) {
-                            if parent.is_empty() {
-                                new_name.trim().to_string()
-                            } else {
-                                format!("{}/{}", parent, new_name.trim())
-                            }
-                        } else {
-                            new_name.trim().to_string()
-                        };
-                        d_keydown.rename_entry(path, &full_new_path);
-                    }
-                }
-            } else if event.key() == "Escape" {
-                event.prevent_default();
-                d_keydown.0.borrow_mut().renaming_path = None;
-                d_keydown.0.borrow_mut().rename_value = String::new();
-                if let Some(path) = d_keydown.0.borrow().selected_path.clone() {
-                    d_keydown.0.borrow_mut().pending_focus_key = Some(format!("file:{}", path));
-                }
-                d_keydown.render();
-            }
             return;
         }
     }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
@@ -13818,16 +11940,6 @@ fn live_toggle_text(live_on: bool, direct: usize) -> (String, String) {
             ),
         ),
     }
-}
-
-fn set_live_toggle_state(button: &web_sys::Element, live_on: bool, direct: usize) {
-    let (label, title) = live_toggle_text(live_on, direct);
-    if let Ok(Some(span)) = button.query_selector("span") {
-        span.set_text_content(Some(&label));
-    }
-    let _ = button.set_attribute("aria-pressed", if live_on { "true" } else { "false" });
-    let _ = button.set_attribute("data-direct", &direct.to_string());
-    let _ = button.set_attribute("title", &title);
 }
 
 /// Typed values of the auth form's text fields, keyed by class.

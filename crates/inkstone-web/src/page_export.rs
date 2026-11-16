@@ -1,9 +1,10 @@
 use base64::Engine;
 use inkstone_workspace::{WorkspacePath, WorkspaceStore};
+use leptos::prelude::{GetUntracked, Set};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::{Driver, icons};
+use crate::Driver;
 
 const PRINTABLE_WIDTH: f64 = 680.0;
 
@@ -16,14 +17,14 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
-    const ALL: [ExportFormat; 4] = [
+    pub(crate) const ALL: [ExportFormat; 4] = [
         ExportFormat::Pdf,
         ExportFormat::Html,
         ExportFormat::Markdown,
         ExportFormat::Vault,
     ];
 
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             ExportFormat::Pdf => "pdf",
             ExportFormat::Html => "html",
@@ -32,11 +33,7 @@ impl ExportFormat {
         }
     }
 
-    fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|format| format.key() == key)
-    }
-
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             ExportFormat::Pdf => "PDF",
             ExportFormat::Html => "Web page",
@@ -45,7 +42,7 @@ impl ExportFormat {
         }
     }
 
-    fn detail(self) -> &'static str {
+    pub(crate) fn detail(self) -> &'static str {
         match self {
             ExportFormat::Pdf => "Print or save, ink and all",
             ExportFormat::Html => "One file that opens in any browser",
@@ -53,47 +50,6 @@ impl ExportFormat {
             ExportFormat::Vault => "Every note and file as a ZIP",
         }
     }
-}
-
-pub fn render_button(document: &web_sys::Document, open: bool) -> web_sys::Element {
-    let wrap = document.create_element("div").unwrap();
-    wrap.set_class_name("export-wrap");
-    let button = document.create_element("button").unwrap();
-    button.set_class_name("mode-toggle-btn export-btn");
-    button.set_attribute("type", "button").unwrap();
-    button.set_attribute("data-export-action", "menu").unwrap();
-    button.set_attribute("aria-haspopup", "menu").unwrap();
-    button
-        .set_attribute("aria-expanded", if open { "true" } else { "false" })
-        .unwrap();
-    button
-        .set_attribute("data-focus-key", "export-menu")
-        .unwrap();
-    icons::icon_button_content(document, &button, "download", "Export");
-    wrap.append_child(&button).unwrap();
-    if open {
-        let menu = document.create_element("div").unwrap();
-        menu.set_class_name("export-menu");
-        menu.set_attribute("role", "menu").unwrap();
-        menu.set_attribute("aria-label", "Export").unwrap();
-        for format in ExportFormat::ALL {
-            let item = document.create_element("button").unwrap();
-            item.set_class_name("export-menu-item");
-            item.set_attribute("type", "button").unwrap();
-            item.set_attribute("role", "menuitem").unwrap();
-            item.set_attribute("data-export-action", format.key())
-                .unwrap();
-            let name = document.create_element("strong").unwrap();
-            name.set_text_content(Some(format.title()));
-            item.append_child(&name).unwrap();
-            let detail = document.create_element("span").unwrap();
-            detail.set_text_content(Some(format.detail()));
-            item.append_child(&detail).unwrap();
-            menu.append_child(&item).unwrap();
-        }
-        wrap.append_child(&menu).unwrap();
-    }
-    wrap
 }
 
 fn escape_html(text: &str) -> String {
@@ -212,44 +168,17 @@ struct PageSnapshot {
 }
 
 impl Driver {
-    pub(crate) fn handle_export_click(&self, target: &web_sys::Element) -> bool {
-        let menu_open = self.0.borrow().export_menu_open;
-        let control = target.closest("[data-export-action]").ok().flatten();
-        if menu_open && control.is_none() {
-            self.0.borrow_mut().export_menu_open = false;
-            self.render();
-        }
-        let Some(control) = control else {
-            return false;
-        };
-        let action = control
-            .get_attribute("data-export-action")
-            .unwrap_or_default();
-        if action == "menu" {
-            let mut inner = self.0.borrow_mut();
-            inner.export_menu_open = !inner.export_menu_open;
-            drop(inner);
-            self.render();
-            return true;
-        }
-        let Some(format) = ExportFormat::from_key(&action) else {
-            return false;
-        };
-        self.0.borrow_mut().export_menu_open = false;
-        self.render();
-        self.export(format);
-        true
-    }
-
-    pub(crate) fn close_export_menu(&self) -> bool {
-        let mut inner = self.0.borrow_mut();
-        if !inner.export_menu_open {
+    pub(crate) fn close_export_menu(&self, target: Option<&web_sys::Element>) -> bool {
+        let open = crate::ui::state().export_open;
+        let outside =
+            target.is_none_or(|target| target.closest(".export-wrap").ok().flatten().is_none());
+        if !open.get_untracked() || !outside {
             return false;
         }
-        inner.export_menu_open = false;
-        inner.pending_focus_key = Some("export-menu".into());
-        drop(inner);
-        self.render();
+        open.set(false);
+        if target.is_none() {
+            crate::ui::focus_soon("export-menu");
+        }
         true
     }
 

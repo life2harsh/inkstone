@@ -4,6 +4,7 @@ use inkstone_core::protocol::{
     PublicLinkAccessRequest, PublicLinkRequest, PublicLinkResponse, UpdateWorkspaceRequest,
     WorkspaceKeyEnvelopeResponse, WorkspaceMemberResponse, WorkspaceResponse,
 };
+use leptos::prelude::{GetUntracked, Set, Update};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{
@@ -37,7 +38,7 @@ impl VaultAccess {
         Self::ALL.into_iter().find(|access| access.key() == key)
     }
 
-    fn icon(self) -> &'static str {
+    pub(crate) fn icon(self) -> &'static str {
         match self {
             VaultAccess::Private => "lock",
             VaultAccess::Shared => "users",
@@ -316,154 +317,6 @@ fn action_button(
         .append_child(&text(document, "span", "", label))
         .unwrap();
     button
-}
-
-/// The vault name at the top of the sidebar, which opens the vault menu.
-pub fn render_switcher(document: &web_sys::Document, inner: &DriverInner) -> web_sys::Element {
-    let interactive = !inner.local_mode && inner.public_view.is_none();
-    let switcher = element(
-        document,
-        if interactive { "button" } else { "div" },
-        "brand vault-switcher",
-    );
-    if interactive {
-        switcher.set_attribute("type", "button").unwrap();
-        switcher.set_attribute("data-vault-action", "menu").unwrap();
-        switcher.set_attribute("aria-haspopup", "menu").unwrap();
-        switcher
-            .set_attribute(
-                "aria-expanded",
-                if inner.vault_menu_open {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .unwrap();
-        switcher
-            .set_attribute("data-focus-key", "vault-switcher")
-            .unwrap();
-    }
-    let mark = element(document, "span", "brand-mark");
-    mark.append_child(&icons::icon(document, "mark")).unwrap();
-    switcher.append_child(&mark).unwrap();
-    let label = element(document, "span", "brand-text");
-    label
-        .append_child(&text(
-            document,
-            "span",
-            "brand-name vault-name",
-            &inner.workspace_name,
-        ))
-        .unwrap();
-    let detail = if let Some(name) = &inner.guest_name {
-        format!("Editing as {name}")
-    } else if inner.public_view.is_some() {
-        "View only".to_string()
-    } else if inner.local_mode {
-        "On this device".to_string()
-    } else {
-        current_workspace(inner)
-            .map(access_summary)
-            .unwrap_or_default()
-    };
-    label
-        .append_child(&text(document, "span", "workspace-name", &detail))
-        .unwrap();
-    switcher.append_child(&label).unwrap();
-    if interactive {
-        let chevron = icons::icon(document, "chevrons-up-down");
-        chevron
-            .set_attribute("class", "icon vault-chevron")
-            .unwrap();
-        switcher.append_child(&chevron).unwrap();
-    } else if inner.public_view.is_some() {
-        let eye = icons::icon(
-            document,
-            if inner.guest_name.is_some() {
-                "pencil"
-            } else {
-                "eye"
-            },
-        );
-        eye.set_attribute("class", "icon vault-chevron").unwrap();
-        switcher.append_child(&eye).unwrap();
-    }
-    switcher
-}
-
-pub fn render_menu(document: &web_sys::Document, inner: &DriverInner) -> web_sys::Element {
-    let menu = element(document, "div", "vault-menu");
-    menu.set_attribute("role", "menu").unwrap();
-    menu.set_attribute("aria-label", "Vaults").unwrap();
-    menu.append_child(&text(document, "div", "vault-menu-label", "Vaults"))
-        .unwrap();
-    let mut workspaces: Vec<&WorkspaceResponse> = inner.workspaces.iter().collect();
-    let name_of = |workspace: &WorkspaceResponse| {
-        inner
-            .vault_names
-            .get(&workspace.id)
-            .cloned()
-            .unwrap_or_else(|| "Locked vault".into())
-    };
-    workspaces.sort_by_key(|workspace| name_of(workspace).to_lowercase());
-    for workspace in workspaces {
-        let current = Some(workspace.id) == inner.workspace_id;
-        let item = element(document, "button", "vault-menu-item");
-        item.set_attribute("type", "button").unwrap();
-        item.set_attribute("role", "menuitemradio").unwrap();
-        item.set_attribute("aria-checked", if current { "true" } else { "false" })
-            .unwrap();
-        item.set_attribute("data-vault-action", "switch").unwrap();
-        item.set_attribute("data-workspace-id", &workspace.id.to_string())
-            .unwrap();
-        item.append_child(&icons::icon(document, access_of(workspace).icon()))
-            .unwrap();
-        let label = element(document, "span", "vault-menu-text");
-        label
-            .append_child(&text(
-                document,
-                "span",
-                "vault-menu-name",
-                &name_of(workspace),
-            ))
-            .unwrap();
-        label
-            .append_child(&text(
-                document,
-                "span",
-                "vault-menu-detail",
-                &access_summary(workspace),
-            ))
-            .unwrap();
-        item.append_child(&label).unwrap();
-        if current {
-            let check = icons::icon(document, "check");
-            check
-                .set_attribute("class", "icon vault-menu-check")
-                .unwrap();
-            item.append_child(&check).unwrap();
-        }
-        menu.append_child(&item).unwrap();
-    }
-    menu.append_child(&element(document, "div", "vault-menu-divider"))
-        .unwrap();
-    for (action, icon, label) in [
-        ("new", "plus", "New vault"),
-        ("share", "users", "Share this vault"),
-        ("settings", "settings", "Vault settings"),
-    ] {
-        let item = action_button(
-            document,
-            "vault-menu-item vault-menu-command",
-            action,
-            Some(icon),
-            label,
-        );
-        item.set_attribute("role", "menuitem").unwrap();
-        menu.append_child(&item).unwrap();
-    }
-    menu
 }
 
 pub fn render_new_vault_dialog(
@@ -785,7 +638,6 @@ impl Driver {
         if inner.local_mode || inner.public_view.is_some() {
             return;
         }
-        inner.vault_menu_open = false;
         inner.settings_open = false;
         inner.new_vault = Some(NewVaultDraft {
             name: String::new(),
@@ -858,7 +710,6 @@ impl Driver {
 
     fn open_sharing(&self) {
         let mut inner = self.0.borrow_mut();
-        inner.vault_menu_open = false;
         inner.settings_open = true;
         inner.settings_category = "Sharing".into();
         inner.pending_focus_key = Some("settings-content".into());
@@ -874,12 +725,10 @@ impl Driver {
             self.close_new_vault();
             return true;
         }
-        let menu_open = self.0.borrow().vault_menu_open;
+        let menu = crate::ui::state().menu_open;
         let control = target.closest("[data-vault-action]").ok().flatten();
-        if menu_open && control.is_none() && target.closest(".vault-menu").ok().flatten().is_none()
-        {
-            self.0.borrow_mut().vault_menu_open = false;
-            self.render();
+        if control.is_none() && target.closest(".vault-menu").ok().flatten().is_none() {
+            menu.set(false);
         }
         let Some(control) = control else {
             return false;
@@ -887,15 +736,10 @@ impl Driver {
         let action = control
             .get_attribute("data-vault-action")
             .unwrap_or_default();
+        menu.update(|open| *open = action == "menu" && !*open);
         match action.as_str() {
-            "menu" => {
-                let mut inner = self.0.borrow_mut();
-                inner.vault_menu_open = !inner.vault_menu_open;
-                drop(inner);
-                self.render();
-            }
+            "menu" => {}
             "switch" => {
-                self.0.borrow_mut().vault_menu_open = false;
                 let id = control
                     .get_attribute("data-workspace-id")
                     .and_then(|id| uuid::Uuid::parse_str(&id).ok());
@@ -910,7 +754,6 @@ impl Driver {
             "share" => self.open_sharing(),
             "settings" => {
                 let mut inner = self.0.borrow_mut();
-                inner.vault_menu_open = false;
                 inner.settings_open = true;
                 inner.settings_category = "General".into();
                 inner.pending_focus_key = Some("settings-content".into());
@@ -980,14 +823,12 @@ impl Driver {
     }
 
     pub(crate) fn close_vault_menu(&self) -> bool {
-        let mut inner = self.0.borrow_mut();
-        if !inner.vault_menu_open {
+        let menu = crate::ui::state().menu_open;
+        if !menu.get_untracked() {
             return false;
         }
-        inner.vault_menu_open = false;
-        inner.pending_focus_key = Some("vault-switcher".into());
-        drop(inner);
-        self.render();
+        menu.set(false);
+        crate::ui::focus_soon("vault-switcher");
         true
     }
 
