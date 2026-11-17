@@ -1,8 +1,11 @@
 use inkstone_core::document::{BlockContent, InkstoneDocument};
 
-use wasm_bindgen::JsCast;
-
-use crate::{Driver, icons};
+use crate::{
+    DriverInner,
+    icons::svg,
+    ui::{Create, Ui, refresh, state},
+};
+use leptos::prelude::*;
 
 const VIEW_KEY: &str = "inkstone-home-view";
 const SORT_KEY: &str = "inkstone-home-sort";
@@ -223,20 +226,12 @@ fn stored(key: &str) -> Option<String> {
         .flatten()
 }
 
-pub fn store(key: &str, value: &str) {
+fn store(key: &str, value: &str) {
     if let Some(storage) =
         web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     {
         let _ = storage.set_item(key, value);
     }
-}
-
-pub fn set_view(value: &str) {
-    store(VIEW_KEY, value);
-}
-
-pub fn set_sort(value: &str) {
-    store(SORT_KEY, value);
 }
 
 fn list_view() -> bool {
@@ -299,510 +294,437 @@ fn folder_of(path: &str) -> String {
         .map(|(folder, _)| folder.replace('/', " / "))
         .unwrap_or_default()
 }
-pub fn apply_filter(home: &web_sys::Element, query: &str) {
-    let query = query.trim().to_lowercase();
-    let Ok(items) = home.query_selector_all("[data-filter]") else {
-        return;
-    };
-    let mut shown = 0;
-    for index in 0..items.length() {
-        let Some(item) = items
-            .item(index)
-            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
-        else {
-            continue;
-        };
-        let matches = query.is_empty()
-            || item
-                .get_attribute("data-filter")
-                .is_some_and(|text| query.split_whitespace().all(|word| text.contains(word)));
-        if matches {
-            let _ = item.remove_attribute("hidden");
-            if item.has_attribute("data-note") {
-                shown += 1;
-            }
-        } else {
-            let _ = item.set_attribute("hidden", "");
-        }
-    }
-    if let Ok(Some(count)) = home.query_selector(".home-all-count") {
-        count.set_text_content(Some(&shown.to_string()));
-    }
-    if let Ok(Some(none)) = home.query_selector(".home-no-match") {
-        if shown == 0 {
-            let _ = none.remove_attribute("hidden");
-        } else {
-            let _ = none.set_attribute("hidden", "");
-        }
-    }
-    if let Ok(Some(recent)) = home.query_selector(".home-recent-section") {
-        if query.is_empty() {
-            let _ = recent.remove_attribute("hidden");
-        } else {
-            let _ = recent.set_attribute("hidden", "");
-        }
-    }
-}
-
-fn el(document: &web_sys::Document, tag: &str, class: &str) -> web_sys::Element {
-    let element = document.create_element(tag).unwrap();
-    if !class.is_empty() {
-        element.set_class_name(class);
-    }
-    element
-}
-
-fn text(document: &web_sys::Document, tag: &str, class: &str, value: &str) -> web_sys::Element {
-    let element = el(document, tag, class);
-    element.set_text_content(Some(value));
-    element
-}
-
 fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-impl Driver {
-    pub(crate) fn render_home(&self, document: &web_sys::Document) -> web_sys::Element {
-        let inner = self.0.borrow();
-        let now = js_sys::Date::now() as i64;
-        let home = el(document, "section", "home");
-        home.set_attribute("aria-label", "Home").unwrap();
+#[derive(Clone, PartialEq)]
+pub(crate) struct Card {
+    path: String,
+    title: String,
+    folder: String,
+    filter: String,
+    edited: String,
+    snippet: String,
+    ink: bool,
+    done: usize,
+    total: usize,
+    open: Vec<String>,
+    words: Option<usize>,
+}
 
-        let tagged = inner.home_tag.as_ref().and_then(|tag| {
-            inner
-                .knowledge
-                .tag_to_paths
-                .get(tag)
-                .map(|paths| (tag.clone(), paths))
-        });
-        let mut notes: Vec<HomeNote<'_>> = inner
-            .search_documents
-            .iter()
-            .filter(|doc| {
-                tagged
-                    .as_ref()
-                    .is_none_or(|(_, paths)| paths.contains(&doc.path))
-            })
-            .map(|doc| HomeNote {
-                path: &doc.path,
-                title: display_title(&doc.title, &doc.path),
-                folder: folder_of(&doc.path),
-                summary: inner.note_summaries.get(&doc.path),
-            })
-            .collect();
-        let sort = current_sort();
-        sort_notes(&mut notes, sort);
-        let list = list_view();
-        let head = el(document, "header", "home-head");
-        let heading = el(document, "div", "home-heading");
-        heading
-            .append_child(&text(document, "h1", "home-title", &inner.workspace_name))
-            .unwrap();
-        let folders = inner
-            .entries
-            .iter()
-            .filter(|entry| entry.kind == inkstone_workspace::WorkspaceEntryKind::Folder)
-            .count();
-        let open_tasks: usize = inner
-            .note_summaries
-            .values()
-            .map(|summary| summary.open_tasks.len())
-            .sum();
-        let inked = inner
-            .note_summaries
-            .values()
-            .filter(|summary| summary.has_ink)
-            .count();
-        let mut stats = vec![plural(inner.search_documents.len(), "note", "notes")];
-        if folders > 0 {
-            stats.push(plural(folders, "folder", "folders"));
-        }
-        if open_tasks > 0 {
-            stats.push(plural(open_tasks, "open task", "open tasks"));
-        }
-        if inked > 0 {
-            stats.push(format!("{inked} with ink"));
-        }
-        heading
-            .append_child(&text(document, "p", "home-stats", &stats.join(" · ")))
-            .unwrap();
-        head.append_child(&heading).unwrap();
-        if crate::can_edit_workspace(&inner) {
-            let new = el(document, "button", "home-new-btn");
-            new.append_child(&icons::icon(document, "plus")).unwrap();
-            new.append_child(&text(document, "span", "", "New note"))
-                .unwrap();
-            head.append_child(&new).unwrap();
-        }
-        home.append_child(&head).unwrap();
+#[derive(Clone, PartialEq)]
+pub(crate) struct Home {
+    name: String,
+    stats: String,
+    can_edit: bool,
+    sort: Sort,
+    list: bool,
+    tags: Vec<(String, usize)>,
+    tag: Option<String>,
+    recent: Vec<Card>,
+    notes: Vec<Card>,
+}
 
-        if inner.search_documents.is_empty() {
-            let empty = el(document, "div", "home-empty");
-            empty
-                .append_child(&text(document, "h2", "", "Nothing here yet"))
-                .unwrap();
-            empty
-                .append_child(&text(
-                    document,
-                    "p",
-                    "",
-                    "Start a note to write, sketch, or plan. Everything you make shows up here.",
-                ))
-                .unwrap();
-            home.append_child(&empty).unwrap();
-            return home;
-        }
-        let toolbar = el(document, "div", "home-toolbar");
-        let filter_wrap = el(document, "label", "home-filter-wrap");
-        filter_wrap
-            .append_child(&icons::icon(document, "search"))
-            .unwrap();
-        let filter = el(document, "input", "home-filter");
-        filter.set_attribute("type", "search").unwrap();
-        filter.set_attribute("placeholder", "Filter notes").unwrap();
-        filter.set_attribute("aria-label", "Filter notes").unwrap();
-        filter
-            .set_attribute("data-focus-key", "home-filter")
-            .unwrap();
-        filter
-            .unchecked_ref::<web_sys::HtmlInputElement>()
-            .set_value(&inner.home_filter);
-        filter_wrap.append_child(&filter).unwrap();
-        toolbar.append_child(&filter_wrap).unwrap();
-
-        let controls = el(document, "div", "home-controls");
-        let sort_group = el(document, "div", "home-segmented");
-        sort_group.set_attribute("role", "group").unwrap();
-        sort_group.set_attribute("aria-label", "Sort by").unwrap();
-        for (option, key, label) in Sort::ALL {
-            let button = text(document, "button", "home-seg", label);
-            button.set_attribute("data-home-sort", key).unwrap();
-            button
-                .set_attribute(
-                    "aria-pressed",
-                    if option == sort { "true" } else { "false" },
-                )
-                .unwrap();
-            sort_group.append_child(&button).unwrap();
-        }
-        controls.append_child(&sort_group).unwrap();
-        let view_group = el(document, "div", "home-segmented");
-        view_group.set_attribute("role", "group").unwrap();
-        view_group.set_attribute("aria-label", "Show as").unwrap();
-        for (key, icon, label) in [("cards", "grid", "Cards"), ("list", "list", "List")] {
-            let button = el(document, "button", "home-seg home-seg-icon");
-            button.append_child(&icons::icon(document, icon)).unwrap();
-            button.set_attribute("data-home-view", key).unwrap();
-            button.set_attribute("aria-label", label).unwrap();
-            button.set_attribute("title", label).unwrap();
-            button
-                .set_attribute(
-                    "aria-pressed",
-                    if (key == "list") == list {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .unwrap();
-            view_group.append_child(&button).unwrap();
-        }
-        controls.append_child(&view_group).unwrap();
-        toolbar.append_child(&controls).unwrap();
-        home.append_child(&toolbar).unwrap();
-
-        let tags = inner.knowledge.get_all_tags_with_counts();
-        if !tags.is_empty() {
-            let chips = el(document, "div", "home-tags");
-            let all = text(document, "button", "home-tag", "All");
-            all.set_attribute("data-home-tag", "").unwrap();
-            all.set_attribute(
-                "aria-pressed",
-                if inner.home_tag.is_none() {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .unwrap();
-            chips.append_child(&all).unwrap();
-            for (tag, count) in tags.iter().take(16) {
-                let chip = el(document, "button", "home-tag");
-                chip.append_child(&text(document, "span", "", &format!("#{tag}")))
-                    .unwrap();
-                chip.append_child(&text(
-                    document,
-                    "span",
-                    "home-tag-count",
-                    &count.to_string(),
-                ))
-                .unwrap();
-                chip.set_attribute("data-home-tag", tag).unwrap();
-                chip.set_attribute(
-                    "aria-pressed",
-                    if inner.home_tag.as_deref() == Some(tag.as_str()) {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .unwrap();
-                chips.append_child(&chip).unwrap();
-            }
-            home.append_child(&chips).unwrap();
-        }
-        let recent: Vec<&HomeNote<'_>> = inner
-            .recent_notes
-            .iter()
-            .filter_map(|path| notes.iter().find(|note| note.path == path))
-            .take(RECENT_SHOWN)
-            .collect();
-        if !recent.is_empty() && tagged.is_none() && !list {
-            let section = el(document, "section", "home-section home-recent-section");
-            section
-                .append_child(&text(document, "h2", "home-section-title", "Jump back in"))
-                .unwrap();
-            let row = el(document, "div", "home-recent");
-            for note in recent {
-                let item = el(document, "button", "home-recent-item");
-                item.set_attribute("data-path", note.path).unwrap();
-                item.append_child(&icons::icon(document, "file")).unwrap();
-                let words = el(document, "span", "home-recent-text");
-                words
-                    .append_child(&text(document, "span", "home-recent-title", &note.title))
-                    .unwrap();
-                words
-                    .append_child(&text(
-                        document,
-                        "span",
-                        "home-recent-meta",
-                        &relative_time(note.edited(), now),
-                    ))
-                    .unwrap();
-                item.append_child(&words).unwrap();
-                row.append_child(&item).unwrap();
-            }
-            section.append_child(&row).unwrap();
-            home.append_child(&section).unwrap();
-        }
-        let section = el(document, "section", "home-section");
-        let title = el(document, "h2", "home-section-title");
-        title
-            .append_child(&document.create_text_node(&match &tagged {
-                Some((tag, _)) => format!("Tagged #{tag} "),
-                None => "All notes ".to_string(),
-            }))
-            .unwrap();
-        title
-            .append_child(&text(
-                document,
-                "span",
-                "home-all-count",
-                &notes.len().to_string(),
-            ))
-            .unwrap();
-        section.append_child(&title).unwrap();
-        if list {
-            let table = el(document, "table", "home-table");
-            let head_row = el(document, "tr", "");
-            for (label, class) in [
-                ("Name", ""),
-                ("Folder", "home-col-folder"),
-                ("Edited", ""),
-                ("Tasks", "home-col-num"),
-                ("Words", "home-col-num home-col-words"),
-            ] {
-                let cell = text(document, "th", class, label);
-                cell.set_attribute("scope", "col").unwrap();
-                head_row.append_child(&cell).unwrap();
-            }
-            let thead = el(document, "thead", "");
-            thead.append_child(&head_row).unwrap();
-            table.append_child(&thead).unwrap();
-            let body = el(document, "tbody", "");
-            for note in &notes {
-                let row = el(document, "tr", "home-row");
-                row.set_attribute("data-path", note.path).unwrap();
-                row.set_attribute("data-filter", &note.haystack()).unwrap();
-                row.set_attribute("data-note", "").unwrap();
-                let cell = el(document, "td", "");
-                let name = el(document, "div", "home-row-name");
-                let open = text(document, "button", "home-open", &note.title);
-                open.set_attribute("data-path", note.path).unwrap();
-                name.append_child(&open).unwrap();
-                if note.summary.is_some_and(|summary| summary.has_ink) {
-                    name.append_child(&text(document, "span", "home-badge", "Ink"))
-                        .unwrap();
-                }
-                cell.append_child(&name).unwrap();
-                row.append_child(&cell).unwrap();
-                row.append_child(&text(document, "td", "home-col-folder", &note.folder))
-                    .unwrap();
-                row.append_child(&text(
-                    document,
-                    "td",
-                    "home-col-edited",
-                    &relative_time(note.edited(), now),
-                ))
-                .unwrap();
-                let tasks = note
-                    .summary
-                    .filter(|summary| summary.total_tasks() > 0)
-                    .map(|summary| format!("{}/{}", summary.done_tasks, summary.total_tasks()))
-                    .unwrap_or_default();
-                row.append_child(&text(document, "td", "home-col-num", &tasks))
-                    .unwrap();
-                row.append_child(&text(
-                    document,
-                    "td",
-                    "home-col-num home-col-words",
-                    &note
-                        .summary
-                        .map(|summary| summary.words.to_string())
-                        .unwrap_or_default(),
-                ))
-                .unwrap();
-                body.append_child(&row).unwrap();
-            }
-            table.append_child(&body).unwrap();
-            let scroller = el(document, "div", "home-table-wrap");
-            scroller.append_child(&table).unwrap();
-            section.append_child(&scroller).unwrap();
-        } else {
-            let grid = el(document, "div", "home-grid");
-            for note in &notes {
-                let card = el(document, "button", "home-card");
-                card.set_attribute("data-path", note.path).unwrap();
-                card.set_attribute("data-filter", &note.haystack()).unwrap();
-                card.set_attribute("data-note", "").unwrap();
-                if !note.folder.is_empty() {
-                    card.append_child(&text(document, "span", "home-card-folder", &note.folder))
-                        .unwrap();
-                }
-                card.append_child(&text(document, "span", "home-card-title", &note.title))
-                    .unwrap();
-                let snippet = note
-                    .summary
-                    .map(|summary| summary.snippet.as_str())
-                    .unwrap_or("");
-                card.append_child(&text(
-                    document,
-                    "span",
-                    if snippet.is_empty() {
-                        "home-card-snippet home-card-blank"
-                    } else {
-                        "home-card-snippet"
-                    },
-                    if snippet.is_empty() {
-                        "Empty page"
-                    } else {
-                        snippet
-                    },
-                ))
-                .unwrap();
-                let meta = el(document, "span", "home-card-meta");
-                meta.append_child(&text(
-                    document,
-                    "span",
-                    "",
-                    &relative_time(note.edited(), now),
-                ))
-                .unwrap();
-                if let Some(summary) = note.summary {
-                    if summary.has_ink {
-                        meta.append_child(&text(document, "span", "home-badge", "Ink"))
-                            .unwrap();
-                    }
-                    if summary.total_tasks() > 0 {
-                        let badge = text(
-                            document,
-                            "span",
-                            "home-badge",
-                            &format!("{}/{} done", summary.done_tasks, summary.total_tasks()),
-                        );
-                        if summary.open_tasks.is_empty() {
-                            badge.set_attribute("data-done", "true").unwrap();
-                        }
-                        meta.append_child(&badge).unwrap();
-                    }
-                }
-                card.append_child(&meta).unwrap();
-                grid.append_child(&card).unwrap();
-            }
-            section.append_child(&grid).unwrap();
-        }
-        let none = text(
-            document,
-            "p",
-            "home-no-match",
-            "No notes match that filter.",
-        );
-        none.set_attribute("hidden", "").unwrap();
-        section.append_child(&none).unwrap();
-        home.append_child(&section).unwrap();
-        let open: Vec<(&HomeNote<'_>, &String)> = notes
-            .iter()
-            .filter_map(|note| note.summary.map(|summary| (note, summary)))
-            .flat_map(|(note, summary)| summary.open_tasks.iter().map(move |task| (note, task)))
-            .collect();
-        if !open.is_empty() {
-            let section = el(document, "section", "home-section");
-            let title = el(document, "h2", "home-section-title");
-            title
-                .append_child(&document.create_text_node("Open tasks "))
-                .unwrap();
-            title
-                .append_child(&text(
-                    document,
-                    "span",
-                    "home-all-count-static",
-                    &open.len().to_string(),
-                ))
-                .unwrap();
-            section.append_child(&title).unwrap();
-            let list = el(document, "ul", "home-tasks");
-            for (index, (note, task)) in open.iter().enumerate() {
-                let item = el(document, "li", "");
-                item.set_attribute(
-                    "data-filter",
-                    &format!("{} {}", task.to_lowercase(), note.haystack()),
-                )
-                .unwrap();
-                if index >= TASKS_SHOWN {
-                    item.set_attribute("data-overflow", "").unwrap();
-                }
-                let button = el(document, "button", "home-task");
-                button.set_attribute("data-path", note.path).unwrap();
-                button
-                    .append_child(&el(document, "span", "home-task-box"))
-                    .unwrap();
-                button
-                    .append_child(&text(document, "span", "home-task-text", task))
-                    .unwrap();
-                button
-                    .append_child(&text(document, "span", "home-task-note", &note.title))
-                    .unwrap();
-                item.append_child(&button).unwrap();
-                list.append_child(&item).unwrap();
-            }
-            section.append_child(&list).unwrap();
-            if open.len() > TASKS_SHOWN {
-                let more = text(
-                    document,
-                    "button",
-                    "home-tasks-more",
-                    &format!("Show all {}", open.len()),
-                );
-                section.append_child(&more).unwrap();
-            }
-            home.append_child(&section).unwrap();
-        }
-        if !inner.home_filter.trim().is_empty() {
-            apply_filter(&home, &inner.home_filter);
-        }
-        home
+pub(crate) fn snapshot(inner: &DriverInner, tag: Option<&str>) -> Home {
+    let now = js_sys::Date::now() as i64;
+    let tagged = tag.and_then(|tag| {
+        inner
+            .knowledge
+            .tag_to_paths
+            .get(tag)
+            .map(|paths| (tag, paths))
+    });
+    let mut notes: Vec<HomeNote<'_>> = inner
+        .search_documents
+        .iter()
+        .filter(|doc| tagged.is_none_or(|(_, paths)| paths.contains(&doc.path)))
+        .map(|doc| HomeNote {
+            path: &doc.path,
+            title: display_title(&doc.title, &doc.path),
+            folder: folder_of(&doc.path),
+            summary: inner.note_summaries.get(&doc.path),
+        })
+        .collect();
+    let sort = current_sort();
+    sort_notes(&mut notes, sort);
+    let card = |note: &HomeNote<'_>| Card {
+        path: note.path.to_string(),
+        title: note.title.clone(),
+        folder: note.folder.clone(),
+        filter: note.haystack(),
+        edited: relative_time(note.edited(), now),
+        snippet: note
+            .summary
+            .map(|summary| summary.snippet.clone())
+            .unwrap_or_default(),
+        ink: note.summary.is_some_and(|summary| summary.has_ink),
+        done: note.summary.map_or(0, |summary| summary.done_tasks),
+        total: note.summary.map_or(0, NoteSummary::total_tasks),
+        open: note
+            .summary
+            .map(|summary| summary.open_tasks.clone())
+            .unwrap_or_default(),
+        words: note.summary.map(|summary| summary.words),
+    };
+    let folders = inner
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == inkstone_workspace::WorkspaceEntryKind::Folder)
+        .count();
+    let summaries = inner.note_summaries.values();
+    let open_tasks: usize = summaries
+        .clone()
+        .map(|summary| summary.open_tasks.len())
+        .sum();
+    let inked = summaries.filter(|summary| summary.has_ink).count();
+    let mut stats = vec![plural(inner.search_documents.len(), "note", "notes")];
+    if folders > 0 {
+        stats.push(plural(folders, "folder", "folders"));
     }
+    if open_tasks > 0 {
+        stats.push(plural(open_tasks, "open task", "open tasks"));
+    }
+    if inked > 0 {
+        stats.push(format!("{inked} with ink"));
+    }
+    let list = list_view();
+    Home {
+        name: inner.workspace_name.clone(),
+        stats: stats.join(" · "),
+        can_edit: crate::can_edit_workspace(inner),
+        sort,
+        list,
+        tags: inner
+            .knowledge
+            .get_all_tags_with_counts()
+            .into_iter()
+            .take(16)
+            .collect(),
+        tag: tagged.map(|(tag, _)| tag.to_string()),
+        recent: if tagged.is_some() || list {
+            Vec::new()
+        } else {
+            inner
+                .recent_notes
+                .iter()
+                .filter_map(|path| notes.iter().find(|note| note.path == path))
+                .take(RECENT_SHOWN)
+                .map(card)
+                .collect()
+        },
+        notes: notes.iter().map(card).collect(),
+    }
+}
+
+fn open(path: &str) -> impl Fn(web_sys::MouseEvent) + 'static {
+    let path = path.to_string();
+    move |_| crate::ui::driver().select_entry(&path)
+}
+
+pub(crate) fn view(ui: Ui) -> impl IntoView {
+    move || ui.home.get().map(|home| page(ui, home))
+}
+
+fn page(ui: Ui, home: Home) -> AnyView {
+    let head = view! {
+        <header class="home-head">
+            <div class="home-heading">
+                <h1 class="home-title">{home.name.clone()}</h1>
+                <p class="home-stats">{home.stats.clone()}</p>
+            </div>
+            {home.can_edit.then(|| view! {
+                <button
+                    class="home-new-btn"
+                    on:click=|_| {
+                        let driver = crate::ui::driver();
+                        if driver.0.borrow().client_state.has_pending_intent() {
+                            return;
+                        }
+                        state().create.set(Some(Create::default()));
+                        driver.0.borrow_mut().sidebar_open = true;
+                        driver.render();
+                    }
+                >
+                    {svg("plus", "icon")}
+                    <span>"New note"</span>
+                </button>
+            })}
+        </header>
+    };
+    if home.notes.is_empty() && home.tag.is_none() {
+        return view! {
+            <section class="home" aria-label="Home">
+                {head}
+                <div class="home-empty">
+                    <h2>"Nothing here yet"</h2>
+                    <p>"Start a note to write, sketch, or plan. Everything you make shows up here."</p>
+                </div>
+            </section>
+        }
+        .into_any();
+    }
+    let query = Memo::new(move |_| ui.home_filter.with(|query| query.trim().to_lowercase()));
+    let shown = move |text: &str| {
+        query.with(|query| query.split_whitespace().all(|word| text.contains(word)))
+    };
+    let filters = home
+        .notes
+        .iter()
+        .map(|note| note.filter.clone())
+        .collect::<Vec<_>>();
+    let count = Memo::new(move |_| filters.iter().filter(|text| shown(text)).count());
+    let sorts = Sort::ALL.map(|(option, key, label)| {
+        view! {
+            <button
+                class="home-seg"
+                data-home-sort=key
+                aria-pressed=crate::ui::bool_str(option == home.sort)
+                on:click=move |_| {
+                    store(SORT_KEY, key);
+                    refresh();
+                }
+            >
+                {label}
+            </button>
+        }
+    });
+    let views = [("cards", "grid", "Cards"), ("list", "list", "List")].map(|(key, icon, label)| {
+        view! {
+            <button
+                class="home-seg home-seg-icon"
+                data-home-view=key
+                aria-label=label
+                title=label
+                aria-pressed=crate::ui::bool_str((key == "list") == home.list)
+                on:click=move |_| {
+                    store(VIEW_KEY, key);
+                    refresh();
+                }
+            >
+                {svg(icon, "icon")}
+            </button>
+        }
+    });
+    let pick = move |tag: Option<String>| {
+        move |_: web_sys::MouseEvent| {
+            ui.home_tag.set(tag.clone());
+            refresh();
+        }
+    };
+    let tags = (!home.tags.is_empty()).then(|| {
+        let chips = home.tags.iter().map(|(tag, count)| {
+            view! {
+                <button
+                    class="home-tag"
+                    data-home-tag=tag.clone()
+                    aria-pressed=crate::ui::bool_str(home.tag.as_ref() == Some(tag))
+                    on:click=pick(Some(tag.clone()))
+                >
+                    <span>{format!("#{tag}")}</span>
+                    <span class="home-tag-count">{count.to_string()}</span>
+                </button>
+            }
+        });
+        view! {
+            <div class="home-tags">
+                <button
+                    class="home-tag"
+                    data-home-tag=""
+                    aria-pressed=crate::ui::bool_str(home.tag.is_none())
+                    on:click=pick(None)
+                >
+                    "All"
+                </button>
+                {chips.collect_view()}
+            </div>
+        }
+    });
+    let recent = (!home.recent.is_empty()).then(|| {
+        let items = home.recent.iter().map(|note| {
+            view! {
+                <button class="home-recent-item" data-path=note.path.clone() on:click=open(&note.path)>
+                    {svg("file", "icon")}
+                    <span class="home-recent-text">
+                        <span class="home-recent-title">{note.title.clone()}</span>
+                        <span class="home-recent-meta">{note.edited.clone()}</span>
+                    </span>
+                </button>
+            }
+        });
+        view! {
+            <section class="home-section home-recent-section" hidden=move || !query.with(String::is_empty)>
+                <h2 class="home-section-title">"Jump back in"</h2>
+                <div class="home-recent">{items.collect_view()}</div>
+            </section>
+        }
+    });
+    let notes = if home.list {
+        table(&home.notes, shown).into_any()
+    } else {
+        grid(&home.notes, shown).into_any()
+    };
+    let tasks = home
+        .notes
+        .iter()
+        .flat_map(|note| note.open.iter().map(move |task| (note, task)))
+        .collect::<Vec<_>>();
+    let tasks = (!tasks.is_empty()).then(|| {
+        let expanded = RwSignal::new(false);
+        let total = tasks.len();
+        let items = tasks.into_iter().enumerate().map(|(index, (note, task))| {
+            let filter = format!("{} {}", task.to_lowercase(), note.filter);
+            view! {
+                <li data-overflow=(index >= TASKS_SHOWN).then_some("") hidden=move || !shown(&filter)>
+                    <button class="home-task" data-path=note.path.clone() on:click=open(&note.path)>
+                        <span class="home-task-box"></span>
+                        <span class="home-task-text">{task.clone()}</span>
+                        <span class="home-task-note">{note.title.clone()}</span>
+                    </button>
+                </li>
+            }
+        });
+        view! {
+            <section class=move || if expanded.get() { "home-section home-tasks-expanded" } else { "home-section" }>
+                <h2 class="home-section-title">
+                    "Open tasks "
+                    <span class="home-all-count-static">{total.to_string()}</span>
+                </h2>
+                <ul class="home-tasks">{items.collect_view()}</ul>
+                {move || (total > TASKS_SHOWN && !expanded.get()).then(|| view! {
+                    <button class="home-tasks-more" on:click=move |_| expanded.set(true)>
+                        {format!("Show all {total}")}
+                    </button>
+                })}
+            </section>
+        }
+    });
+    view! {
+        <section class="home" aria-label="Home">
+            {head}
+            <div class="home-toolbar">
+                <label class="home-filter-wrap">
+                    {svg("search", "icon")}
+                    <input
+                        type="search"
+                        class="home-filter"
+                        placeholder="Filter notes"
+                        aria-label="Filter notes"
+                        data-focus-key="home-filter"
+                        prop:value=move || ui.home_filter.get()
+                        on:input=move |event| ui.home_filter.set(event_target_value(&event))
+                    />
+                </label>
+                <div class="home-controls">
+                    <div class="home-segmented" role="group" aria-label="Sort by">
+                        {sorts.into_iter().collect_view()}
+                    </div>
+                    <div class="home-segmented" role="group" aria-label="Show as">
+                        {views.into_iter().collect_view()}
+                    </div>
+                </div>
+            </div>
+            {tags}
+            {recent}
+            <section class="home-section">
+                <h2 class="home-section-title">
+                    {match &home.tag {
+                        Some(tag) => format!("Tagged #{tag} "),
+                        None => "All notes ".to_string(),
+                    }}
+                    <span class="home-all-count">{move || count.get().to_string()}</span>
+                </h2>
+                {notes}
+                <p class="home-no-match" hidden={move || count.get() > 0}>
+                    "No notes match that filter."
+                </p>
+            </section>
+            {tasks}
+        </section>
+    }
+    .into_any()
+}
+
+fn table(
+    notes: &[Card],
+    shown: impl Fn(&str) -> bool + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    let rows = notes.iter().map(|note| {
+        let filter = note.filter.clone();
+        let total = note.total;
+        view! {
+            <tr class="home-row" data-path=note.path.clone() data-note="" hidden=move || !shown(&filter)>
+                <td>
+                    <div class="home-row-name">
+                        <button class="home-open" data-path=note.path.clone() on:click=open(&note.path)>
+                            {note.title.clone()}
+                        </button>
+                        {note.ink.then(|| view! { <span class="home-badge">"Ink"</span> })}
+                    </div>
+                </td>
+                <td class="home-col-folder">{note.folder.clone()}</td>
+                <td class="home-col-edited">{note.edited.clone()}</td>
+                <td class="home-col-num">
+                    {(total > 0).then(|| format!("{}/{total}", note.done))}
+                </td>
+                <td class="home-col-num home-col-words">{note.words.map(|words| words.to_string())}</td>
+            </tr>
+        }
+    });
+    let heads = [
+        ("Name", ""),
+        ("Folder", "home-col-folder"),
+        ("Edited", ""),
+        ("Tasks", "home-col-num"),
+        ("Words", "home-col-num home-col-words"),
+    ]
+    .map(|(label, class)| view! { <th class=class scope="col">{label}</th> });
+    view! {
+        <div class="home-table-wrap">
+            <table class="home-table">
+                <thead>
+                    <tr>{heads.into_iter().collect_view()}</tr>
+                </thead>
+                <tbody>{rows.collect_view()}</tbody>
+            </table>
+        </div>
+    }
+}
+
+fn grid(
+    notes: &[Card],
+    shown: impl Fn(&str) -> bool + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    let cards = notes.iter().map(|note| {
+        let filter = note.filter.clone();
+        let total = note.total;
+        let blank = note.snippet.is_empty();
+        view! {
+            <button
+                class="home-card"
+                data-path=note.path.clone()
+                data-note=""
+                hidden=move || !shown(&filter)
+                on:click=open(&note.path)
+            >
+                {(!note.folder.is_empty()).then(|| view! { <span class="home-card-folder">{note.folder.clone()}</span> })}
+                <span class="home-card-title">{note.title.clone()}</span>
+                <span class=if blank { "home-card-snippet home-card-blank" } else { "home-card-snippet" }>
+                    {if blank { "Empty page".to_string() } else { note.snippet.clone() }}
+                </span>
+                <span class="home-card-meta">
+                    <span>{note.edited.clone()}</span>
+                    {note.ink.then(|| view! { <span class="home-badge">"Ink"</span> })}
+                    {(total > 0).then(|| view! {
+                        <span class="home-badge" data-done=note.open.is_empty().then_some("true")>
+                            {format!("{}/{total} done", note.done)}
+                        </span>
+                    })}
+                </span>
+            </button>
+        }
+    });
+    view! { <div class="home-grid">{cards.collect_view()}</div> }
 }
 
 #[cfg(test)]

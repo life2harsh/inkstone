@@ -704,8 +704,6 @@ pub struct DriverInner {
     pub sidebar_open: bool,
     pub settings_open: bool,
     pub settings_category: String,
-    home_filter: String,
-    home_tag: Option<String>,
     pub deferred_navigation: Option<String>,
     pub pending_focus_key: Option<String>,
     local_mode: bool,
@@ -882,8 +880,6 @@ impl Driver {
                 migrated_docs: HashSet::new(),
                 sidebar_open: false,
                 settings_open: false,
-                home_filter: String::new(),
-                home_tag: None,
                 settings_category: "General".to_string(),
                 deferred_navigation: None,
                 pending_focus_key: None,
@@ -10335,9 +10331,6 @@ impl Driver {
         let main_content = app_container.children().item(1).unwrap();
         let page = main_content.last_element_child().unwrap();
         page.set_text_content(None);
-        if selected_path.is_none() && storage_error.is_none() {
-            page.append_child(&self.render_home(&document)).unwrap();
-        }
         let _ = main_content.set_attribute("data-scroll-key", &inner.selected_doc_id.to_string());
         main_content.set_class_name(if inner.document_mode == DocumentMode::Preview {
             "main-content preview-mode"
@@ -10868,15 +10861,6 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
                     return;
                 }
 
-                if class == "home-filter" {
-                    let input: &web_sys::HtmlInputElement = el.unchecked_ref();
-                    d_input.0.borrow_mut().home_filter = input.value();
-                    if let Some(home) = el.closest(".home").ok().flatten() {
-                        home::apply_filter(&home, &input.value());
-                    }
-                    return;
-                }
-
                 if class == "invite-email" {
                     let input: web_sys::HtmlInputElement = el.unchecked_into();
                     d_input.0.borrow_mut().invite_email = input.value();
@@ -11024,52 +11008,11 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
             return;
         }
         if el
-            .closest(".sidebar, .workspace-topbar, .inspector")
+            .closest(".sidebar, .workspace-topbar, .inspector, .home")
             .ok()
             .flatten()
             .is_some()
         {
-            return;
-        }
-        if let Some(target) = el.closest(".home [data-path]").ok().flatten() {
-            if let Some(path) = target.get_attribute("data-path") {
-                d_click.select_entry(&path);
-            }
-            return;
-        }
-        if let Some(target) = el
-            .closest("[data-home-sort], [data-home-view], [data-home-tag]")
-            .ok()
-            .flatten()
-        {
-            if let Some(sort) = target.get_attribute("data-home-sort") {
-                home::set_sort(&sort);
-            } else if let Some(view) = target.get_attribute("data-home-view") {
-                home::set_view(&view);
-            } else if let Some(tag) = target.get_attribute("data-home-tag") {
-                d_click.0.borrow_mut().home_tag = (!tag.is_empty()).then_some(tag);
-            }
-            d_click.render();
-            return;
-        }
-        if el.closest(".home-tasks-more").ok().flatten().is_some() {
-            if let Some(list) = el.closest(".home-section").ok().flatten() {
-                let _ = list.class_list().add_1("home-tasks-expanded");
-            }
-            let _ = el
-                .closest(".home-tasks-more")
-                .ok()
-                .flatten()
-                .map(|button| button.remove());
-            return;
-        }
-        if el.closest(".home-new-btn").ok().flatten().is_some() {
-            if d_click.0.borrow().client_state.has_pending_intent() {
-                return;
-            }
-            ui::state().create.set(Some(ui::Create::default()));
-            d_click.0.borrow_mut().sidebar_open = true;
-            d_click.render();
             return;
         }
         if el.closest(".live-toggle-btn").ok().flatten().is_some() {

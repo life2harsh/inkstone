@@ -124,6 +124,9 @@ impl Default for Panel {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Ui {
+    pub home: RwSignal<Option<crate::home::Home>>,
+    pub home_filter: RwSignal<String>,
+    pub home_tag: RwSignal<Option<String>>,
     pub tab: RwSignal<Tab>,
     inspector_open: RwSignal<bool>,
     panel: RwSignal<Panel>,
@@ -245,6 +248,7 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                         {sidebar(ui)}
                         <div class="main-content">
                             {header(ui)}
+                            {crate::home::view(ui)}
                             <div class="page-host" style="display: contents"></div>
                         </div>
                         {inspector(ui)}
@@ -365,6 +369,11 @@ pub(crate) fn publish(driver: &Driver, inner: &DriverInner) {
     );
 
     put(ui.inspector_open, inner.inspector_open);
+    put(
+        ui.home,
+        (inner.selected_path.is_none() && inner.storage_error.is_none())
+            .then(|| crate::home::snapshot(inner, ui.home_tag.get_untracked().as_deref())),
+    );
     put(ui.panel, panel_of(ui.tab.get_untracked(), inner));
 
     let modal = inner.settings_open || inner.new_vault.is_some();
