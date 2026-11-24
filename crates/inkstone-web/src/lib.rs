@@ -33,6 +33,7 @@ mod page_editing;
 mod page_export;
 mod page_files;
 mod page_history;
+mod page_morph;
 pub mod page_surface;
 mod page_touch;
 mod pdf_pages;
@@ -9376,8 +9377,8 @@ impl Driver {
             && phase != SessionPhase::Error;
 
         let main_content = app_container.children().item(1).unwrap();
-        let page = main_content.last_element_child().unwrap();
-        page.set_text_content(None);
+        let live_page = main_content.last_element_child().unwrap();
+        let page = document.create_element("div").unwrap();
         let _ = main_content.set_attribute("data-scroll-key", &inner.selected_doc_id.to_string());
         main_content.set_class_name(if inner.document_mode == DocumentMode::Preview {
             "main-content preview-mode"
@@ -9700,6 +9701,7 @@ impl Driver {
             page.append_child(&err_state).unwrap();
         }
 
+        page_morph::morph(&live_page, &page, document.active_element().as_ref());
         self.mount_ink_blocks(
             &view_doc,
             &inner.ink_tool,

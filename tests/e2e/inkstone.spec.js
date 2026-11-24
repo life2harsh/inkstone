@@ -408,6 +408,7 @@ async function openNote(page, path, title) {
   await file.click();
   await expect(page.locator('.breadcrumb')).toHaveText(path);
   await expect(page.locator('.document-title-input')).toHaveValue(title);
+  await expect(page.locator('.loading-state, .closed-state')).toHaveCount(0);
 }
 
 function failOnBrowserErrors(page) {
@@ -736,6 +737,20 @@ test('inline $math$ renders as MathML inside text', async ({ page }) => {
   await createNote(page, 'InlineMath.md', 'Inline math', 'Energy $E = mc^2$ costs $5 or $10.');
   await expect(page.locator('.page-rendered .math-inline math')).toHaveCount(1);
   await expect(page.locator('.page-rendered')).toContainText('costs $5 or $10.');
+});
+
+test('editing one block leaves the other blocks untouched', async ({ page }) => {
+  await createNote(page, 'Steady blocks.md', 'Steady blocks', '# Heading\n\nFirst paragraph.\n\nSecond paragraph.\n\n$$x^2$$');
+  const blocks = page.locator('.page-surface > .page-block');
+  await expect(blocks).toHaveCount(4);
+  await page.evaluate(() => document.querySelectorAll('.page-surface > .page-block').forEach((block, index) => { block.__mark = index; }));
+  await page.locator('.page-rendered p', { hasText: 'First paragraph.' }).click();
+  await expect(page.locator('.page-source')).toBeFocused();
+  await page.keyboard.type(' More.');
+  await closeSource(page);
+  await expect.poll(() => pageMarkdown(page)).toContain('First paragraph. More.');
+  const marks = await page.evaluate(() => [...document.querySelectorAll('.page-surface > .page-block')].map(block => block.__mark ?? null));
+  expect(marks).toEqual([0, null, 2, 3]);
 });
 
 test('checklist boxes tick from the page and undo restores them', async ({ page }) => {
@@ -1227,6 +1242,7 @@ test('typing below a tall picture never moves the page', async ({ page }, testIn
   const source = page.locator('.page-source:focus');
   await expect(source).toHaveCount(1);
   await page.keyboard.type('line one', { delay: 30 });
+  await expect(page.locator('.page-surface img[data-asset-path]')).toHaveCount(1);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(500);
   await page.evaluate(() => {

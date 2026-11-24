@@ -475,51 +475,7 @@ impl Driver {
             return;
         };
         live.set_class_name(&fresh.class_name());
-        let active_id = closest(active, "[data-page-block-id]")
-            .filter(|section| section.parent_element().as_ref() == Some(&live))
-            .and_then(|section| {
-                section
-                    .get_attribute("data-page-block-id")
-                    .map(|id| (section, id))
-            });
-        let keep = active_id.as_ref().map(|(section, _)| section.clone());
-        let children = live.children();
-        for index in (0..children.length()).rev() {
-            if let Some(child) = children.item(index) {
-                if Some(&child) != keep.as_ref() {
-                    child.remove();
-                }
-            }
-        }
-        let fresh_children = fresh.children();
-        let incoming: Vec<web_sys::Element> = (0..fresh_children.length())
-            .filter_map(|index| fresh_children.item(index))
-            .collect();
-        let mut passed = false;
-        for child in incoming {
-            match &active_id {
-                Some((section, id))
-                    if child.get_attribute("data-page-block-id").as_deref() == Some(id) =>
-                {
-                    passed = true;
-                    if let (Ok(Some(old)), Ok(Some(new))) = (
-                        section.query_selector(":scope > .page-gutter"),
-                        child.query_selector(":scope > .page-gutter"),
-                    ) {
-                        let _ = old.replace_with_with_node_1(&new);
-                    }
-                }
-                Some((section, _)) if !passed => {
-                    let _ = live.insert_before(&child, Some(section));
-                }
-                _ => {
-                    let _ = live.append_child(&child);
-                }
-            }
-        }
-        if let (Some((section, _)), false) = (&active_id, passed) {
-            section.remove();
-        }
+        crate::page_morph::morph(&live, &fresh, Some(active));
         self.hydrate_markdown_assets(document);
         self.layout_page();
     }
@@ -1018,6 +974,7 @@ impl Driver {
             blur_page_source();
             self.0.borrow_mut().editing_block = None;
         }
+        let _ = checkbox.unchecked_ref::<web_sys::HtmlElement>().blur();
         self.history_boundary();
         self.ensure_text_target(TextTarget::Markdown(block_id));
         self.dispatch_text_edit(TextTarget::Markdown(block_id), &text, &next);
@@ -1117,7 +1074,12 @@ impl Driver {
                 let inner = self.0.borrow();
                 let doc = Driver::effective_document(&inner);
                 doc.blocks.last().map(|block| match &block.content {
-                    BlockContent::Markdown { text } => {
+                    BlockContent::Markdown { text }
+                        if !text
+                            .lines()
+                            .rfind(|line| !line.trim().is_empty())
+                            .is_some_and(|line| line.trim_start().starts_with("![")) =>
+                    {
                         (block.id, Some(text.encode_utf16().count() as u32))
                     }
                     _ => (block.id, None),

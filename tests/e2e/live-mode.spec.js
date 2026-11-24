@@ -34,6 +34,8 @@ async function openFile(page, path) {
   await expect(file.or(folder)).toBeVisible({ timeout: 30_000 });
   if (!(await file.isVisible())) await folder.click();
   await file.click();
+  await expect(page.locator('.page-surface')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('.loading-state, .closed-state')).toHaveCount(0);
 }
 
 // A device that has been unlocked once stays unlocked until sign out.
