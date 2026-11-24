@@ -152,57 +152,62 @@ pub fn reset() {
 }
 
 /// One labelled row of choices per preference.
-pub fn render_controls(document: &web_sys::Document) -> web_sys::Element {
-    let list = document.create_element("div").unwrap();
-    list.set_class_name("prefs-list");
-    for pref in PREFS {
-        let row = document.create_element("div").unwrap();
-        row.set_class_name("prefs-row");
-        let label = document.create_element("span").unwrap();
-        label.set_class_name("prefs-label");
-        label.set_text_content(Some(pref.label));
-        row.append_child(&label).unwrap();
-
-        let group = document.create_element("div").unwrap();
-        group.set_class_name(if pref.swatches {
-            "prefs-swatches"
-        } else {
-            "prefs-choices"
-        });
-        group.set_attribute("role", "group").unwrap();
-        group.set_attribute("aria-label", pref.label).unwrap();
-        let current = get(pref.key);
-        for (value, name) in pref.options {
-            let button = document.create_element("button").unwrap();
-            button.set_class_name(if pref.swatches {
-                "pref-choice pref-swatch"
-            } else {
-                "pref-choice"
-            });
-            button.set_attribute("data-pref-key", pref.key).unwrap();
-            button.set_attribute("data-pref-value", value).unwrap();
-            button
-                .set_attribute(
-                    "aria-pressed",
-                    if current == *value { "true" } else { "false" },
-                )
-                .unwrap();
-            if pref.swatches {
-                button.set_attribute("aria-label", name).unwrap();
-                button.set_attribute("title", name).unwrap();
-            } else {
-                button.set_text_content(Some(name));
+pub fn controls(changed: impl Fn() + Copy + Send + Sync + 'static) -> impl leptos::IntoView {
+    use leptos::prelude::*;
+    let tick = RwSignal::new(0u32);
+    let rows = PREFS.iter().map(|pref| {
+        let choices = pref.options.iter().map(|(value, name)| {
+            view! {
+                <button
+                    class=if pref.swatches { "pref-choice pref-swatch" } else { "pref-choice" }
+                    data-pref-key=pref.key
+                    data-pref-value=*value
+                    aria-pressed=move || {
+                        tick.track();
+                        if get(pref.key) == *value { "true" } else { "false" }
+                    }
+                    aria-label=pref.swatches.then_some(*name)
+                    title=pref.swatches.then_some(*name)
+                    on:click=move |_| {
+                        if set(pref.key, value) {
+                            tick.update(|tick| *tick += 1);
+                            changed();
+                        }
+                    }
+                >
+                    {(!pref.swatches).then_some(*name)}
+                </button>
             }
-            group.append_child(&button).unwrap();
+        });
+        view! {
+            <div class="prefs-row">
+                <span class="prefs-label">{pref.label}</span>
+                <div
+                    class=if pref.swatches { "prefs-swatches" } else { "prefs-choices" }
+                    role="group"
+                    aria-label=pref.label
+                >
+                    {choices.collect_view()}
+                </div>
+            </div>
         }
-        row.append_child(&group).unwrap();
-        list.append_child(&row).unwrap();
+    });
+    view! {
+        <div class="prefs-list">
+            {rows.collect_view()}
+            <button
+                class="pref-reset settings-row-action"
+                on:click=move |_| {
+                    reset();
+                    crate::theme::persist_and_apply(crate::theme::ThemePreference::System);
+                    tick.update(|tick| *tick += 1);
+                    changed();
+                }
+            >
+                "Reset to defaults"
+            </button>
+        </div>
     }
-    let reset = document.create_element("button").unwrap();
-    reset.set_class_name("pref-reset settings-row-action");
-    reset.set_text_content(Some("Reset to defaults"));
-    list.append_child(&reset).unwrap();
-    list
 }
 
 #[cfg(test)]

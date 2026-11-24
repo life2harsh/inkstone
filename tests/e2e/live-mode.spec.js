@@ -177,6 +177,8 @@ test.describe('Live mode and accounts', () => {
     await staysUnlocked(owner);
     await openFile(owner, path);
     await expect(owner.locator('.live-toggle-btn')).toHaveAttribute('aria-pressed', 'true', { timeout: 20_000 });
+    await owner.context().close();
+    await guest.context().close();
   });
 
   test('note text typed on a laptop and a phone reaches the other live', async ({ browser }, testInfo) => {
@@ -215,6 +217,8 @@ test.describe('Live mode and accounts', () => {
     await expect(laptop.locator('.page-surface')).toContainText('Then the phone', { timeout: 15_000 });
     await expect(laptop.locator('.sync-status')).toHaveText('Encrypted sync is live');
     await expect(phone.locator('.sync-status')).toHaveText('Encrypted sync is live');
+    await phone.context().close();
+    await laptop.context().close();
   });
 
   test('fast typing and ink drawn on a laptop and a phone at once all survive', async ({ browser }, testInfo) => {

@@ -8,8 +8,8 @@ use leptos::prelude::{GetUntracked, Set, Update};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{
-    AuthPhase, Driver, DriverInner, WorkspaceMetadata, api, can_manage_members, crypto,
-    decrypt_workspace_metadata, icons, workspace_key_metadata,
+    AuthPhase, Driver, DriverInner, WorkspaceMetadata, api, crypto, decrypt_workspace_metadata,
+    workspace_key_metadata,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,7 @@ impl VaultAccess {
         VaultAccess::Public,
     ];
 
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             VaultAccess::Private => "private",
             VaultAccess::Shared => "shared",
@@ -46,7 +46,7 @@ impl VaultAccess {
         }
     }
 
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             VaultAccess::Private => "Private",
             VaultAccess::Shared => "Shared",
@@ -54,7 +54,7 @@ impl VaultAccess {
         }
     }
 
-    fn choice_text(self) -> &'static str {
+    pub(crate) fn choice_text(self) -> &'static str {
         match self {
             VaultAccess::Private => "Only you can open it.",
             VaultAccess::Shared => "People you invite. You'll pick them next.",
@@ -65,7 +65,7 @@ impl VaultAccess {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewVaultDraft {
     pub name: String,
     pub access: VaultAccess,
@@ -100,7 +100,7 @@ struct GuestSession {
 }
 
 const GUEST_NAME_KEY: &str = "inkstone.guest-name";
-const MAX_GUEST_NAME_CHARS: usize = 60;
+pub(crate) const MAX_GUEST_NAME_CHARS: usize = 60;
 
 fn guest_session_key(workspace_id: uuid::Uuid) -> String {
     format!("guest-session:{workspace_id}")
@@ -155,69 +155,6 @@ fn decrypt_guest_name(
     .ok()
     .and_then(|bytes| String::from_utf8(bytes).ok())
     .and_then(|name| clean_guest_name(&name))
-}
-
-pub fn render_guest_join(document: &web_sys::Document, card: &web_sys::Element, join: &GuestJoin) {
-    card.append_child(&text(document, "h2", "", "Join as a guest"))
-        .unwrap();
-    card.append_child(&text(
-        document,
-        "p",
-        "auth-help",
-        "You can edit this vault without an account. Pick a name so others know who wrote what.",
-    ))
-    .unwrap();
-    let label = text(document, "label", "", "Your name");
-    label.set_attribute("for", "guest-name").unwrap();
-    card.append_child(&label).unwrap();
-    let input = element(document, "input", "guest-name");
-    input.set_id("guest-name");
-    input.set_attribute("type", "text").unwrap();
-    input.set_attribute("autocomplete", "nickname").unwrap();
-    input
-        .set_attribute("maxlength", &MAX_GUEST_NAME_CHARS.to_string())
-        .unwrap();
-    input.set_attribute("data-focus-key", "guest-name").unwrap();
-    input
-        .dyn_ref::<web_sys::HtmlInputElement>()
-        .unwrap()
-        .set_value(&join.name);
-    card.append_child(&input).unwrap();
-    if let Some(error) = &join.error {
-        let line = text(document, "p", "auth-error", error);
-        line.set_attribute("role", "alert").unwrap();
-        card.append_child(&line).unwrap();
-    }
-    let actions = element(document, "div", "guest-join-actions");
-    let join_button = text(
-        document,
-        "button",
-        "primary-btn guest-join-btn",
-        if join.busy { "Joining…" } else { "Join" },
-    );
-    join_button.set_attribute("type", "button").unwrap();
-    join_button
-        .set_attribute("data-vault-action", "guest-join")
-        .unwrap();
-    let view_button = text(document, "button", "text-btn guest-view-btn", "Just read");
-    view_button.set_attribute("type", "button").unwrap();
-    view_button
-        .set_attribute("data-vault-action", "guest-view")
-        .unwrap();
-    if join.busy {
-        join_button.set_attribute("disabled", "").unwrap();
-        view_button.set_attribute("disabled", "").unwrap();
-    }
-    actions.append_child(&join_button).unwrap();
-    actions.append_child(&view_button).unwrap();
-    card.append_child(&actions).unwrap();
-    card.append_child(&text(
-        document,
-        "p",
-        "settings-note",
-        "Your name is encrypted with the vault, so the server can't read it either.",
-    ))
-    .unwrap();
 }
 
 pub fn access_summary(workspace: &WorkspaceResponse) -> String {
@@ -286,350 +223,69 @@ fn current_workspace(inner: &DriverInner) -> Option<&WorkspaceResponse> {
         .find(|workspace| Some(workspace.id) == inner.workspace_id)
 }
 
-fn element(document: &web_sys::Document, tag: &str, class: &str) -> web_sys::Element {
-    let element = document.create_element(tag).unwrap();
-    if !class.is_empty() {
-        element.set_class_name(class);
-    }
-    element
-}
-
-fn text(document: &web_sys::Document, tag: &str, class: &str, value: &str) -> web_sys::Element {
-    let element = element(document, tag, class);
-    element.set_text_content(Some(value));
-    element
-}
-
-fn action_button(
-    document: &web_sys::Document,
-    class: &str,
-    action: &str,
-    icon: Option<&str>,
-    label: &str,
-) -> web_sys::Element {
-    let button = element(document, "button", class);
-    button.set_attribute("type", "button").unwrap();
-    button.set_attribute("data-vault-action", action).unwrap();
-    if let Some(icon) = icon {
-        button.append_child(&icons::icon(document, icon)).unwrap();
-    }
-    button
-        .append_child(&text(document, "span", "", label))
-        .unwrap();
-    button
-}
-
-pub fn render_new_vault_dialog(
-    document: &web_sys::Document,
-    draft: &NewVaultDraft,
-) -> web_sys::Element {
-    let backdrop = element(document, "div", "settings-backdrop new-vault-backdrop");
-    let dialog = element(document, "section", "new-vault-dialog");
-    dialog.set_attribute("role", "dialog").unwrap();
-    dialog.set_attribute("aria-modal", "true").unwrap();
-    dialog
-        .set_attribute("aria-labelledby", "new-vault-title")
-        .unwrap();
-    let heading = text(document, "h2", "", "New vault");
-    heading.set_id("new-vault-title");
-    dialog.append_child(&heading).unwrap();
-    dialog
-        .append_child(&text(
-            document,
-            "p",
-            "new-vault-intro",
-            "A vault is a separate space with its own notes, folders and people. Everything in it is end-to-end encrypted.",
-        ))
-        .unwrap();
-    let label = text(document, "label", "new-vault-label", "Name");
-    label.set_attribute("for", "new-vault-name").unwrap();
-    dialog.append_child(&label).unwrap();
-    let input = element(document, "input", "new-vault-name");
-    input.set_id("new-vault-name");
-    input.set_attribute("maxlength", "200").unwrap();
-    input.set_attribute("autocomplete", "off").unwrap();
-    input
-        .set_attribute("placeholder", "Research, Journal, Team wiki…")
-        .unwrap();
-    input
-        .set_attribute("data-focus-key", "new-vault-name")
-        .unwrap();
-    input
-        .dyn_ref::<web_sys::HtmlInputElement>()
-        .unwrap()
-        .set_value(&draft.name);
-    dialog.append_child(&input).unwrap();
-    let group_label = text(document, "p", "new-vault-label", "Who can open it");
-    group_label.set_id("new-vault-access-label");
-    dialog.append_child(&group_label).unwrap();
-    let choices = element(document, "div", "vault-access-choices");
-    choices.set_attribute("role", "radiogroup").unwrap();
-    choices
-        .set_attribute("aria-labelledby", "new-vault-access-label")
-        .unwrap();
-    for access in VaultAccess::ALL {
-        let selected = access == draft.access;
-        let choice = element(document, "button", "vault-access-choice");
-        choice.set_attribute("type", "button").unwrap();
-        choice.set_attribute("role", "radio").unwrap();
-        choice
-            .set_attribute("aria-checked", if selected { "true" } else { "false" })
-            .unwrap();
-        choice.set_attribute("data-vault-action", "access").unwrap();
-        choice.set_attribute("data-access", access.key()).unwrap();
-        choice
-            .set_attribute("data-focus-key", &format!("vault-access-{}", access.key()))
-            .unwrap();
-        choice
-            .append_child(&icons::icon(document, access.icon()))
-            .unwrap();
-        let body = element(document, "span", "vault-access-text");
-        body.append_child(&text(document, "strong", "", access.title()))
-            .unwrap();
-        body.append_child(&text(document, "span", "", access.choice_text()))
-            .unwrap();
-        choice.append_child(&body).unwrap();
-        choices.append_child(&choice).unwrap();
-    }
-    dialog.append_child(&choices).unwrap();
-    if let Some(error) = &draft.error {
-        let error_line = text(document, "p", "settings-error", error);
-        error_line.set_attribute("role", "alert").unwrap();
-        dialog.append_child(&error_line).unwrap();
-    }
-    let actions = element(document, "div", "new-vault-actions");
-    actions
-        .append_child(&action_button(
-            document,
-            "text-btn",
-            "close-new",
-            None,
-            "Cancel",
-        ))
-        .unwrap();
-    let create = action_button(
-        document,
-        "primary-btn new-vault-create",
-        "create",
-        None,
-        if draft.busy {
-            "Creating…"
-        } else {
-            "Create vault"
-        },
-    );
-    if draft.busy {
-        create.set_attribute("disabled", "").unwrap();
-    }
-    actions.append_child(&create).unwrap();
-    dialog.append_child(&actions).unwrap();
-    backdrop.append_child(&dialog).unwrap();
-    backdrop
-}
-
-/// Who can open the vault, and its public link, at the top of Sharing.
-pub fn render_access_section(
-    document: &web_sys::Document,
-    content: &web_sys::Element,
-    inner: &DriverInner,
-) {
-    let Some(workspace) = current_workspace(inner) else {
-        return;
-    };
-    let access = access_of(workspace);
-    let summary = element(document, "div", "sharing-access");
-    summary.set_attribute("data-access", access.key()).unwrap();
-    summary
-        .append_child(&icons::icon(document, access.icon()))
-        .unwrap();
-    let body = element(document, "div", "sharing-access-text");
-    body.append_child(&text(document, "strong", "", access.title()))
-        .unwrap();
-    let people = workspace.member_count;
-    let detail = match access {
-        VaultAccess::Private => {
-            "Only you can open this vault. Invite people or turn on a public link to share it."
-                .to_string()
-        }
-        VaultAccess::Shared => format!("{people} people can open this vault."),
-        VaultAccess::Public => {
-            let reach = if workspace.public_link_editable {
-                "Anyone with the link can edit this vault as a guest."
-            } else {
-                "Anyone with the link can read this vault."
-            };
-            let mut detail = reach.to_string();
-            if people > 1 {
-                detail.push_str(&format!(" {people} people can also open it as members."));
+pub(crate) fn new_vault_view(ui: crate::ui::Ui) -> impl leptos::IntoView {
+    use leptos::prelude::*;
+    let open = Memo::new(move |_| ui.new_vault.with(Option::is_some));
+    let draft = Memo::new(move |_| ui.new_vault.get());
+    let access = move || draft.with(|draft| draft.as_ref().map(|draft| draft.access));
+    let busy = move || draft.with(|draft| draft.as_ref().is_some_and(|draft| draft.busy));
+    move || {
+        open.get().then(|| {
+            let name = draft.with_untracked(|draft| draft.as_ref().map(|draft| draft.name.clone()));
+            let choices = VaultAccess::ALL.map(|choice| {
+                view! {
+                    <button
+                        type="button"
+                        class="vault-access-choice"
+                        role="radio"
+                        aria-checked=move || crate::ui::bool_str(access() == Some(choice))
+                        data-vault-action="access"
+                        data-access=choice.key()
+                        data-focus-key=format!("vault-access-{}", choice.key())
+                    >
+                        {crate::icons::svg(choice.icon(), "icon")}
+                        <span class="vault-access-text">
+                            <strong>{choice.title()}</strong>
+                            <span>{choice.choice_text()}</span>
+                        </span>
+                    </button>
+                }
+            });
+            view! {
+                <div class="settings-backdrop new-vault-backdrop">
+                    <section class="new-vault-dialog" role="dialog" aria-modal="true" aria-labelledby="new-vault-title">
+                        <h2 id="new-vault-title">"New vault"</h2>
+                        <p class="new-vault-intro">
+                            "A vault is a separate space with its own notes, folders and people. Everything in it is end-to-end encrypted."
+                        </p>
+                        <label class="new-vault-label" for="new-vault-name">"Name"</label>
+                        <input
+                            id="new-vault-name"
+                            class="new-vault-name"
+                            maxlength="200"
+                            autocomplete="off"
+                            placeholder="Research, Journal, Team wiki…"
+                            data-focus-key="new-vault-name"
+                            prop:value=name.unwrap_or_default()
+                        />
+                        <p id="new-vault-access-label" class="new-vault-label">"Who can open it"</p>
+                        <div class="vault-access-choices" role="radiogroup" aria-labelledby="new-vault-access-label">
+                            {choices.into_iter().collect_view()}
+                        </div>
+                        {move || draft.with(|draft| draft.as_ref().and_then(|draft| draft.error.clone())).map(|error| view! {
+                            <p class="settings-error" role="alert">{error}</p>
+                        })}
+                        <div class="new-vault-actions">
+                            <button type="button" class="text-btn" data-vault-action="close-new">"Cancel"</button>
+                            <button type="button" class="primary-btn new-vault-create" data-vault-action="create" disabled=busy>
+                                {move || if busy() { "Creating…" } else { "Create vault" }}
+                            </button>
+                        </div>
+                    </section>
+                </div>
             }
-            match workspace.guest_count {
-                0 => {}
-                1 => detail.push_str(" 1 guest has joined."),
-                guests => detail.push_str(&format!(" {guests} guests have joined.")),
-            }
-            detail
-        }
-    };
-    body.append_child(&text(document, "span", "", &detail))
-        .unwrap();
-    summary.append_child(&body).unwrap();
-    content.append_child(&summary).unwrap();
-
-    content
-        .append_child(&text(document, "h4", "", "Public link"))
-        .unwrap();
-    content
-        .append_child(&text(
-            document,
-            "p",
-            "settings-description",
-            "Anyone with the link can open every note and file in this vault, without an account. Let them edit and they join as a guest under a name they pick. The key is part of the link, so the server still can't read anything.",
-        ))
-        .unwrap();
-    let admin = can_manage_members(inner);
-    let link = element(document, "div", "public-link-row");
-    if workspace.public_link {
-        match (&inner.workspace_public_link, inner.workspace_key) {
-            (Some(token), Some(key)) => {
-                let url = element(document, "input", "public-link-url");
-                url.set_attribute("readonly", "").unwrap();
-                url.set_attribute("aria-label", "Public link").unwrap();
-                url.dyn_ref::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .set_value(&link_url(token, &key));
-                link.append_child(&url).unwrap();
-                link.append_child(&action_button(
-                    document,
-                    "settings-row-action",
-                    "link-copy",
-                    Some("copy"),
-                    "Copy link",
-                ))
-                .unwrap();
-            }
-            _ => {
-                link.append_child(&text(
-                    document,
-                    "p",
-                    "settings-note",
-                    "The link is on, but it was made somewhere this device can't read. Reset it to get a new one.",
-                ))
-                .unwrap();
-            }
-        }
+        })
     }
-    content.append_child(&link).unwrap();
-    if workspace.public_link {
-        let access = element(document, "div", "link-access");
-        access.set_attribute("role", "radiogroup").unwrap();
-        access
-            .set_attribute("aria-label", "Anyone with the link can")
-            .unwrap();
-        access
-            .append_child(&text(
-                document,
-                "span",
-                "link-access-label",
-                "Anyone with the link can",
-            ))
-            .unwrap();
-        for (editable, icon, label) in [(false, "eye", "Read"), (true, "pencil", "Edit")] {
-            let selected = workspace.public_link_editable == editable;
-            let choice = action_button(
-                document,
-                if selected {
-                    "link-access-choice selected"
-                } else {
-                    "link-access-choice"
-                },
-                "link-access",
-                Some(icon),
-                label,
-            );
-            choice.set_attribute("role", "radio").unwrap();
-            choice
-                .set_attribute("aria-checked", if selected { "true" } else { "false" })
-                .unwrap();
-            choice
-                .set_attribute("data-editable", if editable { "true" } else { "false" })
-                .unwrap();
-            if !admin || inner.public_link_busy {
-                choice.set_attribute("disabled", "").unwrap();
-            }
-            access.append_child(&choice).unwrap();
-        }
-        content.append_child(&access).unwrap();
-    }
-    if admin {
-        let actions = element(document, "div", "public-link-actions");
-        let busy = inner.public_link_busy;
-        let mut buttons = Vec::new();
-        if workspace.public_link {
-            buttons.push(action_button(
-                document,
-                "settings-row-action",
-                "link-enable",
-                None,
-                "Reset link",
-            ));
-            buttons.push(action_button(
-                document,
-                "settings-row-action danger-action",
-                "link-disable",
-                None,
-                "Turn off link",
-            ));
-        } else {
-            buttons.push(action_button(
-                document,
-                "settings-row-action",
-                "link-enable",
-                Some("globe"),
-                "Create public link",
-            ));
-        }
-        for button in buttons {
-            if busy {
-                button.set_attribute("disabled", "").unwrap();
-            }
-            actions.append_child(&button).unwrap();
-        }
-        content.append_child(&actions).unwrap();
-    } else {
-        content
-            .append_child(&text(
-                document,
-                "p",
-                "settings-note",
-                "Only owners and admins can change the public link.",
-            ))
-            .unwrap();
-    }
-    if let Some(status) = &inner.public_link_status {
-        let line = text(document, "p", "copy-status", status);
-        line.set_attribute("role", "status").unwrap();
-        content.append_child(&line).unwrap();
-    }
-    content
-        .append_child(&text(document, "h4", "", "People with access"))
-        .unwrap();
-}
-
-pub fn render_link_unavailable(
-    document: &web_sys::Document,
-    card: &web_sys::Element,
-    message: &str,
-) {
-    card.append_child(&text(document, "h2", "", "This link isn't available"))
-        .unwrap();
-    card.append_child(&text(document, "p", "auth-help", message))
-        .unwrap();
-    let open = text(document, "a", "primary-btn link-home-btn", "Open Inkstone");
-    let home = web_sys::window()
-        .and_then(|window| window.location().pathname().ok())
-        .unwrap_or_else(|| "/".into());
-    open.set_attribute("href", &home).unwrap();
-    card.append_child(&open).unwrap();
 }
 
 impl Driver {

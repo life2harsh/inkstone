@@ -55,40 +55,46 @@ pub fn persist_and_apply(preference: ThemePreference) {
         let _ = storage.set_item(THEME_KEY, preference.as_str());
     }
     apply(preference);
+    leptos::prelude::Set::set(&chosen(), preference);
 }
 
-pub fn render_control(document: &web_sys::Document, class_name: &str) -> web_sys::Element {
-    let group = document.create_element("div").unwrap();
-    group.set_class_name(class_name);
-    group.set_attribute("role", "group").unwrap();
-    group.set_attribute("aria-label", "Color theme").unwrap();
-    let current = current();
-    for (preference, label) in [
+fn chosen() -> leptos::prelude::ArcRwSignal<ThemePreference> {
+    thread_local! {
+        static CHOSEN: leptos::prelude::ArcRwSignal<ThemePreference> =
+            leptos::prelude::ArcRwSignal::new(current());
+    }
+    CHOSEN.with(Clone::clone)
+}
+
+pub fn control(class: &'static str) -> impl leptos::IntoView + use<> {
+    use leptos::prelude::*;
+    let choices = [
         (ThemePreference::System, "System"),
         (ThemePreference::Light, "Light"),
         (ThemePreference::Dark, "Dark"),
         (ThemePreference::Paper, "Paper"),
         (ThemePreference::Midnight, "Midnight"),
-    ] {
-        let button = document.create_element("button").unwrap();
-        button.set_class_name("theme-choice");
-        button
-            .set_attribute("data-theme-choice", preference.as_str())
-            .unwrap();
-        button
-            .set_attribute(
-                "aria-pressed",
-                if current == preference {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .unwrap();
-        button.set_text_content(Some(label));
-        group.append_child(&button).unwrap();
+    ]
+    .map(|(preference, label)| {
+        view! {
+            <button
+                class="theme-choice"
+                data-theme-choice=preference.as_str()
+                aria-pressed={
+                    let theme = chosen();
+                    move || if theme.get() == preference { "true" } else { "false" }
+                }
+                on:click=move |_| persist_and_apply(preference)
+            >
+                {label}
+            </button>
+        }
+    });
+    view! {
+        <div class=class role="group" aria-label="Color theme">
+            {choices.into_iter().collect_view()}
+        </div>
     }
-    group
 }
 
 #[cfg(test)]

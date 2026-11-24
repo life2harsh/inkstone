@@ -124,6 +124,9 @@ impl Default for Panel {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Ui {
+    pub auth: RwSignal<Option<crate::auth::Auth>>,
+    pub new_vault: RwSignal<Option<crate::vaults::NewVaultDraft>>,
+    pub settings: RwSignal<Option<crate::settings::Settings>>,
     pub home: RwSignal<Option<crate::home::Home>>,
     pub home_filter: RwSignal<String>,
     pub home_tag: RwSignal<Option<String>>,
@@ -242,7 +245,14 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                     .expect("app container")
                     .unchecked_into();
                 root.append_child(&app).expect("mount app container");
+                let auth: web_sys::HtmlElement = document()
+                    .create_element("div")
+                    .expect("auth host")
+                    .unchecked_into();
+                auth.style().set_property("display", "contents").expect("auth host style");
+                root.append_child(&auth).expect("mount auth host");
                 let ui = state();
+                leptos::mount::mount_to(auth, move || crate::auth::view(ui)).forget();
                 leptos::mount::mount_to(app.clone(), move || {
                     view! {
                         {sidebar(ui)}
@@ -259,6 +269,8 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                                 <button class="drawer-backdrop" aria-label="Close panels" on:click=|_| close_panels()></button>
                             })
                         }}
+                        {crate::settings::view(ui)}
+                        {crate::vaults::new_vault_view(ui)}
                     }
                 })
                 .forget();
@@ -370,6 +382,14 @@ pub(crate) fn publish(driver: &Driver, inner: &DriverInner) {
 
     put(ui.inspector_open, inner.inspector_open);
     put(
+        ui.settings,
+        inner
+            .settings_open
+            .then(|| crate::settings::snapshot(inner)),
+    );
+    put(ui.new_vault, inner.new_vault.clone());
+    put(ui.auth, crate::auth::snapshot(inner));
+    put(
         ui.home,
         (inner.selected_path.is_none() && inner.storage_error.is_none())
             .then(|| crate::home::snapshot(inner, ui.home_tag.get_untracked().as_deref())),
@@ -380,6 +400,7 @@ pub(crate) fn publish(driver: &Driver, inner: &DriverInner) {
     let closed_drawer = viewport_width() <= 760.0 && !inner.sidebar_open;
     SHELL.with(|shell| {
         let Some(app) = shell.get() else { return };
+        app.set_hidden(!inner.local_mode && inner.auth_phase != crate::AuthPhase::Ready);
         app.set_class_name(
             match (inner.sidebar_open, inner.local_persistence_error.is_some()) {
                 (true, true) => "app-container sidebar-open save-failed",
@@ -389,6 +410,9 @@ pub(crate) fn publish(driver: &Driver, inner: &DriverInner) {
             },
         );
         let children = app.children();
+        if let Some(main) = children.item(1) {
+            let _ = main.toggle_attribute_with_force("inert", modal);
+        }
         for (index, hidden) in [(0, closed_drawer), (2, !inner.inspector_open)] {
             if let Some(panel) = children.item(index) {
                 let _ = panel.toggle_attribute_with_force("inert", hidden || modal);
