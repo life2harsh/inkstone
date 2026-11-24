@@ -863,11 +863,9 @@ impl Driver {
                 pending_selection: None,
                 recent_notes_revision: 0,
                 missing_note: None,
-                ink_tool: saved_brush
-                    .as_ref()
-                    .map_or_else(|| "pen".to_string(), |brush| brush.0.clone()),
-                ink_brush_width: saved_brush.as_ref().map_or(3.0, |brush| brush.1),
-                ink_brush_color: saved_brush.as_ref().map_or((31, 41, 55), |brush| brush.2),
+                ink_tool: saved_brush.0,
+                ink_brush_width: saved_brush.1,
+                ink_brush_color: saved_brush.2,
                 ink_panel_open: false,
                 expanded_ink_block: None,
                 editing_block: None,

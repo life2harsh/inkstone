@@ -1465,6 +1465,33 @@ test('a tablet pen clicks and types in Type mode and only draws with an ink tool
   expect(strokeCount(await pageInk(page))).toBe(1);
 });
 
+test('pen and highlighter keep their own color and size', async ({ page }) => {
+  await createNote(page, 'Brushes.md', 'Brushes', 'Some text.');
+  const panel = page.locator('.ink-panel');
+  const setBrush = async (tool, color, size) => {
+    await chooseInkTool(page, tool);
+    await page.locator(`.ink-dock [data-page-ink="tool"][data-tool="${tool}"]`).click();
+    await expect(panel).toBeVisible();
+    await panel.locator(`[data-color="${color}"]`).click();
+    await panel.locator('.ink-size-slider').fill(String(size));
+    await expect(panel.locator('.ink-size-value')).toHaveText(String(size));
+  };
+  const expectBrush = async (tool, color, size) => {
+    await chooseInkTool(page, tool);
+    await page.locator(`.ink-dock [data-page-ink="tool"][data-tool="${tool}"]`).click();
+    await expect(panel.locator('.ink-size-value')).toHaveText(String(size));
+    await expect(panel.locator(`[data-color="${color}"]`)).toHaveAttribute('aria-pressed', 'true');
+  };
+  await setBrush('pen', '37,99,235', 6);
+  await expectBrush('highlighter', '234,179,8', 14);
+  await setBrush('highlighter', '22,163,74', 20);
+  await expectBrush('pen', '37,99,235', 6);
+  await page.reload();
+  await openNote(page, 'Brushes.md', 'Brushes');
+  await expectBrush('highlighter', '22,163,74', 20);
+  await expectBrush('pen', '37,99,235', 6);
+});
+
 test('images and PDF pages stay on screen while the page redraws', async ({ page }) => {
   await createNote(page, 'Steady.md', 'Steady', 'Above the picture.');
   const chooser = page.waitForEvent('filechooser');

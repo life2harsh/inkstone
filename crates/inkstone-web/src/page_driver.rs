@@ -111,34 +111,58 @@ fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
-pub(crate) fn load_brush() -> Option<(String, f32, (u8, u8, u8))> {
-    let value = local_storage()?.get_item(BRUSH_KEY).ok().flatten()?;
-    let mut parts = value.split('|');
-    let tool = parts.next()?.to_string();
-    if !DOCK_TOOLS.iter().any(|(name, _)| *name == tool) {
-        return None;
-    }
-    let width = parts.next()?.parse::<f32>().ok()?;
-    if !width.is_finite() {
-        return None;
-    }
-    let rgb = parts
-        .next()?
+fn parse_brush(value: &str) -> Option<(f32, (u8, u8, u8))> {
+    let (width, rgb) = value.split_once('|')?;
+    let width = width
+        .parse::<f32>()
+        .ok()
+        .filter(|width| width.is_finite())?;
+    let rgb = rgb
         .split(',')
         .filter_map(|part| part.parse::<u8>().ok())
         .collect::<Vec<_>>();
     let [r, g, b] = rgb[..] else {
         return None;
     };
-    Some((tool, width.clamp(MIN_BRUSH, MAX_BRUSH), (r, g, b)))
+    Some((width.clamp(MIN_BRUSH, MAX_BRUSH), (r, g, b)))
+}
+
+pub(crate) fn tool_brush(tool: &str) -> (f32, (u8, u8, u8)) {
+    let storage = local_storage();
+    let saved = |key: String| storage.as_ref()?.get_item(&key).ok().flatten();
+    saved(format!("{BRUSH_KEY}.{tool}"))
+        .and_then(|value| parse_brush(&value))
+        .or_else(|| {
+            saved(BRUSH_KEY.to_string())?
+                .strip_prefix(&format!("{tool}|"))
+                .and_then(parse_brush)
+        })
+        .unwrap_or(if tool == "highlighter" {
+            (14.0, (234, 179, 8))
+        } else {
+            (3.0, (31, 41, 55))
+        })
+}
+
+pub(crate) fn load_brush() -> (String, f32, (u8, u8, u8)) {
+    let tool = local_storage()
+        .and_then(|storage| storage.get_item(BRUSH_KEY).ok().flatten())
+        .and_then(|value| value.split('|').next().map(str::to_string))
+        .filter(|tool| DOCK_TOOLS.iter().any(|(name, _)| name == tool))
+        .unwrap_or_else(|| "pen".into());
+    let (width, color) = tool_brush(if tool_draws(&tool) { &tool } else { "pen" });
+    (tool, width, color)
 }
 
 fn save_brush(tool: &str, width: f32, color: (u8, u8, u8)) {
     if let Some(storage) = local_storage() {
-        let _ = storage.set_item(
-            BRUSH_KEY,
-            &format!("{tool}|{width}|{},{},{}", color.0, color.1, color.2),
-        );
+        let _ = storage.set_item(BRUSH_KEY, tool);
+        if tool_draws(tool) {
+            let _ = storage.set_item(
+                &format!("{BRUSH_KEY}.{tool}"),
+                &format!("{width}|{},{},{}", color.0, color.1, color.2),
+            );
+        }
     }
 }
 
@@ -1156,6 +1180,9 @@ impl Driver {
                     inner.ink_panel_open = !inner.ink_panel_open;
                 } else {
                     inner.ink_panel_open = false;
+                }
+                if inner.ink_tool != tool && tool_draws(&tool) {
+                    (inner.ink_brush_width, inner.ink_brush_color) = tool_brush(&tool);
                 }
                 inner.ink_tool = tool;
                 inner.ink_mode = true;
