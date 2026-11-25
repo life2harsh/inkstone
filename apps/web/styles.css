@@ -2152,8 +2152,24 @@ kbd,
 
 .ink-panel-colors {
   display: grid;
-  grid-template-columns: repeat(8, 1fr);
+  grid-template-columns: repeat(9, 1fr);
   gap: 8px;
+}
+
+.ink-panel-color.ink-panel-custom {
+  position: relative;
+  cursor: pointer;
+  background: radial-gradient(circle, var(--swatch) 0 38%, transparent 40%),
+    conic-gradient(red, yellow, lime, cyan, blue, magenta, red);
+}
+
+.ink-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .ink-panel-color {

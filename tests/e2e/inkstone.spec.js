@@ -1505,6 +1505,26 @@ test('the style panel sets ink color and a variable size that persists', async (
   await expect(page.locator('.ink-panel-color[data-color="124,58,237"]')).toHaveClass(/active/);
 });
 
+test('the style panel picks any color, like bright yellow', async ({ page }) => {
+  await createNote(page, 'AnyColor.md', 'Any color', 'Write beside this line.');
+  await chooseInkTool(page);
+  await page.locator('.ink-dock-style').click();
+  await page.getByLabel('Any color').fill('#ffee00');
+  await expect(page.locator('.ink-panel-custom')).toHaveClass(/active/);
+  await expect(page.locator('.ink-panel-color.active')).toHaveCount(1);
+  await expect(page.locator('.ink-panel')).toBeVisible();
+  await drawOver(page, page.locator('.page-rendered p'));
+  await expect.poll(async () => strokeCount(await pageInk(page))).toBe(1);
+  expect((await pageInk(page)).stonepen_json).toMatch(/"r":\s*255(\.0)?,\s*"g":\s*238(\.0)?,\s*"b":\s*0(\.0)?/);
+  await page.reload();
+  await openNote(page, 'AnyColor.md', 'Any color');
+  await chooseInkTool(page);
+  await page.locator('.ink-dock-style').click();
+  await expect(page.getByLabel('Any color')).toHaveValue('#ffee00');
+  await expect(page.locator('.ink-panel-custom')).toHaveClass(/active/);
+  expect(page.__browserErrors).toEqual([]);
+});
+
 test('ink beside a line follows it while the block is still being typed in', async ({ page }) => {
   await createNote(page, 'LiveAnchors.md', 'Live anchors', '- alpha\n- beta\n- gamma');
   await chooseInkTool(page);

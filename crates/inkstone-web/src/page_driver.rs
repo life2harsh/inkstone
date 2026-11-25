@@ -679,6 +679,23 @@ impl Driver {
             }
             colors.append_child(&swatch).unwrap();
         }
+        let custom = element(document, "label", "ink-panel-color ink-panel-custom");
+        custom.set_attribute("title", "Any color").unwrap();
+        custom
+            .set_attribute("style", &format!("--swatch: rgb({rgb})"))
+            .unwrap();
+        if !DOCK_COLORS.iter().any(|(_, value)| *value == rgb) {
+            custom.class_list().add_1("active").unwrap();
+        }
+        let picker = element(document, "input", "ink-color-input");
+        picker.set_attribute("type", "color").unwrap();
+        picker.set_attribute("aria-label", "Any color").unwrap();
+        let (r, g, b) = inner.ink_brush_color;
+        picker
+            .set_attribute("value", &format!("#{r:02x}{g:02x}{b:02x}"))
+            .unwrap();
+        custom.append_child(&picker).unwrap();
+        colors.append_child(&custom).unwrap();
         panel.append_child(&colors).unwrap();
 
         let size = element(document, "label", "ink-panel-size");
@@ -705,6 +722,38 @@ impl Driver {
         size.append_child(&value).unwrap();
         panel.append_child(&size).unwrap();
         panel
+    }
+
+    pub(crate) fn preview_brush_color(&self, hex: &str) {
+        let Ok(value) = u32::from_str_radix(hex.trim_start_matches('#'), 16) else {
+            return;
+        };
+        let color = ((value >> 16) as u8, (value >> 8) as u8, value as u8);
+        let width = {
+            let mut inner = self.0.borrow_mut();
+            inner.ink_brush_color = color;
+            inner.ink_brush_width
+        };
+        if let Some(document) = web_sys::window().and_then(|window| window.document())
+            && let Ok(swatches) = document.query_selector_all(".ink-panel-color")
+        {
+            for index in 0..swatches.length() {
+                if let Some(swatch) = swatches
+                    .item(index)
+                    .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+                {
+                    let custom = swatch.class_list().contains("ink-panel-custom");
+                    let _ = swatch.class_list().toggle_with_force("active", custom);
+                    if custom {
+                        let _ = swatch.set_attribute(
+                            "style",
+                            &format!("--swatch: rgb({},{},{})", color.0, color.1, color.2),
+                        );
+                    }
+                }
+            }
+        }
+        self.preview_brush_width(width);
     }
 
     pub(crate) fn preview_brush_width(&self, width: f32) {
@@ -1757,6 +1806,12 @@ pub(crate) fn install_page_listeners(
         let Some(target) = event_element(&event) else {
             return;
         };
+        if target.class_list().contains("ink-color-input") {
+            if let Ok(picker) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                d.preview_brush_color(&picker.value());
+            }
+            return;
+        }
         if target.class_list().contains("ink-size-slider") {
             if let Ok(slider) = target.dyn_into::<web_sys::HtmlInputElement>() {
                 d.preview_brush_width(slider.value_as_number() as f32);
