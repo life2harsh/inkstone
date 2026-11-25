@@ -30,6 +30,10 @@ fn paths(name: &str) -> &'static str {
             r#"<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>"#
         }
         "check" => r#"<path d="M20 6 9 17l-5-5"/>"#,
+        "comment" => {
+            r#"<path d="M21 11.5a8.4 8.4 0 0 1-12.3 7.5L3 20.5l1.6-5.2A8.4 8.4 0 1 1 21 11.5Z"/>"#
+        }
+        "send" => r#"<path d="m21 3-7.5 18-3.2-7.3L3 10.5Z"/><path d="m21 3-10.7 10.7"/>"#,
         "chevrons-up-down" => r#"<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>"#,
         "copy" => {
             r#"<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
@@ -216,6 +220,8 @@ mod tests {
             "highlighter",
             "eraser",
             "lasso",
+            "comment",
+            "send",
             "undo",
             "redo",
             "text",

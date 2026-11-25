@@ -85,11 +85,12 @@ fn tool_draws(tool: &str) -> bool {
     matches!(tool, "pen" | "pencil" | "highlighter")
 }
 
-const DOCK_TOOLS: [(&str, &str); 4] = [
+const DOCK_TOOLS: [(&str, &str); 5] = [
     ("pen", "Pen"),
     ("highlighter", "Highlighter"),
     ("eraser", "Eraser"),
     ("lasso", "Lasso"),
+    ("comment", "Comment"),
 ];
 const DOCK_COLORS: [(&str, &str); 8] = [
     ("Ink", "31,41,55"),
@@ -155,7 +156,7 @@ pub(crate) fn load_brush() -> (String, f32, (u8, u8, u8)) {
 }
 
 fn save_brush(tool: &str, width: f32, color: (u8, u8, u8)) {
-    if let Some(storage) = local_storage() {
+    if let Some(storage) = local_storage().filter(|_| tool != "comment") {
         let _ = storage.set_item(BRUSH_KEY, tool);
         if tool_draws(tool) {
             let _ = storage.set_item(
@@ -798,6 +799,7 @@ impl Driver {
                 if let Some(page) = registry.page.as_mut() {
                     page.configure(&tool, width, color);
                     page.layout(view_doc, inner.text_client_state.as_ref(), editing);
+                    crate::comments::publish(page, view_doc, &inner);
                 }
             }
         }
@@ -882,6 +884,7 @@ impl Driver {
         };
         let doc = Driver::effective_document(&inner);
         page.layout(&doc, inner.text_client_state.as_ref(), inner.editing_block);
+        crate::comments::publish(page, &doc, &inner);
     }
 
     fn update_page_view(&self) {
@@ -993,12 +996,24 @@ impl Driver {
         let Some(target) = event_element(event) else {
             return false;
         };
+        if closest(&target, ".comment-layer").is_some() {
+            return false;
+        }
         if let Some(action) = closest(&target, "[data-page-ink]") {
             self.page_ink_action(&action);
             return true;
         }
         if !self.page_editable() {
             return false;
+        }
+        let commenting = {
+            let inner = self.0.borrow();
+            inner.ink_mode && inner.ink_tool == "comment"
+        };
+        if commenting && closest(&target, ".page-surface").is_some() {
+            event.prevent_default();
+            self.place_comment(f64::from(event.client_x()), f64::from(event.client_y()));
+            return true;
         }
         let editing = self.0.borrow().editing_block;
         let in_editing_block = editing.is_some_and(|id| {
@@ -1268,7 +1283,7 @@ impl Driver {
                 &target,
                 ".ink-dock-wrap, .page-gutter, .page-insert, .workspace-topbar, \
                  .document-header-card, .missing-note-prompt, button, select, \
-                 .settings-overlay, .sidebar, .inspector",
+                 .settings-overlay, .sidebar, .inspector, .comment-layer",
             )
             .is_some()
             {
@@ -1284,7 +1299,7 @@ impl Driver {
                 f64::from(event.client_x()),
                 f64::from(event.client_y()),
             );
-            let finger_draws = !tool_draws(&tool) || !page_touch::pen_seen();
+            let finger_draws = (!tool_draws(&tool) || !page_touch::pen_seen()) && tool != "comment";
             if count > 1 || !finger_draws {
                 self.cancel_page_gesture();
                 if !page_touch::panning() {
@@ -1293,6 +1308,9 @@ impl Driver {
                 event.prevent_default();
                 return;
             }
+        }
+        if tool == "comment" {
+            return;
         }
         self.ensure_page_text_targets();
         let started = {
@@ -1326,6 +1344,25 @@ impl Driver {
             page_touch::start_pan();
             event.prevent_default();
         }
+    }
+
+    fn place_comment(&self, x: f64, y: f64) {
+        self.ensure_page_text_targets();
+        let anchor = {
+            let mut guard = self.0.borrow_mut();
+            let inner = &mut *guard;
+            let doc = Driver::effective_document(inner);
+            let editing = inner.editing_block;
+            let Ok(mut registry) = self.1.try_borrow_mut() else {
+                return;
+            };
+            let Some(page) = registry.page.as_mut() else {
+                return;
+            };
+            page.comment_anchor_at((x, y), &doc, inner.text_client_state.as_mut(), editing)
+        };
+        crate::comments::start_draft(anchor);
+        self.layout_page();
     }
 
     fn cancel_page_gesture(&self) {

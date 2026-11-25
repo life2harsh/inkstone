@@ -753,6 +753,112 @@ test('editing one block leaves the other blocks untouched', async ({ page }) => 
   expect(marks).toEqual([0, null, 2, 3]);
 });
 
+async function docComments(page) {
+  return page.evaluate(async () => {
+    const module = await import('/pkg/inkstone_web.js');
+    return Object.values(JSON.parse(module.active_document_json_for_test?.() ?? '{}').comments ?? {});
+  });
+}
+
+async function placeComment(page, word, body) {
+  await chooseInkTool(page, 'comment');
+  const box = await wordBox(page, word);
+  await page.mouse.click((box.left + box.right) / 2, (box.top + box.bottom) / 2);
+  const draft = page.locator('.comment-card[aria-label="New comment"] .comment-input');
+  await expect(draft).toBeFocused();
+  await page.keyboard.type(body);
+  await page.locator('.comment-card .comment-btn.primary').click();
+  await expect(page.locator('.comment-card[aria-label="Comment thread"]')).toBeVisible();
+  return box;
+}
+
+test('comments pin to words, thread replies, follow the text, and survive reload', async ({ page }) => {
+  await createNote(page, 'Comments.md', 'Comments', '# Plan\n\nShip the comment boxes soon.');
+  const box = await placeComment(page, 'boxes', 'Is this ready?');
+  const pin = page.locator('.comment-pin:not(.draft)');
+  await expect(pin).toHaveCount(1);
+  const pinBox = await pin.boundingBox();
+  expect(Math.abs(pinBox.x - (box.left + box.right) / 2)).toBeLessThan(8);
+  expect(Math.abs(pinBox.y + pinBox.height - box.top)).toBeLessThan(8);
+
+  const reply = page.locator('.comment-card .comment-input[aria-label="Reply"]');
+  await reply.click();
+  await page.keyboard.type('Almost. Backspace stays here');
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator('.comment-card .comment-entry')).toHaveCount(2);
+  await expect(page.locator('.comment-card .comment-body').nth(1)).toHaveText('Almost. Backspace stays her');
+  await expect(pin.locator('.comment-pin-count')).toHaveText('2');
+  await expect.poll(async () => (await docComments(page)).length).toBe(2);
+  await expect.poll(() => pageMarkdown(page)).toBe('# Plan\n\nShip the comment boxes soon.');
+
+  const second = page.locator('.comment-card .comment-entry').nth(1);
+  await second.hover();
+  await second.locator('[aria-label="Edit comment"]').click();
+  const edit = second.locator('textarea[aria-label="Edit comment"]');
+  await expect(edit).toBeFocused();
+  await edit.fill('Almost there.');
+  await second.locator('.comment-btn.primary').click();
+  await expect(page.locator('.comment-card .comment-body').nth(1)).toHaveText('Almost there.');
+  await expect(page.locator('.comment-card .comment-entry').nth(1)).toContainText('edited');
+
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.comment-card')).toHaveCount(0);
+  await chooseTyping(page);
+  const before = await wordBox(page, 'boxes');
+  const source = await openSource(page, 'markdown', 1);
+  await source.press('Home');
+  await page.keyboard.type('Please ');
+  await closeSource(page);
+  const after = await wordBox(page, 'boxes');
+  expect(after.left - before.left).toBeGreaterThan(20);
+  const moved = await pin.boundingBox();
+  expect(Math.abs(moved.x - pinBox.x - (after.left - before.left))).toBeLessThan(8);
+
+  await saved(page);
+  await page.reload();
+  await openNote(page, 'Comments.md', 'Comments');
+  await expect(pin).toHaveCount(1);
+  await pin.click();
+  await expect(page.locator('.comment-card .comment-entry')).toHaveCount(2);
+  await expect(page.locator('.comment-card .comment-body').first()).toHaveText('Is this ready?');
+});
+
+test('comments resolve into the inspector list and delete with a second click', async ({ page }) => {
+  await createNote(page, 'Review.md', 'Review', 'First point to check.\n\nSecond point to check.');
+  await placeComment(page, 'Second', 'Needs a source.');
+  await page.locator('.comment-card [aria-label="Resolve thread"]').click();
+  await expect(page.locator('.comment-card')).toHaveCount(0);
+  await expect(page.locator('.comment-pin')).toHaveCount(0);
+  await expect.poll(async () => (await docComments(page))[0]?.resolved).toBe(true);
+
+  await ensureInspectorOpen(page);
+  await page.locator('.inspector-tab[data-tab="Comments"]').click();
+  await expect(page.locator('.comment-list-item')).toHaveCount(0);
+  await page.locator('.comment-filter input').check();
+  const item = page.locator('.comment-list-item');
+  await expect(item).toHaveCount(1);
+  await expect(item).toContainText('Needs a source.');
+  await item.click();
+  const card = page.locator('.comment-card[aria-label="Comment thread"]');
+  await expect(card).toBeVisible();
+  await expect(card.locator('.comment-card-title')).toHaveText('Resolved');
+  await card.locator('[aria-label="Reopen thread"]').click();
+  await expect(card.locator('.comment-card-title')).toHaveText('Comment');
+
+  const remove = card.locator('.comment-entry').first().locator('.comment-icon-btn.danger');
+  await card.locator('.comment-entry').first().hover();
+  await remove.click();
+  await expect(remove).toHaveText('Delete?');
+  await expect.poll(async () => (await docComments(page)).length).toBe(1);
+  await remove.click();
+  await expect(page.locator('.comment-card')).toHaveCount(0);
+  await expect(page.locator('.comment-pin')).toHaveCount(0);
+  await expect.poll(async () => (await docComments(page)).length).toBe(0);
+  await ensureInspectorOpen(page);
+  await expect(page.locator('.comment-empty')).toBeVisible();
+});
+
 test('checklist boxes tick from the page and undo restores them', async ({ page }) => {
   await createNote(page, 'Todo.md', 'Todo', '- [ ] milk\n- [ ] eggs\n> - [x] quoted');
   const boxes = page.locator('.page-rendered input.task-toggle');
@@ -913,7 +1019,7 @@ test('keyboard journey reaches search, files, inspector tabs, and restored contr
   await expect(page.locator('.inspector-tab[data-tab="Outline"]')).toBeFocused();
   await expect(page.locator('.inspector-tab[data-tab="Outline"]')).toHaveAttribute('aria-selected', 'true');
   await page.keyboard.press('End');
-  await expect(page.locator('.inspector-tab[data-tab="Graph"]')).toBeFocused();
+  await expect(page.locator('.inspector-tab[data-tab="Comments"]')).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(page.locator('.inspector')).not.toHaveClass(/open/);
   await expect(inspectorToggle).toBeFocused();
@@ -1650,7 +1756,7 @@ test('knowledge navigation resolves outlines, links, backlinks, and tags', async
   await ensureWorkspaceOpen(page);
   await page.locator('.recent-item[data-path="Home.md"]').click();
   await ensureInspectorOpen(page);
-  await page.locator('.inspector-tab[data-tab="Backlinks"]').click();
+  await page.locator('.inspector-tab[data-tab="Links"]').click();
   await expect(page.locator('.inspector-section')).toContainText('Notes label');
   await expect(page.locator('.inspector-section')).toContainText('Home context');
   await page.locator('.inspector-tab[data-tab="Tags"]').click();
@@ -1705,8 +1811,8 @@ test('populated research notebook is durable and composed', async ({ page }, tes
   await expect(page.locator('.page-source')).toHaveCount(0);
 
   await ensureInspectorOpen(page);
-  await page.locator('.inspector-tab[data-tab="Backlinks"]').click();
-  await expect(page.locator('.inspector-section[data-section="backlinks"] .backlink-context')).toHaveCount(7);
+  await page.locator('.inspector-tab[data-tab="Links"]').click();
+  await expect(page.locator('.inspector-section[data-section="links"] .backlink-context')).toHaveCount(7);
   await expect(page.locator('.inspector-section')).toContainText('Research/Conjugate Priors.md');
   if (!isMobile) {
     await page.screenshot({ path: '/tmp/inkstone-rc-proof/preview-backlinks.png', fullPage: true });

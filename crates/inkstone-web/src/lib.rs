@@ -15,6 +15,7 @@ pub struct MissingNoteRequest {
 
 mod api;
 mod auth;
+mod comments;
 mod crypto;
 pub mod explorer;
 mod home;

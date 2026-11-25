@@ -77,17 +77,25 @@ pub(crate) enum Tab {
     Outline,
     Tags,
     Graph,
+    Comments,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Backlinks, Tab::Outline, Tab::Tags, Tab::Graph];
+    const ALL: [Tab; 5] = [
+        Tab::Backlinks,
+        Tab::Outline,
+        Tab::Tags,
+        Tab::Graph,
+        Tab::Comments,
+    ];
 
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Tab::Backlinks => "Backlinks",
+            Tab::Backlinks => "Links",
             Tab::Outline => "Outline",
             Tab::Tags => "Tags",
             Tab::Graph => "Graph",
+            Tab::Comments => "Comments",
         }
     }
 }
@@ -114,6 +122,7 @@ enum Panel {
     Links(Option<Vec<Link>>, Option<Vec<(String, String, String)>>),
     Tags(Vec<String>, Vec<(String, usize)>),
     Graph(LocalGraph),
+    Comments,
 }
 
 impl Default for Panel {
@@ -151,6 +160,10 @@ pub(crate) struct Ui {
     pub expanded: RwSignal<HashSet<String>>,
     pub create: RwSignal<Option<Create>>,
     pub renaming: RwSignal<Option<String>>,
+    pub comments: RwSignal<crate::comments::Pins>,
+    pub comment_open: RwSignal<Option<inkstone_core::CommentId>>,
+    pub comment_draft: RwSignal<Option<inkstone_core::InkAnchor>>,
+    pub show_resolved: RwSignal<bool>,
 }
 
 impl Ui {
@@ -205,7 +218,7 @@ pub(crate) fn state() -> Ui {
     UI.with(|cell| *cell.get_or_init(Ui::default))
 }
 
-fn put<T: PartialEq + Send + Sync + 'static>(signal: RwSignal<T>, value: T) {
+pub(crate) fn put<T: PartialEq + Send + Sync + 'static>(signal: RwSignal<T>, value: T) {
     if signal.with_untracked(|current| *current != value) {
         signal.set(value);
     }
@@ -259,6 +272,7 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                         <div class="main-content">
                             {header(ui)}
                             {crate::home::view(ui)}
+                            {crate::comments::layer(ui)}
                             <div class="page-host" style="display: contents"></div>
                         </div>
                         {inspector(ui)}
@@ -274,6 +288,18 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                     }
                 })
                 .forget();
+                if let Some(main) = app.query_selector(".main-content").ok().flatten() {
+                    let relayout = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(|| {
+                        driver().layout_page()
+                    });
+                    if let Ok(observer) =
+                        web_sys::ResizeObserver::new(relayout.as_ref().unchecked_ref())
+                    {
+                        observer.observe(&main);
+                        relayout.forget();
+                        std::mem::forget(observer);
+                    }
+                }
                 app
             })
             .clone()
@@ -500,6 +526,7 @@ fn panel_of(tab: Tab, inner: &DriverInner) -> Panel {
             path.map(|path| crate::local_graph::build_local_graph(knowledge, path))
                 .unwrap_or_default(),
         ),
+        Tab::Comments => Panel::Comments,
     }
 }
 
@@ -1630,6 +1657,7 @@ fn panel(panel: Panel) -> AnyView {
         }
         .into_any(),
         Panel::Graph(graph) => graph_view(graph).into_any(),
+        Panel::Comments => crate::comments::list(state()).into_any(),
     }
 }
 
@@ -1804,7 +1832,7 @@ fn graph_view(graph: LocalGraph) -> impl IntoView {
     }
 }
 
-fn close_panels() {
+pub(crate) fn close_panels() {
     let driver = driver();
     let mut inner = driver.0.borrow_mut();
     inner.pending_focus_key = Some(

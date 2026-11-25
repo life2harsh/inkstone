@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BlockId, DocId, InkGroupId};
+use crate::ids::{BlockId, CommentId, DocId, InkGroupId};
 use crate::text_crdt::RelativePosition;
 
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -27,6 +27,26 @@ pub struct InkstoneDocument {
     /// One ink layer over the whole page. Strokes live here, not in blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ink: Option<PageInkLayer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub comments: BTreeMap<CommentId, Comment>,
+}
+
+/// A note pinned to the page like ink, or a reply in another comment's thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<InkAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<CommentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<uuid::Uuid>,
+    pub author: String,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub edited_at_ms: Option<i64>,
+    pub body: String,
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 /// The document-wide ink layer.
@@ -204,6 +224,7 @@ impl InkstoneDocument {
             blocks: Vec::new(),
             metadata: BTreeMap::new(),
             ink: None,
+            comments: BTreeMap::new(),
         }
     }
 

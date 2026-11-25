@@ -564,6 +564,79 @@ impl PageSurface {
         self.update_view();
     }
 
+    pub fn comment_points(
+        &mut self,
+        doc: &InkstoneDocument,
+        text: Option<&TextClientState>,
+        editing: Option<BlockId>,
+        pins: &[(Uuid, InkAnchor)],
+    ) -> Option<((f64, f64), f64, Vec<(f32, f32)>)> {
+        let document = dom_document()?;
+        let surface = document.query_selector(".page-surface").ok()??;
+        let scroller = document.query_selector(".main-content").ok()??;
+        let page = surface.get_bounding_client_rect();
+        let view = scroller.get_bounding_client_rect();
+        let offset = (
+            page.left() - view.left() + f64::from(scroller.scroll_left()),
+            page.top() - view.top() + f64::from(scroller.scroll_top()),
+        );
+        let origin = (page.left(), page.top());
+        let scale = self.page_scale;
+        let points = pins
+            .iter()
+            .map(|(id, anchor)| {
+                let group = Some(InkGroupId(*id));
+                let base = self
+                    .resolve_origin(&surface, origin, doc, text, editing, group, anchor)
+                    .unwrap_or((0.0, 0.0));
+                (base.0 + anchor.dx * scale, base.1 + anchor.dy * scale)
+            })
+            .collect();
+        Some((offset, f64::from(scroller.client_width()), points))
+    }
+
+    pub fn comment_anchor_at(
+        &mut self,
+        client: (f64, f64),
+        doc: &InkstoneDocument,
+        mut text: Option<&mut TextClientState>,
+        editing: Option<BlockId>,
+    ) -> Option<InkAnchor> {
+        let surface = dom_document()?.query_selector(".page-surface").ok()??;
+        let page = surface.get_bounding_client_rect();
+        let origin = (page.left(), page.top());
+        let point = ((client.0 - origin.0) as f32, (client.1 - origin.1) as f32);
+        let target =
+            self.anchor_target_at(&surface, origin, point, doc, text.as_deref_mut(), editing);
+        let probe = InkAnchor {
+            target,
+            dx: 0.0,
+            dy: 0.0,
+        };
+        let base = self
+            .resolve_origin(
+                &surface,
+                origin,
+                doc,
+                text.as_deref(),
+                editing,
+                None,
+                &probe,
+            )
+            .unwrap_or((0.0, 0.0));
+        let scale = self.page_scale.max(0.01);
+        let on_text = matches!(probe.target, AnchorTarget::Text { .. });
+        Some(InkAnchor {
+            dx: (point.0 - base.0) / scale,
+            dy: if on_text {
+                0.0
+            } else {
+                (point.1 - base.1) / scale
+            },
+            ..probe
+        })
+    }
+
     /// Page-relative origin an anchor's offset is measured from.
     #[allow(clippy::too_many_arguments)]
     fn resolve_origin(

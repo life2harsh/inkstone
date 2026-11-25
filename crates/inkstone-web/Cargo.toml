@@ -98,6 +98,8 @@ features = [
     "HtmlCollection",
     "Range",
     "ScrollIntoViewOptions",
+    "ScrollBehavior",
+    "ScrollToOptions",
     "ScrollLogicalPosition",
     "RtcPeerConnection",
     "RtcConfiguration",

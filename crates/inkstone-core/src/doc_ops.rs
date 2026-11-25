@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    AnchorTarget, BlockContent, DocumentBlock, INK_COLLABORATION_VERSION, InkAnchor,
+    AnchorTarget, BlockContent, Comment, DocumentBlock, INK_COLLABORATION_VERSION, InkAnchor,
     InkCollaborationState, InkstoneDocument, PAGE_INK_LAYER_VERSION, PageInkLayer,
 };
-use crate::ids::{BlockId, DocId, InkGroupId, UpdateId};
+use crate::ids::{BlockId, CommentId, DocId, InkGroupId, UpdateId};
 use crate::text_crdt::{CollaborativeTextUpdate, TextTarget};
 
 pub const DOCUMENT_UPDATE_VERSION: u32 = 1;
@@ -111,6 +111,24 @@ pub enum DocumentOp {
         snapshot: Vec<u8>,
         conversions: Vec<InkBlockConversion>,
     },
+
+    #[serde(rename = "add_comment")]
+    AddComment {
+        comment_id: CommentId,
+        comment: Comment,
+    },
+
+    #[serde(rename = "edit_comment")]
+    EditComment { comment_id: CommentId, body: String },
+
+    #[serde(rename = "resolve_comment")]
+    ResolveComment {
+        comment_id: CommentId,
+        resolved: bool,
+    },
+
+    #[serde(rename = "delete_comment")]
+    DeleteComment { comment_id: CommentId },
 }
 
 impl DocumentOp {
@@ -122,7 +140,11 @@ impl DocumentOp {
             | DocumentOp::ApplyPageInkUpdate { .. }
             | DocumentOp::SetInkAnchor { .. }
             | DocumentOp::RemoveInkAnchors { .. }
-            | DocumentOp::MigrateInkBlocks { .. } => DOCUMENT_UPDATE_V2_VERSION,
+            | DocumentOp::MigrateInkBlocks { .. }
+            | DocumentOp::AddComment { .. }
+            | DocumentOp::EditComment { .. }
+            | DocumentOp::ResolveComment { .. }
+            | DocumentOp::DeleteComment { .. } => DOCUMENT_UPDATE_V2_VERSION,
             _ => DOCUMENT_UPDATE_VERSION,
         }
     }
@@ -179,7 +201,15 @@ pub enum ApplyError {
 
     #[error("invalid ink anchor: {0}")]
     InvalidInkAnchor(String),
+
+    #[error("comment not found: {0}")]
+    CommentNotFound(CommentId),
+
+    #[error("invalid comment: {0}")]
+    InvalidComment(&'static str),
 }
+
+pub const MAX_COMMENT_LEN: usize = 10_000;
 
 /// Strict local-intent application.
 /// Rejects any operation that cannot be applied exactly as intended.
@@ -275,8 +305,91 @@ pub fn apply_update(doc: &mut InkstoneDocument, update: DocumentUpdate) -> Resul
                 update.applied_at_ms,
             )?;
         }
+        op @ (DocumentOp::AddComment { .. }
+        | DocumentOp::EditComment { .. }
+        | DocumentOp::ResolveComment { .. }
+        | DocumentOp::DeleteComment { .. }) => {
+            apply_comment(doc, op, update.applied_at_ms, true)?;
+        }
     }
 
+    Ok(())
+}
+
+fn comment_mut(doc: &mut InkstoneDocument, id: CommentId) -> Result<&mut Comment, ApplyError> {
+    doc.comments
+        .get_mut(&id)
+        .ok_or(ApplyError::CommentNotFound(id))
+}
+
+fn check_body(body: &str) -> Result<(), ApplyError> {
+    match body.trim().len() {
+        0 => Err(ApplyError::InvalidComment("empty comment")),
+        len if len > MAX_COMMENT_LEN => Err(ApplyError::InvalidComment("comment too long")),
+        _ => Ok(()),
+    }
+}
+
+fn apply_comment(
+    doc: &mut InkstoneDocument,
+    op: DocumentOp,
+    at_ms: i64,
+    strict: bool,
+) -> Result<(), ApplyError> {
+    match op {
+        DocumentOp::AddComment {
+            comment_id,
+            comment,
+        } => {
+            if doc.comments.contains_key(&comment_id) {
+                return Err(ApplyError::InvalidComment("duplicate comment id"));
+            }
+            check_body(&comment.body)?;
+            match (&comment.anchor, comment.parent) {
+                (Some(anchor), None) if strict => validate_anchor(doc, anchor)?,
+                (Some(anchor), None) => {
+                    if !anchor.dx.is_finite() || !anchor.dy.is_finite() {
+                        return Err(ApplyError::InvalidInkAnchor("non-finite offset".into()));
+                    }
+                }
+                (None, Some(parent)) => match doc.comments.get(&parent) {
+                    Some(thread) if thread.parent.is_none() => {}
+                    Some(_) => return Err(ApplyError::InvalidComment("replies cannot nest")),
+                    None => return Err(ApplyError::CommentNotFound(parent)),
+                },
+                _ => {
+                    return Err(ApplyError::InvalidComment(
+                        "a comment needs an anchor or a parent",
+                    ));
+                }
+            }
+            doc.comments.insert(comment_id, comment);
+        }
+        DocumentOp::EditComment { comment_id, body } => {
+            check_body(&body)?;
+            let comment = comment_mut(doc, comment_id)?;
+            comment.body = body;
+            comment.edited_at_ms = Some(at_ms);
+        }
+        DocumentOp::ResolveComment {
+            comment_id,
+            resolved,
+        } => {
+            let comment = comment_mut(doc, comment_id)?;
+            if comment.parent.is_some() {
+                return Err(ApplyError::InvalidComment("only threads can be resolved"));
+            }
+            comment.resolved = resolved;
+        }
+        DocumentOp::DeleteComment { comment_id } => {
+            if doc.comments.remove(&comment_id).is_none() && strict {
+                return Err(ApplyError::CommentNotFound(comment_id));
+            }
+            doc.comments
+                .retain(|_, comment| comment.parent != Some(comment_id));
+        }
+        _ => unreachable!("not a comment op"),
+    }
     Ok(())
 }
 
@@ -290,13 +403,22 @@ fn reanchor_removed_block(doc: &mut InkstoneDocument, pos: usize) {
         .or_else(|| pos.checked_sub(1).and_then(|prev| doc.blocks.get(prev)))
         .map(|block| AnchorTarget::Block { block_id: block.id })
         .unwrap_or(AnchorTarget::Page);
-    if let Some(layer) = doc.ink.as_mut() {
-        for anchor in layer.anchors.values_mut() {
-            if anchor.target.block_id() == Some(removed) {
-                anchor.target = fallback.clone();
-            }
+    for anchor in anchors_mut(doc) {
+        if anchor.target.block_id() == Some(removed) {
+            anchor.target = fallback.clone();
         }
     }
+}
+
+fn anchors_mut(doc: &mut InkstoneDocument) -> impl Iterator<Item = &mut InkAnchor> {
+    doc.ink
+        .iter_mut()
+        .flat_map(|layer| layer.anchors.values_mut())
+        .chain(
+            doc.comments
+                .values_mut()
+                .filter_map(|comment| comment.anchor.as_mut()),
+        )
 }
 
 /// Text anchors into a block that is no longer Markdown fall back to the
@@ -309,13 +431,11 @@ fn demote_stale_text_anchors(doc: &mut InkstoneDocument, block_id: BlockId) {
     if is_markdown {
         return;
     }
-    if let Some(layer) = doc.ink.as_mut() {
-        for anchor in layer.anchors.values_mut() {
-            if matches!(&anchor.target, AnchorTarget::Text { .. })
-                && anchor.target.block_id() == Some(block_id)
-            {
-                anchor.target = AnchorTarget::Block { block_id };
-            }
+    for anchor in anchors_mut(doc) {
+        if matches!(&anchor.target, AnchorTarget::Text { .. })
+            && anchor.target.block_id() == Some(block_id)
+        {
+            anchor.target = AnchorTarget::Block { block_id };
         }
     }
 }
@@ -689,6 +809,17 @@ pub fn sequenced_replay(doc: &mut InkstoneDocument, update: DocumentUpdate) -> R
                 },
                 Err(error) => ReplayOutcome::Fatal {
                     reason: error.to_string(),
+                },
+            }
+        }
+        op @ (DocumentOp::AddComment { .. }
+        | DocumentOp::EditComment { .. }
+        | DocumentOp::ResolveComment { .. }
+        | DocumentOp::DeleteComment { .. }) => {
+            match apply_comment(doc, op, update.applied_at_ms, false) {
+                Ok(()) => ReplayOutcome::Applied,
+                Err(error) => ReplayOutcome::NoOp {
+                    conflict: error.to_string(),
                 },
             }
         }
@@ -2085,5 +2216,194 @@ mod page_ink_tests {
         doc.blocks.push(markdown_block("x"));
         let json = serde_json::to_string(&doc).unwrap();
         assert!(!json.contains("\"ink\""));
+    }
+
+    fn thread(anchor: Option<InkAnchor>, parent: Option<CommentId>, body: &str) -> Comment {
+        Comment {
+            anchor,
+            parent,
+            author_id: None,
+            author: "a@example.test".into(),
+            created_at_ms: 1,
+            edited_at_ms: None,
+            body: body.into(),
+            resolved: false,
+        }
+    }
+
+    fn add(comment_id: CommentId, comment: Comment) -> DocumentOp {
+        DocumentOp::AddComment {
+            comment_id,
+            comment,
+        }
+    }
+
+    #[test]
+    fn comments_thread_edit_resolve_and_delete_with_replies() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let block = markdown_block("hello");
+        let block_id = block.id;
+        doc.blocks.push(block);
+        let (root, reply) = (CommentId::new_v4(), CommentId::new_v4());
+        apply(
+            &mut doc,
+            add(root, thread(Some(block_anchor(block_id)), None, "Why?")),
+        )
+        .unwrap();
+        apply(&mut doc, add(reply, thread(None, Some(root), "Because"))).unwrap();
+        apply(
+            &mut doc,
+            DocumentOp::EditComment {
+                comment_id: reply,
+                body: "Because.".into(),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut doc,
+            DocumentOp::ResolveComment {
+                comment_id: root,
+                resolved: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(doc.comments[&reply].body, "Because.");
+        assert_eq!(doc.comments[&reply].edited_at_ms, Some(1_000));
+        assert!(doc.comments[&root].resolved);
+        apply(&mut doc, DocumentOp::DeleteComment { comment_id: root }).unwrap();
+        assert!(doc.comments.is_empty());
+    }
+
+    #[test]
+    fn invalid_comments_are_rejected_locally() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let root = CommentId::new_v4();
+        let page = InkAnchor {
+            target: AnchorTarget::Page,
+            dx: 1.0,
+            dy: 2.0,
+        };
+        assert!(apply(&mut doc, add(root, thread(Some(page.clone()), None, "  "))).is_err());
+        assert!(apply(&mut doc, add(root, thread(None, None, "x"))).is_err());
+        assert!(
+            apply(
+                &mut doc,
+                add(root, thread(Some(page.clone()), Some(root), "x"))
+            )
+            .is_err()
+        );
+        let missing = InkAnchor {
+            target: AnchorTarget::Block {
+                block_id: BlockId::new_v4(),
+            },
+            dx: 0.0,
+            dy: 0.0,
+        };
+        assert!(apply(&mut doc, add(root, thread(Some(missing), None, "x"))).is_err());
+        apply(&mut doc, add(root, thread(Some(page), None, "x"))).unwrap();
+        let reply = CommentId::new_v4();
+        apply(&mut doc, add(reply, thread(None, Some(root), "y"))).unwrap();
+        assert!(
+            apply(
+                &mut doc,
+                add(CommentId::new_v4(), thread(None, Some(reply), "z"))
+            )
+            .is_err()
+        );
+        assert!(
+            apply(
+                &mut doc,
+                DocumentOp::ResolveComment {
+                    comment_id: reply,
+                    resolved: true,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            apply(
+                &mut doc,
+                DocumentOp::DeleteComment {
+                    comment_id: CommentId::new_v4()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn comment_replay_tolerates_concurrent_deletes() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let root = CommentId::new_v4();
+        let gone = InkAnchor {
+            target: AnchorTarget::Block {
+                block_id: BlockId::new_v4(),
+            },
+            dx: 0.0,
+            dy: 0.0,
+        };
+        assert_eq!(
+            replay(&mut doc, add(root, thread(Some(gone.clone()), None, "x"))),
+            ReplayOutcome::Applied
+        );
+        assert!(matches!(
+            replay(&mut doc, add(root, thread(Some(gone), None, "x"))),
+            ReplayOutcome::NoOp { .. }
+        ));
+        assert_eq!(
+            replay(&mut doc, DocumentOp::DeleteComment { comment_id: root }),
+            ReplayOutcome::Applied
+        );
+        assert_eq!(
+            replay(&mut doc, DocumentOp::DeleteComment { comment_id: root }),
+            ReplayOutcome::Applied
+        );
+        assert!(matches!(
+            replay(
+                &mut doc,
+                add(CommentId::new_v4(), thread(None, Some(root), "late reply"))
+            ),
+            ReplayOutcome::NoOp { .. }
+        ));
+        assert!(matches!(
+            replay(
+                &mut doc,
+                DocumentOp::EditComment {
+                    comment_id: root,
+                    body: "x".into()
+                }
+            ),
+            ReplayOutcome::NoOp { .. }
+        ));
+        assert!(doc.comments.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_block_moves_comment_pins_and_old_documents_still_load() {
+        let mut doc = InkstoneDocument::new(DocId::new_v4());
+        let (first, second) = (markdown_block("a"), markdown_block("b"));
+        let (first_id, second_id) = (first.id, second.id);
+        doc.blocks.extend([first, second]);
+        let root = CommentId::new_v4();
+        apply(
+            &mut doc,
+            add(root, thread(Some(block_anchor(first_id)), None, "x")),
+        )
+        .unwrap();
+        apply(&mut doc, DocumentOp::DeleteBlock { block_id: first_id }).unwrap();
+        assert_eq!(
+            doc.comments[&root].anchor.as_ref().unwrap().target,
+            AnchorTarget::Block {
+                block_id: second_id
+            }
+        );
+        let json = serde_json::to_string(&doc).unwrap();
+        let loaded: InkstoneDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.comments, doc.comments);
+        let mut bare = InkstoneDocument::new(DocId::new_v4());
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("comments"));
+        bare = serde_json::from_str(&json).unwrap();
+        assert!(bare.comments.is_empty());
     }
 }

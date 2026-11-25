@@ -223,6 +223,65 @@ test.describe('Live mode and accounts', () => {
     await laptop.context().close();
   });
 
+  test('comments placed on a laptop reach a phone, take replies, and resolve for both', async ({ browser }, testInfo) => {
+    test.skip(testInfo.project.name !== 'chromium-desktop', 'one browser pair is enough');
+    test.setTimeout(120_000);
+    const laptop = await (await browser.newContext()).newPage();
+    const phone = await (await browser.newContext({ ...devices['Pixel 7'] })).newPage();
+    const path = `Review ${Date.now().toString(36)}.md`;
+
+    await signIn(laptop, ownerEmail, ownerPassword);
+    await staysUnlocked(laptop);
+    await ensureSidebar(laptop);
+    await laptop.locator('.explorer-new-btn').click();
+    await laptop.locator('.explorer-create-input').fill(path);
+    await laptop.locator('.explorer-create-input').press('Enter');
+    await expect(laptop.locator('.document-title-input')).toBeFocused({ timeout: 15_000 });
+    await laptop.keyboard.type('Review');
+    await laptop.locator('.page-tail').click();
+    await laptop.keyboard.type('The launch plan needs a second look');
+    await expect(laptop.locator('.sync-status')).toHaveText('Encrypted sync is live', { timeout: 15_000 });
+
+    await signIn(phone, ownerEmail, ownerPassword);
+    await staysUnlocked(phone);
+    await ensureSidebar(phone);
+    await openFile(phone, path);
+    await expect(phone.locator('.page-surface')).toContainText('second look', { timeout: 15_000 });
+
+    const dockTool = laptop.locator('.ink-dock [data-page-ink="tool"][data-tool="comment"]');
+    await dockTool.click();
+    await expect(dockTool).toHaveClass(/active/);
+    await expect(laptop.locator('.page-surface')).toHaveClass(/ink-mode/);
+    const source = await laptop.locator('.page-source').last().boundingBox();
+    const box = { x: source.x + 40, y: source.y + 10 };
+    await laptop.mouse.click(box.x, box.y);
+    await expect(laptop.locator('.comment-card[aria-label="New comment"] .comment-input')).toBeFocused();
+    await laptop.keyboard.type('Who owns this?');
+    await laptop.locator('.comment-card .comment-btn.primary').click();
+    await expect(laptop.locator('.comment-card[aria-label="Comment thread"]')).toBeVisible();
+
+    const phonePin = phone.locator('.comment-pin:not(.draft)');
+    await expect(phonePin).toHaveCount(1, { timeout: 15_000 });
+    await phonePin.tap();
+    await expect(phone.locator('.comment-card .comment-body')).toHaveText('Who owns this?');
+    await phone.locator('.comment-card .comment-input[aria-label="Reply"]').fill('I do');
+    await phone.getByRole('button', { name: 'Send reply' }).tap();
+    await expect(laptop.locator('.comment-card .comment-entry')).toHaveCount(2, { timeout: 15_000 });
+    await expect(laptop.locator('.comment-card .comment-entry').last()).toContainText('I do');
+
+    await laptop.getByRole('button', { name: 'Resolve thread' }).click();
+    await expect(laptop.locator('.comment-pin:not(.draft)')).toHaveCount(0);
+    await expect(phone.locator('.comment-card .comment-card-title')).toHaveText('Resolved', { timeout: 15_000 });
+    await expect(phonePin).toHaveClass(/resolved/);
+    await phone.getByRole('button', { name: 'Close' }).tap();
+    await expect(phonePin).toHaveCount(0);
+    await expect(phone.locator('.page-surface')).toContainText('The launch plan needs a second look');
+    await expect(laptop.locator('.sync-status')).toHaveText('Encrypted sync is live');
+    await expect(phone.locator('.sync-status')).toHaveText('Encrypted sync is live');
+    await phone.context().close();
+    await laptop.context().close();
+  });
+
   test('fast typing and ink drawn on a laptop and a phone at once all survive', async ({ browser }, testInfo) => {
     test.skip(testInfo.project.name !== 'chromium-desktop', 'one browser pair is enough');
     test.setTimeout(180_000);

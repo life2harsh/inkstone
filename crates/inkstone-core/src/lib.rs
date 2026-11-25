@@ -16,11 +16,11 @@ pub use doc_ops::{
     sequenced_replay,
 };
 pub use document::{
-    AnchorTarget, BlockContent, DEFAULT_SPACE_HEIGHT, DocumentBlock, INK_COLLABORATION_VERSION,
-    InkAnchor, InkCollaborationState, PAGE_WIDTH, PageInkLayer, first_page_ink_layer, new_document,
-    new_opaque_ink_content, new_page_ink_layer,
+    AnchorTarget, BlockContent, Comment, DEFAULT_SPACE_HEIGHT, DocumentBlock,
+    INK_COLLABORATION_VERSION, InkAnchor, InkCollaborationState, PAGE_WIDTH, PageInkLayer,
+    first_page_ink_layer, new_document, new_opaque_ink_content, new_page_ink_layer,
 };
-pub use ids::{BlockId, DocId, InkGroupId, UpdateId};
+pub use ids::{BlockId, CommentId, DocId, InkGroupId, UpdateId};
 pub use ink_snapshot::InkSnapshot;
 pub use page_ink::plan_ink_block_migration;
 pub use protocol::{INK_PRESENCE_VERSION, InkPresencePayload};
