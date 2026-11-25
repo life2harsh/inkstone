@@ -44,6 +44,7 @@ mod settings;
 pub mod storage;
 mod theme;
 mod ui;
+mod zoom;
 use leptos::prelude::{GetUntracked, Set, Update};
 mod vaults;
 pub mod workspace_db;
@@ -121,7 +122,7 @@ fn hold_page_height(document: &web_sys::Document, key: Option<String>, height: f
     }
     let _ = surface
         .style()
-        .set_property("min-height", &format!("{}px", height.ceil()));
+        .set_property("min-height", &format!("{}px", zoom::local(height).ceil()));
     let generation = PAGE_HEIGHT_HOLD.with(|hold| {
         hold.set(hold.get().wrapping_add(1));
         hold.get()
@@ -10033,6 +10034,7 @@ fn setup_event_delegation(driver: &Driver) -> Result<(), JsValue> {
 
     page_driver::install_page_listeners(driver, &window, &root)?;
     page_files::install(driver, &window)?;
+    zoom::install(&window)?;
 
     let d_click = driver.clone();
     let click_document = document.clone();

@@ -164,6 +164,8 @@ pub(crate) struct Ui {
     pub comment_open: RwSignal<Option<inkstone_core::CommentId>>,
     pub comment_draft: RwSignal<Option<inkstone_core::InkAnchor>>,
     pub show_resolved: RwSignal<bool>,
+    pub zoom: RwSignal<f64>,
+    pub view_open: RwSignal<bool>,
 }
 
 impl Ui {
@@ -290,6 +292,7 @@ pub(crate) fn shell(root: &web_sys::Element) -> web_sys::HtmlElement {
                 .forget();
                 if let Some(main) = app.query_selector(".main-content").ok().flatten() {
                     let relayout = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(|| {
+                        crate::zoom::measure_view();
                         driver().layout_page()
                     });
                     if let Ok(observer) =
@@ -1429,9 +1432,83 @@ fn header(ui: Ui) -> impl IntoView {
     }
 }
 
+fn view_menu(ui: Ui) -> impl IntoView {
+    let dark = RwSignal::new(crate::prefs::get("pdf") == "dark");
+    let label = move || crate::zoom::percent(ui.zoom.get());
+    let at_min = move || ui.zoom.get() < crate::zoom::MIN + 1e-3;
+    let at_max = move || ui.zoom.get() > crate::zoom::MAX - 1e-3;
+    view! {
+        <div class="view-wrap">
+            <button
+                class="mode-toggle-btn view-btn"
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded=move || bool_str(ui.view_open.get())
+                data-focus-key="view-menu"
+                aria-label="View"
+                title="Zoom and PDF pages"
+                on:click=move |_| {
+                    dark.set(crate::prefs::get("pdf") == "dark");
+                    ui.view_open.update(|open| *open = !*open);
+                }
+            >
+                {label}
+            </button>
+            <Show when=move || ui.view_open.get()>
+                <div class="view-menu" role="dialog" aria-label="View">
+                    <div class="zoom-row">
+                        <button
+                            class="zoom-step"
+                            type="button"
+                            aria-label="Zoom out"
+                            disabled=at_min
+                            on:click=|_| crate::zoom::step(-1)
+                        >
+                            {svg("minus", "icon")}
+                        </button>
+                        <button
+                            class="zoom-level"
+                            type="button"
+                            aria-label="Reset zoom"
+                            title="Back to 100%"
+                            on:click=|_| crate::zoom::reset()
+                        >
+                            {label}
+                        </button>
+                        <button
+                            class="zoom-step"
+                            type="button"
+                            aria-label="Zoom in"
+                            disabled=at_max
+                            on:click=|_| crate::zoom::step(1)
+                        >
+                            {svg("plus", "icon")}
+                        </button>
+                    </div>
+                    <label class="view-switch">
+                        <input
+                            type="checkbox"
+                            role="switch"
+                            prop:checked=move || dark.get()
+                            on:change=move |event| {
+                                let on = event_target_checked(&event);
+                                dark.set(on);
+                                crate::prefs::set("pdf", if on { "dark" } else { "light" });
+                            }
+                        />
+                        <span>"Dark PDF pages"</span>
+                    </label>
+                    <p class="view-hint">"Pinch, or hold Ctrl and scroll, to zoom"</p>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
 fn mode_bar(ui: Ui) -> impl IntoView {
     view! {
         <div class="mode-bar">
+            {view_menu(ui)}
             <div class="export-wrap">
                 <button
                     class="mode-toggle-btn export-btn"

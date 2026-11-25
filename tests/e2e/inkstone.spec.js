@@ -1951,6 +1951,120 @@ function makePdf(pages) {
   return Buffer.from(out, 'latin1');
 }
 
+test('zoom scales the page with its ink and comments, sharpens PDFs, and PDF pages can go dark', async ({ page }, testInfo) => {
+  const phone = testInfo.project.name === 'chromium-mobile';
+  await createNote(page, 'Zoom.md', 'Zoom', 'Before the paper.');
+  await placeComment(page, 'paper', 'Zoom check');
+  await page.keyboard.press('Escape');
+  await chooseTyping(page);
+  const chooser = page.waitForEvent('filechooser');
+  await page.locator('.add-block-btn[data-block-type="image"]').click();
+  await (await chooser).setFiles({ name: 'slides.pdf', mimeType: 'application/pdf', buffer: makePdf(['Page one heading', 'Page two heading']) });
+  const pages = page.locator('.pdf-pages .pdf-page');
+  const natural = () => pages.nth(0).locator('img').evaluate(image => image.complete ? image.naturalWidth : 0).catch(() => 0);
+  await expect.poll(natural, { timeout: 15000 }).toBeGreaterThan(1000);
+  const before = await natural();
+  await chooseInkTool(page);
+  await drawOver(page, pages.nth(0), { x: 40, y: 0.3, dx: 100 });
+  await expect.poll(async () => strokeCount(await pageInk(page))).toBe(1);
+  await chooseTyping(page);
+
+  const measure = async () => {
+    await pages.nth(0).evaluate(sheet => sheet.scrollIntoView({ block: 'start' }));
+    await page.locator('.main-content').evaluate(main => { main.scrollLeft = 0; });
+    await page.waitForTimeout(100);
+    const sheet = await pages.nth(0).boundingBox();
+    const ink = await inkBox(page);
+    const word = await wordBox(page, 'paper');
+    const pin = await page.locator('.comment-pin:not(.draft)').boundingBox();
+    return {
+      width: sheet.width,
+      x: (ink.left - sheet.x) / sheet.width,
+      y: (ink.top - sheet.y) / sheet.height,
+      span: (ink.right - ink.left) / sheet.width,
+      pin: [pin.x + 2 - word.left, pin.y + pin.height - word.top]
+    };
+  };
+  const zoomLabel = page.locator('.view-btn');
+  await expect(zoomLabel).toHaveText('100%');
+  const start = await measure();
+  const pinHolds = (now, zoom) => now.pin.forEach((offset, axis) => expect(Math.abs(offset / zoom - start.pin[axis])).toBeLessThan(4));
+
+  if (phone) {
+    const box = await page.locator('.main-content').boundingBox();
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    const cdp = await page.context().newCDPSession(page);
+    const touch = (type, spread) => cdp.send('Input.dispatchTouchEvent', {
+      type,
+      touchPoints: type === 'touchEnd' ? [] : [{ x: cx - spread, y: cy, id: 1 }, { x: cx + spread, y: cy, id: 2 }]
+    });
+    await touch('touchStart', 40);
+    for (let spread = 44; spread <= 80; spread += 4) {
+      await touch('touchMove', spread);
+      await page.waitForTimeout(16);
+    }
+    await touch('touchEnd', 0);
+    await expect.poll(async () => parseInt(await zoomLabel.textContent(), 10)).toBeGreaterThan(180);
+  } else {
+    await zoomLabel.click();
+    const zoomIn = page.getByRole('button', { name: 'Zoom in' });
+    for (let step = 0; step < 3; step += 1) await zoomIn.click();
+    await expect(page.locator('.zoom-level')).toHaveText('150%');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.view-menu')).toHaveCount(0);
+    await page.waitForTimeout(250);
+    const mid = await measure();
+    expect(mid.width / start.width).toBeCloseTo(1.5, 1);
+    expect(Math.abs(mid.x - start.x)).toBeLessThan(0.02);
+    expect(Math.abs(mid.y - start.y)).toBeLessThan(0.02);
+    pinHolds(mid, 1.5);
+    const view = await page.locator('.main-content').boundingBox();
+    await page.mouse.move(view.x + view.width / 2, view.y + view.height / 2);
+    await page.keyboard.down('Control');
+    for (let notch = 0; notch < 4; notch += 1) {
+      await page.mouse.wheel(0, -60);
+      await page.waitForTimeout(30);
+    }
+    await page.keyboard.up('Control');
+    await expect.poll(async () => parseInt(await zoomLabel.textContent(), 10)).toBeGreaterThan(200);
+  }
+  await page.waitForTimeout(250);
+  const zoomed = await measure();
+  const factor = parseInt(await zoomLabel.textContent(), 10) / 100;
+  expect(zoomed.width / start.width).toBeCloseTo(factor, 1);
+  expect(Math.abs(zoomed.x - start.x)).toBeLessThan(0.02);
+  expect(Math.abs(zoomed.y - start.y)).toBeLessThan(0.02);
+  expect(Math.abs(zoomed.span - start.span)).toBeLessThan(0.02);
+  pinHolds(zoomed, factor);
+  expect(await page.locator('.main-content').evaluate(main => main.scrollWidth > main.clientWidth + 50)).toBe(true);
+  await expect.poll(natural, { timeout: 15000 }).toBeGreaterThan(before * 1.2);
+
+  await page.reload();
+  await openNote(page, 'Zoom.md', 'Zoom');
+  await expect(zoomLabel).toHaveText(`${Math.round(factor * 100)}%`);
+  await zoomLabel.click();
+  await page.locator('.zoom-level').click();
+  await expect(page.locator('.zoom-level')).toHaveText('100%');
+  const switchBox = page.getByRole('switch', { name: 'Dark PDF pages' });
+  await expect(switchBox).not.toBeChecked();
+  await switchBox.check();
+  await expect(page.locator('html')).toHaveAttribute('data-pdf', 'dark');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('html')).not.toHaveAttribute('data-zoomed', '');
+  await page.waitForTimeout(250);
+  const back = await measure();
+  expect(Math.abs(back.width - start.width)).toBeLessThan(2);
+  expect(Math.abs(back.x - start.x)).toBeLessThan(0.02);
+  pinHolds(back, 1);
+  await expect(pages.nth(0).locator('img')).toHaveCSS('filter', /invert/);
+  await pages.nth(0).hover().catch(() => {});
+  await page.locator('.pdf-dark-btn').click();
+  await expect(page.locator('html')).toHaveAttribute('data-pdf', 'light');
+  await expect(pages.nth(0).locator('img')).toHaveCSS('filter', 'none');
+  expect(page.__browserErrors).toEqual([]);
+});
+
 test('a PDF opens as pages you can write on, and the writing stays on the page at any width', async ({ page }) => {
   await createNote(page, 'Reading.md', 'Reading', 'Before the paper.');
   const chooser = page.waitForEvent('filechooser');

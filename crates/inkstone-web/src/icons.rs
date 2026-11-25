@@ -38,6 +38,7 @@ fn paths(name: &str) -> &'static str {
         "copy" => {
             r#"<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
         }
+        "moon" => r#"<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>"#,
         "eye" => {
             r#"<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>"#
         }
@@ -222,6 +223,7 @@ mod tests {
             "lasso",
             "comment",
             "send",
+            "moon",
             "undo",
             "redo",
             "text",

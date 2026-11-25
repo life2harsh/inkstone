@@ -169,17 +169,22 @@ struct PageSnapshot {
 
 impl Driver {
     pub(crate) fn close_export_menu(&self, target: Option<&web_sys::Element>) -> bool {
-        let open = crate::ui::state().export_open;
-        let outside =
-            target.is_none_or(|target| target.closest(".export-wrap").ok().flatten().is_none());
-        if !open.get_untracked() || !outside {
-            return false;
+        let ui = crate::ui::state();
+        let mut closed = false;
+        for (open, wrap, key) in [
+            (ui.export_open, ".export-wrap", "export-menu"),
+            (ui.view_open, ".view-wrap", "view-menu"),
+        ] {
+            let outside = target.is_none_or(|target| target.closest(wrap).ok().flatten().is_none());
+            if open.get_untracked() && outside {
+                open.set(false);
+                if target.is_none() {
+                    crate::ui::focus_soon(key);
+                }
+                closed = true;
+            }
         }
-        open.set(false);
-        if target.is_none() {
-            crate::ui::focus_soon("export-menu");
-        }
-        true
+        closed
     }
 
     pub(crate) fn export(&self, format: ExportFormat) {
@@ -202,6 +207,13 @@ impl Driver {
     }
 
     async fn snapshot_page(&self) -> Result<PageSnapshot, String> {
+        let zoom = crate::zoom::suspend();
+        let result = self.snapshot_unzoomed().await;
+        crate::zoom::resume(zoom);
+        result
+    }
+
+    async fn snapshot_unzoomed(&self) -> Result<PageSnapshot, String> {
         self.flush_ink_before_transition();
         self.stop_editing();
         next_frame().await;

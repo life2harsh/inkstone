@@ -24,10 +24,80 @@ struct PdfPage {
     width: f64,
     height: f64,
     url: Option<String>,
+    density: f64,
 }
 
 thread_local! {
     static CACHE: RefCell<HashMap<String, Rc<RefCell<PdfState>>>> = RefCell::new(HashMap::new());
+}
+
+fn density() -> f64 {
+    let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
+    (ratio * crate::zoom::get()).clamp(1.5, 3.0)
+}
+
+fn blurry(state: &PdfState, target: f64) -> bool {
+    state.pages.iter().any(|page| page.density < target * 0.95)
+}
+
+fn containers(path: &str) -> Vec<web_sys::Element> {
+    let Some(found) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.query_selector_all(".pdf-pages[data-pdf-key]").ok())
+    else {
+        return Vec::new();
+    };
+    (0..found.length())
+        .filter_map(|index| found.item(index)?.dyn_into::<web_sys::Element>().ok())
+        .filter(|container| container.get_attribute("data-pdf-key").as_deref() == Some(path))
+        .collect()
+}
+
+fn next_page(path: &str, state: &PdfState, target: f64) -> Option<usize> {
+    let slots = containers(path)
+        .first()
+        .and_then(|container| container.query_selector_all(".pdf-page").ok());
+    let height = web_sys::window()
+        .and_then(|window| window.inner_height().ok()?.as_f64())
+        .unwrap_or(0.0);
+    let distance = |index: usize| {
+        slots
+            .as_ref()
+            .and_then(|slots| {
+                slots
+                    .item(index as u32)?
+                    .dyn_into::<web_sys::Element>()
+                    .ok()
+            })
+            .map_or(f64::MAX, |slot| {
+                let rect = slot.get_bounding_client_rect();
+                (-rect.bottom()).max(rect.top() - height).max(0.0)
+            })
+    };
+    (0..state.pages.len())
+        .filter(|index| state.pages[*index].density < target * 0.95)
+        .min_by(|a, b| distance(*a).total_cmp(&distance(*b)).then(a.cmp(b)))
+}
+
+pub fn sharpen() {
+    let target = density();
+    let blurry = CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .filter(|(_, state)| {
+                let state = state.borrow();
+                !state.loading && state.error.is_none() && blurry(&state, target)
+            })
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect::<Vec<_>>()
+    });
+    for (path, state) in blurry {
+        if containers(&path).is_empty() {
+            continue;
+        }
+        crate::ui::driver().render_pdf(path, state);
+    }
 }
 
 pub fn is_pdf(path: &str) -> bool {
@@ -190,7 +260,10 @@ fn paint(container: &web_sys::Element, state: &PdfState) {
         ) else {
             continue;
         };
-        if slot.query_selector("img").ok().flatten().is_some() {
+        if let Some(image) = slot.query_selector("img").ok().flatten() {
+            if image.get_attribute("src").as_deref() != Some(url) {
+                let _ = image.set_attribute("src", url);
+            }
             continue;
         }
         let image = document.create_element("img").unwrap();
@@ -199,6 +272,25 @@ fn paint(container: &web_sys::Element, state: &PdfState) {
         let _ = image.set_attribute("draggable", "false");
         let _ = slot.append_child(&image);
     }
+    if container
+        .query_selector(".pdf-dark-btn")
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        let button = document.create_element("button").unwrap();
+        button.set_class_name("pdf-dark-btn");
+        let _ = button.set_attribute("type", "button");
+        let _ = button.set_attribute("aria-label", "Dark PDF pages");
+        let _ = button.set_attribute("title", "Dark PDF pages");
+        crate::icons::icon_button_content(&document, &button, "moon", "Dark PDF pages");
+        let _ = container.insert_before(&button, container.first_child().as_ref());
+    }
+}
+
+pub(crate) fn toggle_dark() {
+    let dark = crate::prefs::get("pdf") == "dark";
+    crate::prefs::set("pdf", if dark { "light" } else { "dark" });
 }
 
 impl Driver {
@@ -220,23 +312,32 @@ impl Driver {
         let cached = CACHE.with(|cache| cache.borrow().get(path).cloned());
         if let Some(state) = &cached {
             paint(&container, &state.borrow());
-            if state.borrow().loading || state.borrow().error.is_none() {
+            let current = state.borrow();
+            if current.loading || current.error.is_none() {
+                let stale = !current.loading && blurry(&current, density());
+                drop(current);
+                if stale {
+                    self.render_pdf(path.to_string(), state.clone());
+                }
                 return;
             }
         }
-        let state = Rc::new(RefCell::new(PdfState {
-            loading: true,
-            ..PdfState::default()
-        }));
+        let state = Rc::new(RefCell::new(PdfState::default()));
         CACHE.with(|cache| cache.borrow_mut().insert(path.to_string(), state.clone()));
         paint(&container, &state.borrow());
+        self.render_pdf(path.to_string(), state);
+    }
+
+    fn render_pdf(&self, path: String, state: Rc<RefCell<PdfState>>) {
+        state.borrow_mut().loading = true;
         let this = self.clone();
-        let path = path.to_string();
         wasm_bindgen_futures::spawn_local(async move {
             let result = this.load_pdf(&path, &state).await;
             let mut current = state.borrow_mut();
             current.loading = false;
-            if let Err(error) = result {
+            if let Err(error) = result
+                && current.pages.iter().all(|page| page.url.is_none())
+            {
                 current.error = Some(error);
             }
             drop(current);
@@ -245,26 +346,11 @@ impl Driver {
     }
 
     fn repaint_pdf(&self, path: &str, state: &Rc<RefCell<PdfState>>) {
-        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-            return;
-        };
-        let Ok(found) = document.query_selector_all(".pdf-pages[data-pdf-key]") else {
-            return;
-        };
-        let mut changed = false;
-        for index in 0..found.length() {
-            let Some(container) = found
-                .item(index)
-                .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
-            else {
-                continue;
-            };
-            if container.get_attribute("data-pdf-key").as_deref() == Some(path) {
-                paint(&container, &state.borrow());
-                changed = true;
-            }
+        let found = containers(path);
+        for container in &found {
+            paint(container, &state.borrow());
         }
-        if changed {
+        if !found.is_empty() {
             self.layout_page();
         }
     }
@@ -297,31 +383,36 @@ impl Driver {
         ]);
         let task = call(&pdfjs, "getDocument", &[params])?;
         let pdf = wait(get(&task, "promise")).await?;
-        let count = get(&pdf, "numPages").as_f64().unwrap_or(0.0) as u32;
-        let count = count.min(MAX_PAGES);
-        let mut pages = Vec::with_capacity(count as usize);
-        for number in 1..=count {
-            let page = wait(call(&pdf, "getPage", &[JsValue::from(number)])?).await?;
-            let viewport = call(&page, "getViewport", &[object(&[("scale", 1.0.into())])])?;
-            pages.push(PdfPage {
-                width: get(&viewport, "width").as_f64().unwrap_or(612.0),
-                height: get(&viewport, "height").as_f64().unwrap_or(792.0),
-                url: None,
-            });
+        if state.borrow().pages.is_empty() {
+            let count = (get(&pdf, "numPages").as_f64().unwrap_or(0.0) as u32).min(MAX_PAGES);
+            let mut pages = Vec::with_capacity(count as usize);
+            for number in 1..=count {
+                let page = wait(call(&pdf, "getPage", &[JsValue::from(number)])?).await?;
+                let viewport = call(&page, "getViewport", &[object(&[("scale", 1.0.into())])])?;
+                pages.push(PdfPage {
+                    width: get(&viewport, "width").as_f64().unwrap_or(612.0),
+                    height: get(&viewport, "height").as_f64().unwrap_or(792.0),
+                    url: None,
+                    density: 0.0,
+                });
+            }
+            state.borrow_mut().pages = pages;
+            self.repaint_pdf(path, state);
         }
-        state.borrow_mut().pages = pages;
-        self.repaint_pdf(path, state);
         let document = web_sys::window()
             .and_then(|window| window.document())
             .ok_or("no document")?;
-        let density = web_sys::window()
-            .map(|window| window.device_pixel_ratio())
-            .unwrap_or(1.0)
-            .clamp(1.5, 2.0);
-        for number in 1..=count {
-            let page = wait(call(&pdf, "getPage", &[JsValue::from(number)])?).await?;
-            let width = state.borrow().pages[(number - 1) as usize].width;
-            let scale = PAGE_WIDTH * density / width.max(1.0);
+        loop {
+            let target = density();
+            let Some(index) = next_page(path, &state.borrow(), target) else {
+                break;
+            };
+            if containers(path).is_empty() && state.borrow().pages[index].url.is_some() {
+                break;
+            }
+            let page = wait(call(&pdf, "getPage", &[JsValue::from(index as u32 + 1)])?).await?;
+            let width = state.borrow().pages[index].width;
+            let scale = PAGE_WIDTH * target / width.max(1.0);
             let viewport = call(&page, "getViewport", &[object(&[("scale", scale.into())])])?;
             let canvas = document
                 .create_element("canvas")
@@ -343,8 +434,16 @@ impl Driver {
             wait(get(&render, "promise")).await?;
             let url = canvas_blob_url(&canvas).await?;
             let _ = call(&page, "cleanup", &[]);
-            state.borrow_mut().pages[(number - 1) as usize].url = Some(url);
+            let old = {
+                let mut current = state.borrow_mut();
+                let page = &mut current.pages[index];
+                page.density = target;
+                page.url.replace(url)
+            };
             self.repaint_pdf(path, state);
+            if let Some(old) = old {
+                let _ = web_sys::Url::revoke_object_url(&old);
+            }
         }
         let _ = call(&pdf, "destroy", &[]);
         Ok(())

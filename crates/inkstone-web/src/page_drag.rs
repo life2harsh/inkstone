@@ -143,9 +143,10 @@ impl Driver {
                 }
             };
             if let Ok(line) = line.dyn_into::<web_sys::HtmlElement>() {
-                let _ = line
-                    .style()
-                    .set_property("top", &format!("{}px", line_y - surface_rect.top()));
+                let _ = line.style().set_property(
+                    "top",
+                    &format!("{}px", crate::zoom::local(line_y - surface_rect.top())),
+                );
             }
         }
         self.0.borrow_mut().block_drag = Some(drag);

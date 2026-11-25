@@ -447,15 +447,16 @@ impl PageSurface {
             .map(|layer| &layer.anchors)
             .unwrap_or(&empty);
 
+        let zoom = crate::zoom::get() as f32;
         if self.gesture.is_none() && page_width > 0.0 {
-            self.page_scale = (page_width / REFERENCE_PAGE_WIDTH).clamp(0.2, 1.0);
+            self.page_scale = (page_width / zoom / REFERENCE_PAGE_WIDTH).clamp(0.2, 1.0) * zoom;
         }
 
         for block in &doc.blocks {
             let BlockContent::Space { min_height } = block.content else {
                 continue;
             };
-            let scale = self.page_scale;
+            let scale = self.page_scale / zoom;
             let bottoms = anchors
                 .iter()
                 .filter(|(_, anchor)| anchor.target.block_id() == Some(block.id))
@@ -496,10 +497,11 @@ impl PageSurface {
             let is_text = matches!(anchor.target, AnchorTarget::Text { .. });
             let bounds = self.bounds.get(group).copied();
             let scale = if is_text {
-                bounds
+                let room = page_width / zoom;
+                zoom * bounds
                     .map(|bounds| bounds.max_x - bounds.min_x)
-                    .filter(|width| *width > page_width && page_width > 0.0)
-                    .map_or(1.0, |width| (page_width / width).max(self.page_scale))
+                    .filter(|width| *width > room && room > 0.0)
+                    .map_or(1.0, |width| (room / width).max(self.page_scale / zoom))
             } else {
                 self.page_scale
             };
@@ -553,7 +555,7 @@ impl PageSurface {
             .fold(0.0_f64, f64::max);
         if let Ok(Some(tail)) = surface.query_selector(".page-tail") {
             let tail_top = tail.get_bounding_client_rect().top() - page.top();
-            let height = (ink_bottom + TAIL_PADDING - tail_top).max(MIN_TAIL);
+            let height = (crate::zoom::local(ink_bottom - tail_top) + TAIL_PADDING).max(MIN_TAIL);
             if let Ok(tail) = tail.dyn_into::<web_sys::HtmlElement>() {
                 let _ = tail
                     .style()
@@ -850,7 +852,7 @@ impl PageSurface {
                         editing,
                     );
                     let scale = if matches!(target, AnchorTarget::Text { .. }) {
-                        1.0
+                        crate::zoom::get() as f32
                     } else {
                         self.page_scale
                     };

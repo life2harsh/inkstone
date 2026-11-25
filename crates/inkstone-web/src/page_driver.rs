@@ -999,6 +999,11 @@ impl Driver {
         if closest(&target, ".comment-layer").is_some() {
             return false;
         }
+        if closest(&target, ".pdf-dark-btn").is_some() {
+            event.prevent_default();
+            crate::pdf_pages::toggle_dark();
+            return true;
+        }
         if let Some(action) = closest(&target, "[data-page-ink]") {
             self.page_ink_action(&action);
             return true;

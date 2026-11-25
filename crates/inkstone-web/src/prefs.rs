@@ -84,6 +84,13 @@ pub const PREFS: &[Pref] = &[
         ],
         swatches: false,
     },
+    Pref {
+        key: "pdf",
+        label: "PDF pages",
+        default: "light",
+        options: &[("light", "Original"), ("dark", "Dark")],
+        swatches: false,
+    },
 ];
 
 fn storage_key(key: &str) -> String {
